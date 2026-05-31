@@ -91,3 +91,4 @@ operational tax.
 ## License
 
 Proprietary. © Steve Yeong.
+# Trading
