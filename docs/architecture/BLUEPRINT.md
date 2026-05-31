@@ -3,7 +3,7 @@
 **Codename:** `ATLAS` (Adaptive Trading Logic & Allocation System)\
 **Author:** Steve Yeong
 **Last revised:** 2026-05-27
-**Status:** Architecture v1.0
+**Status:** Architecture v2.0
 
 This is the full engineering and product blueprint for an institutional-grade, multi-asset, AI-powered trading intelligence engine. It is opinionated, execution-focused, and assumes you will actually build it. Every component lists tools, providers, costs, tradeoffs, and where applicable, code skeletons and formulas.
 

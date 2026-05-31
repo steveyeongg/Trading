@@ -1,4 +1,14 @@
-"""LLM rationale writer — Anthropic Claude with prompt caching.
+"""LLM rationale writer — DeepSeek via the OpenAI-compatible chat API.
+
+DeepSeek (`https://api.deepseek.com`) implements the OpenAI chat/completions
+surface byte-for-byte, so we use the `openai` SDK with a custom `base_url`.
+That gets us:
+
+  - first-class async/streaming + the same tool-use shape we'd use elsewhere,
+  - DeepSeek's *server-side* context caching (transparent — no `cache_control`
+    blocks needed; cache hits drop input cost ~10×),
+  - drop-in path to other OpenAI-compat backends (OpenRouter, Groq, vLLM) by
+    only flipping `base_url` + `api_key`.
 
 Falls back to templated output when no API key is configured. The fallback is
 deliberate: the signal pipeline must not fail on missing LLM credentials.
@@ -18,7 +28,8 @@ from explanation_engine.templated import templated_rationale
 
 log = get_logger("explanation")
 
-DEFAULT_MODEL = os.environ.get("ATLAS_EXPLAIN_MODEL", "claude-sonnet-4-6")
+DEFAULT_MODEL = os.environ.get("ATLAS_EXPLAIN_MODEL", "deepseek-chat")
+DEFAULT_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEFAULT_MAX_TOKENS = 1024
 
 
@@ -59,18 +70,25 @@ def _trim_features(features: dict[str, Any]) -> dict[str, Any]:
 
 
 class ExplanationWriter:
-    """Stateful wrapper — holds the Anthropic client so we reuse the
-    connection and the prompt cache across calls."""
+    """Stateful wrapper — holds the OpenAI client (pointed at DeepSeek) so we
+    reuse the connection and benefit from DeepSeek's server-side prompt cache
+    across calls within the cache TTL."""
 
-    def __init__(self, api_key: str | None = None, model: str = DEFAULT_MODEL):
-        self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str = DEFAULT_MODEL,
+        base_url: str = DEFAULT_BASE_URL,
+    ):
+        self.api_key = api_key or os.environ.get("DEEPSEEK_API_KEY")
         self.model = model
+        self.base_url = base_url
         self._client = None
         if self.api_key:
             try:
-                from anthropic import Anthropic
+                from openai import OpenAI
 
-                self._client = Anthropic(api_key=self.api_key)
+                self._client = OpenAI(api_key=self.api_key, base_url=self.base_url)
             except Exception as e:
                 log.warning("explanation.client_init_failed", error=str(e))
 
@@ -85,20 +103,15 @@ class ExplanationWriter:
 
         user_msg = _format_user_message(signal, features)
         try:
-            # The system prompt is sent via the cacheable block. After the
-            # first call within the TTL, subsequent input is billed at the
-            # cached rate (~10x cheaper).
-            response = self._client.messages.create(
+            # DeepSeek caches identical leading content automatically — sending
+            # the same long system prompt every call is cheap after the first.
+            response = self._client.chat.completions.create(
                 model=self.model,
                 max_tokens=DEFAULT_MAX_TOKENS,
-                system=[
-                    {
-                        "type": "text",
-                        "text": SYSTEM_PROMPT,
-                        "cache_control": {"type": "ephemeral"},
-                    }
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg},
                 ],
-                messages=[{"role": "user", "content": user_msg}],
             )
         except Exception as e:
             log.warning("explanation.api_error", error=str(e))
@@ -106,18 +119,21 @@ class ExplanationWriter:
 
         usage = getattr(response, "usage", None)
         if usage:
+            # DeepSeek exposes cache hit/miss counts on the usage object
+            # (prompt_cache_hit_tokens / prompt_cache_miss_tokens) — useful for
+            # observing the cost-savings curve in logs.
             log.info(
                 "explanation.usage",
-                input=getattr(usage, "input_tokens", None),
-                cache_read=getattr(usage, "cache_read_input_tokens", None),
-                cache_create=getattr(usage, "cache_creation_input_tokens", None),
-                output=getattr(usage, "output_tokens", None),
+                input=getattr(usage, "prompt_tokens", None),
+                cache_hit=getattr(usage, "prompt_cache_hit_tokens", None),
+                cache_miss=getattr(usage, "prompt_cache_miss_tokens", None),
+                output=getattr(usage, "completion_tokens", None),
             )
 
-        if not response.content:
+        if not response.choices:
             return templated_rationale(signal, features)
-        block = response.content[0]
-        return getattr(block, "text", "") or templated_rationale(signal, features)
+        text = response.choices[0].message.content or ""
+        return text or templated_rationale(signal, features)
 
 
 # Module-level convenience — reuses a single client.

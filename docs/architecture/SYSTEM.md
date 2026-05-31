@@ -11,8 +11,8 @@ with the actual delivered shape.
                 │   (FRED → KMeans regime)               │
                 │                                        ▼
 ingest_equities ─► TimescaleDB ─► feature_engine (25 ind.) ─► s_tech
-   (Polygon /     bars                                     ─► quant_engine ─► s_quant
-    synthetic)                                                (XGBoost,
+   (Polygon →     bars                                     ─► quant_engine ─► s_quant
+    Alpaca fallback)                                          (XGBoost,
                                                               calibrated)
                                                                      │
 news_ingest ─► news_items / news_scores ─► s_sent                    │
@@ -76,12 +76,12 @@ Background loops in the `signal-service` lifespan:
 | Package | Concern |
 |---|---|
 | `packages/shared-py` (`atlas_shared`) | logging · config · DB (async SQLAlchemy + migrations) · auth (JWT + dev) · entitlements · metrics · jsonable (Decimal→float for API responses) |
-| `apps/ingest-equities` | Polygon REST + synthetic GBM → `bars` hypertable |
+| `apps/ingest-equities` | Polygon REST · Alpaca Market Data v2 · synthetic GBM → `bars` hypertable (CLI `--source polygon\|alpaca\|synthetic`) |
 | `apps/feature-engine` | 25 indicators (pandas-ta) — RSI/MACD/BB/EMA stack/ATR/ADX/VWAP/OBV/Stoch/Ichimoku/SMC-BOS/divergences/realized-vol |
 | `apps/quant-engine` | XGBoost trend model · triple-barrier labels · walk-forward purged CV · isotonic calibration · joblib registry |
 | `apps/scoring-engine` | `s_tech`/`s_quant`/`s_liq` · composite + regime-conditional weights · `generate_signal` (gates + conviction) |
 | `apps/risk-engine` | Kelly · vol-target · ATR-risk · correlation/sector/ADV caps · VaR/CVaR · `RiskVeto` |
-| `apps/explanation-engine` | Anthropic Claude with prompt caching · templated fallback |
+| `apps/explanation-engine` | DeepSeek via OpenAI-compatible API · server-side prompt cache · templated fallback (offline-safe) |
 | `apps/macro-engine` | FRED client (with synthetic fallback) · 4-regime KMeans · `s_macro` |
 | `apps/sentiment-engine` | Lexicon scorer (always-on) · optional FinBERT · per-ticker aggregation · `s_sent` |
 | `apps/news-ingest` | RSS / NewsAPI / file replay · ticker extraction · idempotent persistence + scoring |

@@ -4,6 +4,168 @@ Chronological record of what shipped across the build. Newest first.
 Every entry maps to a turn in the build log; phase numbers reference
 `docs/architecture/BLUEPRINT.md` §18.
 
+## 0.18.2 — Multi-resolution candle aggregation + chart timeframe selector
+
+The chart was showing ~5 hours of data because the `PriceChart` component
+hardcoded `limit=300` at `resolution='1m'` and the backend only stored 1m
+bars. Even maxing `limit=5000` only got you ~12.8 trading days, and 11,700
+1-minute candles is visually unusable anyway.
+
+### Backend — on-the-fly aggregation off the 1m storage
+
+- `ingest_equities.store.latest_bars()` now accepts `1m | 5m | 15m | 30m |
+  1h | 4h | 1d | 1w`. For `1m` it reads raw rows (unchanged). For everything
+  else it aggregates via TimescaleDB `time_bucket()` + `first()`/`last()`
+  aggregates — `first(open, ts)`, `max(high)`, `min(low)`, `last(close, ts)`,
+  volume-weighted `vwap`, `sum(trade_count)`. No new tables, no new ingest
+  pipelines — one source of truth, zoom out at read time.
+- `GET /v1/symbols/{symbol}/bars` validates the `resolution` parameter via
+  the new `is_supported_resolution()` helper and returns 400 on unknown
+  values instead of silently returning empty.
+- `tests/test_bars_resolution.py` — 6 tests pinning the cross-stack contract
+  (frontend timeframes ↔ backend buckets), the GROUP BY shape, and the
+  OHLC-aggregate correctness clues (first(open), last(close), max(high),
+  min(low), volume-weighted vwap).
+
+### Frontend — timeframe pill selector
+
+- `PriceChart.tsx` gained a pill row with **1D / 5D / 1M / 3M / 6M / 1Y**.
+  Each pill maps to a `(resolution, limit)` pair tuned for ~80–260 visible
+  candles — dense enough to see structure, sparse enough that each candle
+  reads cleanly. `refetchInterval` scales with the timeframe (30s for 1D,
+  5min for 6M/1Y).
+- Prop API changed: `resolution?: string` → `initialTimeframe?: TimeframeId`.
+  The single existing caller (`apps/web/src/app/symbols/[symbol]/page.tsx`)
+  doesn't pass either prop, so this is a clean break.
+- `pnpm typecheck` clean.
+
+### Why on-the-fly aggregation, not separate ingest passes per resolution
+
+We could have run `ingest_equities backfill --resolution 1d --days 365` etc.
+and stored each TF as its own rows. But that means N copies of the ingest
+pipeline, N opportunities for resolution drift, and N× the storage. The
+TimescaleDB hypertable + `time_bucket()` path is fast enough for the chart
+read pattern (~30 rows after aggregation), and when 30-day reads start
+hurting (BLUEPRINT §6.2 ledger item) we promote the aggregations to
+**continuous aggregates** (materialised views Timescale keeps incrementally
+fresh) — same SQL, no app-code change.
+
+Test count **217 → 221**.
+
+## 0.18.1 — NewsAPI source: spec audit + 3 bugs fixed
+
+Audit of `apps/news-ingest/src/news_ingest/sources/newsapi.py` against
+[newsapi.org/docs/endpoints/everything](https://newsapi.org/docs/endpoints/everything)
+turned up three real bugs and one best-practice gap. All are fixed with
+regression tests pinning the contract.
+
+- 🔴 **URL was wrong.** The previous implementation set
+  `httpx.AsyncClient(base_url="https://newsapi.org/v2/everything")` then called
+  `client.get("/everything")`. httpx treats leading-slash relative URLs as
+  *replacing* the base URL's path, so the actual request went to
+  `https://newsapi.org/everything` (no `/v2/`). Every NewsAPI call was hitting
+  a 404; only the `raise_for_status` masked it as a generic HTTP error. Fixed
+  by passing the full URL on every call and removing `base_url` entirely.
+- 🔴 **JSON-body errors were silently swallowed.** NewsAPI returns
+  **HTTP 200** with `{"status":"error","code":"...","message":"..."}` for
+  quota / invalid-key / param errors. The previous code only checked
+  `r.raise_for_status()`. Now the payload's `status` field is explicitly
+  inspected; a non-`ok` response raises typed `NewsApiError(code, message)`.
+- 🟡 **Tenacity was retrying app-layer errors.** Invalid API key would retry
+  3× before surfacing — useless and slow. The retry decorator now uses
+  `retry_if_not_exception_type(NewsApiError)` so only transient httpx errors
+  (network, 5xx) get backed off; app-layer errors propagate immediately.
+- 🟡 **Auth moved to `X-Api-Key` header.** Previously sent as `apiKey` query
+  param — works, but the key leaked into URL access logs. Header form is the
+  documented best practice and matches the Alpaca-style auth pattern used
+  elsewhere in the codebase.
+- 🟢 **Added pagination.** `since` requests for gaps > 100 articles silently
+  dropped data. Now walks `page=1..max_pages` (default 5 → up to 500
+  articles/fetch) until either `totalResults` is consumed, a short page
+  arrives, or the cap is hit. The `maximumResultsReached` code (dev-plan
+  cap) is treated as a benign termination, not an error.
+- 🟢 Stripped microseconds from the `from` parameter; added `searchIn=title,description`
+  default for cleaner finance results; propagated `urlToImage`, `source_id`,
+  and `author` into `RawItem.metadata` (was author-only).
+- 🆕 `tests/test_newsapi_source.py` — 8 tests, all using `httpx.MockTransport`
+  so they run offline: URL targeting, header auth, JSON-body-error handling,
+  no-key graceful skip, article→RawItem mapping, pagination walk, max-pages
+  cap, microsecond stripping.
+
+Test count **209 → 217**.
+
+## 0.18.0 — Active-set weight renormalisation (unblocks bars-only signal generation)
+
+The "every signal returns null with null veto" symptom on fresh installs was
+**a math bug, not a data bug**. The blueprint default weights allocate 0.30
+of the composite to `fund` (0.15), `opt` (0.10), and `chain` (0.05) — three
+sub-scores whose adapters are deferred (no `fund` or `chain` ingester exists;
+the signal route never passes `options_features`). Achievable composite on
+the production route was capped at:
+
+  - Best case  (every wired sub-score at ±100) →  0.70 × 100 = ±70
+  - Bars-only  (only tech+quant non-zero)      →  0.45 × 100 = ±45  ❌ can never clear ≥50
+
+Result: even a perfect bullish setup with 180 days of healthy data on AAPL /
+MSFT / TSLA was mathematically unable to publish a signal.
+
+### Fix
+
+- `scoring_engine.composite.composite()` accepts an `active: Iterable[str] | None`
+  set. When provided, weights are **renormalised over the active set** so
+  deferred sub-scores contribute nothing AND don't dilute the total. Default
+  call shape (no `active`) is unchanged — preserves blueprint-default math for
+  the backtest harness and existing tests.
+- `scoring_engine.signal.generate_signal()` now **builds the active set
+  dynamically**: tech/quant/liq are always on; macro/sent/opt join when their
+  feature dicts are supplied by the caller; fund/chain are excluded until
+  they're built. `_engines_agree()` was updated to iterate the active set,
+  not a hard-coded tuple — so the "≥ 2 confirming engines" gate stops
+  counting deferred zeros against the signal.
+- Gate thresholds (`MIN_COMPOSITE`, `MIN_CONFIDENCE`, `MIN_CONFIRMING_ENGINES`,
+  `MIN_AGREE_THRESHOLD`) are now env-overridable via `ATLAS_MIN_*` for
+  sparse-data deployments. Defaults unchanged.
+- New `tests/test_active_weight_renorm.py` (5 tests) pins the contract:
+  default-call behavior unchanged, active-set renormalisation correct, active
+  set excludes `fund`/`chain` and grows when features are supplied, and an
+  end-to-end "bars-only with strong tech+quant" signal now fires.
+
+Test count **202 → 209**. No regressions.
+
+## 0.17.0 — DeepSeek LLM swap + Alpaca ingest adapter + env catalog
+
+Three orthogonal changes the user asked for in one pass; each is independently
+revertible.
+
+- **LLM provider: Anthropic → DeepSeek.** `explanation-engine` now talks to
+  `https://api.deepseek.com` via the `openai` SDK (DeepSeek is wire-compatible
+  with OpenAI chat/completions). Server-side context caching kicks in
+  automatically — we drop the explicit `cache_control` blocks but still get
+  ~10× input-cost savings on repeated system prompts; usage logs now record
+  `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` so the savings curve
+  is observable. Env: `DEEPSEEK_API_KEY` (was `ANTHROPIC_API_KEY`),
+  `ATLAS_EXPLAIN_MODEL=deepseek-chat` default (or `deepseek-reasoner` for R1).
+  Templated fallback path unchanged — pipeline still survives no-key mode.
+  `pyproject.toml`: `anthropic` dep replaced by `openai>=1.40`. Test +
+  OPERATIONS + SYSTEM docs synced.
+- **Ingest source: Alpaca added alongside Polygon.** New
+  `apps/ingest-equities/src/ingest_equities/alpaca.py` mirrors
+  `PolygonClient`'s public surface (same dataframe shape, same column names),
+  so `store.upsert_bars` accepts both with no branching. CLI gains
+  `--source polygon|alpaca|auto` (default `auto` — picks polygon if its key
+  is set, else alpaca). Alpaca's free IEX feed works the moment trading keys
+  exist; flip `ALPACA_FEED=sip` on a paid plan for the consolidated tape.
+  Polygon adapter kept (not deleted) so existing Polygon-paying users aren't
+  forced to switch.
+- **`.env.example` is now the authoritative env catalog.** Was 4 lines of
+  Polygon/Alpaca placeholders; now mirrors every row of OPERATIONS.md's
+  "Going live (real-data) toggles" table — auth (`ATLAS_AUTH_MODE`,
+  `ATLAS_JWKS_URL`, …), market data (Polygon + Alpaca + FRED + NewsAPI), LLM
+  (DeepSeek), and every alert channel (webhook, Telegram, email) — grouped
+  with inline how-to-get-the-credentials notes (e.g. the @BotFather +
+  getUpdates flow for Telegram). The original prompt — "where do I write the
+  telegram_bot_token in?" — is now answerable by `cat .env.example`.
+
 ## 0.16.1 — Production-readiness fixes (caught while running it for real)
 
 Three small bugs surfaced the moment the system left synthetic tests and hit

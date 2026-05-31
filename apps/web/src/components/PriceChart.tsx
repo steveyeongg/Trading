@@ -11,17 +11,46 @@ import {
   type ISeriesApi,
   type IPriceLine,
 } from 'lightweight-charts';
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api } from '@/lib/api';
 import type { BarsResponse, Signal } from '@/lib/types';
 
 interface Props {
   symbol: string;
-  resolution?: string;
+  /** Initial timeframe. Falls back to `1D` (5-min candles × ~1 trading day). */
+  initialTimeframe?: TimeframeId;
   signal?: Signal | null;
 }
 
-export function PriceChart({ symbol, resolution = '1m', signal }: Props) {
+type TimeframeId = '1D' | '5D' | '1M' | '3M' | '6M' | '1Y';
+
+interface TimeframeSpec {
+  id: TimeframeId;
+  label: string;
+  resolution: string;
+  limit: number;
+  description: string; // shown in title tag — helps users understand the trade-off
+}
+
+// The (resolution, limit) pairs were picked so the visible candle count stays
+// in the 80–500 range — dense enough to see structure, sparse enough that each
+// candle is wider than a hairline. All paths aggregate from the 1m storage.
+const TIMEFRAMES: readonly TimeframeSpec[] = [
+  { id: '1D', label: '1D', resolution: '5m',  limit: 100, description: '5-min · last ~8h' },
+  { id: '5D', label: '5D', resolution: '15m', limit: 130, description: '15-min · last ~5 sessions' },
+  { id: '1M', label: '1M', resolution: '1h',  limit: 160, description: 'hourly · last ~1 month' },
+  { id: '3M', label: '3M', resolution: '4h',  limit: 130, description: '4-hour · last ~3 months' },
+  { id: '6M', label: '6M', resolution: '1d',  limit: 130, description: 'daily · last ~6 months' },
+  { id: '1Y', label: '1Y', resolution: '1d',  limit: 260, description: 'daily · last ~1 year' },
+];
+
+const TF_BY_ID: Record<TimeframeId, TimeframeSpec> =
+  Object.fromEntries(TIMEFRAMES.map((tf) => [tf.id, tf])) as Record<TimeframeId, TimeframeSpec>;
+
+export function PriceChart({ symbol, initialTimeframe = '5D', signal }: Props) {
+  const [tfId, setTfId] = useState<TimeframeId>(initialTimeframe);
+  const tf = TF_BY_ID[tfId];
+
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
@@ -29,9 +58,10 @@ export function PriceChart({ symbol, resolution = '1m', signal }: Props) {
   const priceLinesRef = useRef<IPriceLine[]>([]);
 
   const { data, isLoading } = useQuery<BarsResponse>({
-    queryKey: ['bars', symbol, resolution],
-    queryFn: () => api.bars(symbol, resolution, 300),
-    refetchInterval: 30_000,
+    queryKey: ['bars', symbol, tf.resolution, tf.limit],
+    queryFn: () => api.bars(symbol, tf.resolution, tf.limit),
+    // Refetch slower at longer timeframes — 1D should feel live, 1Y can be lazy.
+    refetchInterval: tf.id === '1D' ? 30_000 : tf.id === '5D' ? 60_000 : 300_000,
   });
 
   // Create chart once.
@@ -134,14 +164,34 @@ export function PriceChart({ symbol, resolution = '1m', signal }: Props) {
 
   return (
     <div className="rounded-lg border border-line bg-bg-surface p-3">
-      <div className="mb-2 flex items-center justify-between">
+      <div className="mb-2 flex items-center justify-between gap-4">
         <h3 className="text-xs uppercase tracking-wider text-ink-muted">
-          {symbol} · {resolution}
+          {symbol} · <span title={tf.description}>{tf.resolution}</span>
         </h3>
-        {isLoading && <span className="text-xs text-ink-subtle">loading…</span>}
-        {data && data.bars.length === 0 && (
-          <span className="text-xs text-warn">no bars — ingest first</span>
-        )}
+        <div className="flex items-center gap-2">
+          <div className="flex overflow-hidden rounded border border-line text-xs font-mono">
+            {TIMEFRAMES.map((opt) => (
+              <button
+                key={opt.id}
+                type="button"
+                onClick={() => setTfId(opt.id)}
+                title={opt.description}
+                className={
+                  'px-2 py-1 transition-colors ' +
+                  (opt.id === tfId
+                    ? 'bg-ink-muted/20 text-ink-base'
+                    : 'bg-bg-subtle text-ink-subtle hover:bg-bg-subtle/60 hover:text-ink-muted')
+                }
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+          {isLoading && <span className="text-xs text-ink-subtle">loading…</span>}
+          {data && data.bars.length === 0 && (
+            <span className="text-xs text-warn">no bars — ingest first</span>
+          )}
+        </div>
       </div>
       <div ref={containerRef} className="h-[360px] w-full" />
     </div>

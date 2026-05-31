@@ -1,11 +1,11 @@
 [project]
 name = "explanation-engine"
 version = "0.1.0"
-description = "LLM-generated trade rationale. Claude API with prompt caching; templated fallback."
+description = "LLM-generated trade rationale. DeepSeek (OpenAI-compatible) with server-side prompt cache; templated fallback."
 requires-python = ">=3.12"
 dependencies = [
     "atlas-shared",
-    "anthropic>=0.39",
+    "openai>=1.40",
 ]
 
 [tool.uv.sources]

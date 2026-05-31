@@ -27,10 +27,23 @@ from scoring_engine.composite import DEFAULT_WEIGHTS, composite
 from scoring_engine.sub_scores import s_liq, s_quant, s_tech
 
 # Minimum gates — BLUEPRINT §9 step 4. Tunable per asset class / horizon.
-MIN_COMPOSITE = 50.0
-MIN_CONFIDENCE = 0.55
-MIN_CONFIRMING_ENGINES = 2  # how many sub-scores must agree with the direction
-MIN_AGREE_THRESHOLD = 40.0
+# All four are env-overridable so a Phase 1.5 deployment with sparse data
+# coverage can loosen them without code changes:
+#   ATLAS_MIN_COMPOSITE, ATLAS_MIN_CONFIDENCE,
+#   ATLAS_MIN_CONFIRMING_ENGINES, ATLAS_MIN_AGREE_THRESHOLD
+import os as _os
+
+MIN_COMPOSITE = float(_os.environ.get("ATLAS_MIN_COMPOSITE", "50.0"))
+MIN_CONFIDENCE = float(_os.environ.get("ATLAS_MIN_CONFIDENCE", "0.55"))
+MIN_CONFIRMING_ENGINES = int(_os.environ.get("ATLAS_MIN_CONFIRMING_ENGINES", "2"))
+MIN_AGREE_THRESHOLD = float(_os.environ.get("ATLAS_MIN_AGREE_THRESHOLD", "40.0"))
+
+# Sub-scores whose adapter is always available (always counted in the active
+# set). `fund` and `chain` are deferred — no adapter exists, the score would
+# always be 0, and including them would silently steal weight from the engines
+# that ARE wired. `macro`, `sent`, `opt` are conditional — included when their
+# feature dict is supplied.
+_ALWAYS_ACTIVE: frozenset[str] = frozenset({"tech", "quant", "liq"})
 
 
 def _conviction(composite_abs: float, confidence: float) -> Conviction:
@@ -43,13 +56,32 @@ def _conviction(composite_abs: float, confidence: float) -> Conviction:
     return Conviction.LOW
 
 
-def _engines_agree(subs: SubScores, direction: Direction, thresh: float) -> int:
+def _engines_agree(
+    subs: SubScores, direction: Direction, thresh: float, active: frozenset[str]
+) -> int:
+    """Count engines in the active set whose score leans `>= thresh` in the
+    signal direction. Inactive engines (deferred / not-wired adapters) are
+    skipped — they would always be 0 and would bias the count toward `gated`."""
     sign = 1 if direction == Direction.LONG else -1
-    return sum(
-        1
-        for v in (subs.tech, subs.quant, subs.fund, subs.macro, subs.sent, subs.opt, subs.liq, subs.chain)
-        if sign * v >= thresh
-    )
+    return sum(1 for k in active if sign * getattr(subs, k) >= thresh)
+
+
+def _build_active(
+    macro_features: dict | None,
+    sentiment_features: dict | None,
+    options_features: dict | None,
+) -> frozenset[str]:
+    """Active set = always-on engines + any optional engine whose feature dict
+    was supplied by the caller. Deferred adapters (fund, chain) are never
+    included until they're built."""
+    active = set(_ALWAYS_ACTIVE)
+    if macro_features:
+        active.add("macro")
+    if sentiment_features:
+        active.add("sent")
+    if options_features:
+        active.add("opt")
+    return frozenset(active)
 
 
 def generate_signal(
@@ -81,13 +113,17 @@ def generate_signal(
         sent=s_sent(sentiment_features or {}),
         opt=s_options(options_features or {}),
     )
-    score = composite(subs, weights=weights)
+    # Only count engines that are actually wired. `fund` and `chain` are
+    # deferred — including them would steal 0.20 of the weight and make the
+    # composite mathematically unable to clear 50 on bars-only deployments.
+    active = _build_active(macro_features, sentiment_features, options_features)
+    score = composite(subs, weights=weights, active=active)
     if abs(score) < MIN_COMPOSITE:
         return None
 
     direction = Direction.LONG if score > 0 else Direction.SHORT
 
-    if _engines_agree(subs, direction, MIN_AGREE_THRESHOLD) < MIN_CONFIRMING_ENGINES:
+    if _engines_agree(subs, direction, MIN_AGREE_THRESHOLD, active) < MIN_CONFIRMING_ENGINES:
         return None
 
     # Confidence: until we have a calibrated meta-model, derive from |p_up - 0.5|.

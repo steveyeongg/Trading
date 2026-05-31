@@ -16,7 +16,7 @@ from execution_service.brokers.base import Fill, OrderRequest
 
 log = get_logger("broker.alpaca")
 
-PAPER_BASE = "https://paper-api.alpaca.markets"
+PAPER_BASE = "https://paper-api.alpaca.markets/v2"
 
 
 class AlpacaBroker:

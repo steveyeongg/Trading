@@ -32,9 +32,18 @@ async def symbol_bars(
     """Recent OHLCV bars for charting. Shaped for lightweight-charts:
     each bar carries an epoch-second `time` plus o/h/l/c and volume.
 
+    `resolution='1m'` reads raw 1-minute storage; any other supported value
+    aggregates the underlying 1m bars on the fly via TimescaleDB
+    `time_bucket()`. Currently supported: `1m`, `5m`, `15m`, `30m`, `1h`,
+    `4h`, `1d`, `1w`.
+
     Returns 200 with an empty `bars` list when nothing is stored — the
     chart component renders an empty-state rather than erroring.
     """
+    from ingest_equities.store import is_supported_resolution
+
+    if not is_supported_resolution(resolution):
+        raise HTTPException(400, f"unsupported resolution {resolution!r}")
     symbol = symbol.upper()
     bars = await latest_bars(symbol, resolution=resolution, limit=limit)
     if bars.empty:
@@ -182,7 +191,28 @@ async def signal_debug(
     resolution: str = Query("1m"),
     lookback: int = Query(500, ge=210, le=5000),
 ) -> dict:
-    """Diagnostic view — exposes the veto reason when a signal is killed."""
+    """Diagnostic view — exposes the sub-score breakdown, the active engine
+    set, which gate (if any) killed the signal, and the veto reason. This is
+    the single source of truth for answering "why is my signal null?".
+    """
+    import math
+
+    from atlas_shared.schemas import Direction, SubScores
+    from feature_engine import compute_features
+    from macro_engine import s_macro
+    from options_analytics import s_options
+    from scoring_engine.composite import composite
+    from scoring_engine.signal import (
+        MIN_AGREE_THRESHOLD,
+        MIN_COMPOSITE,
+        MIN_CONFIDENCE,
+        MIN_CONFIRMING_ENGINES,
+        _build_active,
+        _engines_agree,
+    )
+    from scoring_engine.sub_scores import s_liq, s_quant, s_tech
+    from sentiment_engine import s_sent
+
     symbol = symbol.upper()
     bars = await latest_bars(symbol, resolution=resolution, limit=lookback)
     if bars.empty:
@@ -203,11 +233,80 @@ async def signal_debug(
         sentiment_features=sentiment,
         generate_explanation=False,
     )
+
+    # ── Diagnostics: replay the early pipeline steps so the user can see
+    # exactly which sub-scores fired and which gate failed. Cheap (microseconds)
+    # and only on this debug-only endpoint.
+    diagnostics: dict = {}
+    if len(bars) >= 210:
+        feats_df = compute_features(bars)
+        latest = {
+            k: v for k, v in feats_df.iloc[-1].to_dict().items()
+            if not (isinstance(v, float) and math.isnan(v))
+        }
+        latest["close"] = float(bars["close"].iloc[-1])
+
+        model = get_trend_model()
+        p_up = model.predict_proba(feats_df) if model is not None else None
+        macro_in = dict(snapshot or {}); macro_in.setdefault("regime", regime)
+        subs = SubScores(
+            tech=s_tech(latest),
+            quant=s_quant(p_up),
+            liq=s_liq(latest),
+            macro=s_macro(macro_in),
+            sent=s_sent(sentiment or {}),
+            opt=s_options({}),  # options never wired into prod route
+        )
+        active = _build_active(snapshot, sentiment, None)
+        score = composite(subs, active=active)
+        long_count = _engines_agree(subs, Direction.LONG, MIN_AGREE_THRESHOLD, active)
+        short_count = _engines_agree(subs, Direction.SHORT, MIN_AGREE_THRESHOLD, active)
+        direction_implied = "long" if score >= 0 else "short"
+        confirming = long_count if score >= 0 else short_count
+        confidence = float(min(1.0, abs(p_up - 0.5) * 2.0)) if p_up is not None else min(1.0, abs(score) / 100.0)
+
+        # Which gate failed (in pipeline order)?
+        gate_failed: str | None = None
+        if abs(score) < MIN_COMPOSITE:
+            gate_failed = f"composite |{score:.1f}| < {MIN_COMPOSITE} (needs ≥{MIN_COMPOSITE})"
+        elif confirming < MIN_CONFIRMING_ENGINES:
+            gate_failed = (
+                f"only {confirming} engine(s) confirm direction={direction_implied} "
+                f"at ≥{MIN_AGREE_THRESHOLD} (need ≥{MIN_CONFIRMING_ENGINES})"
+            )
+        elif p_up is not None and confidence < MIN_CONFIDENCE:
+            gate_failed = f"confidence {confidence:.2f} < {MIN_CONFIDENCE}"
+
+        diagnostics = {
+            "sub_scores": subs.model_dump(),
+            "composite_score": round(score, 2),
+            "direction_implied": direction_implied,
+            "active_engines": sorted(active),
+            "engines_confirming_long": long_count,
+            "engines_confirming_short": short_count,
+            "confidence": round(confidence, 3),
+            "p_up": p_up,
+            "trend_model_loaded": model is not None,
+            "trend_model_version": getattr(model, "version", None),
+            "gate_failed": gate_failed,
+            "thresholds": {
+                "MIN_COMPOSITE": MIN_COMPOSITE,
+                "MIN_CONFIDENCE": MIN_CONFIDENCE,
+                "MIN_CONFIRMING_ENGINES": MIN_CONFIRMING_ENGINES,
+                "MIN_AGREE_THRESHOLD": MIN_AGREE_THRESHOLD,
+            },
+        }
+    else:
+        diagnostics = {
+            "gate_failed": f"insufficient_bars: have {len(bars)}, need ≥210",
+        }
+
     return {
         "signal": result.signal.model_dump(mode="json") if result.signal else None,
         "veto": {"reason": result.veto.reason, "detail": result.veto.detail} if result.veto else None,
         "macro_snapshot": snapshot,
         "sentiment_snapshot": sentiment,
+        "diagnostics": diagnostics,
     }
 
 

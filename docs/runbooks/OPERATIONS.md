@@ -49,11 +49,11 @@ docker compose -f infra/observability/docker-compose.yml up -d                # 
 
 | Env | Effect |
 |---|---|
-| `POLYGON_API_KEY` | `ingest_equities backfill` switches from synthetic to Polygon |
+| `POLYGON_API_KEY` | `ingest_equities backfill --source polygon` (or `--source auto`) pulls real bars from Polygon |
+| `ALPACA_API_KEY` + `ALPACA_API_SECRET` | Two effects: (a) `ingest_equities backfill --source alpaca` pulls real bars from Alpaca Market Data v2 (free IEX feed by default; set `ALPACA_FEED=sip` on a paid plan); (b) `/v1/execute` routes to Alpaca paper instead of in-process paper |
 | `FRED_API_KEY` | `macro_engine.refresh` uses real FRED series |
 | `NEWSAPI_KEY` | `news_ingest.refresh --source newsapi` works |
-| `ANTHROPIC_API_KEY` | LLM rationales activate (templated fallback otherwise) |
-| `ALPACA_API_KEY` + `ALPACA_API_SECRET` | `/v1/execute` routes to Alpaca paper instead of in-process paper |
+| `DEEPSEEK_API_KEY` | LLM rationales activate via DeepSeek (templated fallback otherwise). Set `ATLAS_EXPLAIN_MODEL=deepseek-reasoner` to swap from `deepseek-chat` to R1. |
 | `ATLAS_AUTH_MODE=jwt` + `ATLAS_JWKS_URL` + `ATLAS_JWT_ISSUER` + `ATLAS_JWT_AUDIENCE` | switches dashboard from dev-headers to real JWT (Clerk/Auth0) |
 | `ATLAS_WEBHOOK_URL` + `ATLAS_WEBHOOK_SECRET` | alerts can use the `webhook` channel (HMAC-SHA256 signed) |
 | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | alerts can use the `telegram` channel |
@@ -81,8 +81,10 @@ docker compose -f infra/observability/docker-compose.yml up -d                # 
    bar resolution drift, CPU saturation. ADR-0001 prescribes Rust if this
    becomes structural.
 3. `quant` → XGBoost predict_proba blowing up; check feature NaN rate.
-4. `rationale` → Anthropic API slow / rate-limited; consider downgrading
-   the model or disabling explanations for scans.
+4. `rationale` → DeepSeek API slow / rate-limited; consider switching
+   `ATLAS_EXPLAIN_MODEL` from `deepseek-reasoner` to `deepseek-chat`, or
+   disabling explanations for scans (`POST /v1/scan` already defaults
+   `explain=false`).
 
 ### `AlertDeliveryFailures` (any non-OK delivery over 10m)
 

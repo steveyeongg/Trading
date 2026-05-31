@@ -80,7 +80,7 @@ def test_templated_handles_missing_fields() -> None:
 
 def test_writer_unavailable_falls_back_to_templated(signal: Signal, monkeypatch) -> None:
     """When no API key is set, the writer must transparently return the templated output."""
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     w = ExplanationWriter(api_key=None)
     assert not w.available
     out = w.write(signal)
@@ -88,7 +88,7 @@ def test_writer_unavailable_falls_back_to_templated(signal: Signal, monkeypatch)
 
 
 def test_module_level_generate_rationale_works_offline(signal: Signal, monkeypatch) -> None:
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     # Reset the module-level singleton so it re-checks the env.
     import explanation_engine.writer as w_mod
     w_mod._writer = None
@@ -96,7 +96,7 @@ def test_module_level_generate_rationale_works_offline(signal: Signal, monkeypat
     assert "SIGNAL: AAPL" in out
 
 
-@pytest.mark.skipif(not os.environ.get("ANTHROPIC_API_KEY"), reason="needs ANTHROPIC_API_KEY")
+@pytest.mark.skipif(not os.environ.get("DEEPSEEK_API_KEY"), reason="needs DEEPSEEK_API_KEY")
 def test_writer_live_llm(signal: Signal) -> None:
     """Smoke test against the real API. Only runs when key is present."""
     w = ExplanationWriter()

@@ -2,6 +2,12 @@
 
 Examples:
     # Real backfill via Polygon:
+    uv run python -m ingest_equities backfill --source polygon --symbols AAPL,MSFT --days 30
+
+    # Real backfill via Alpaca (free IEX feed if no paid plan):
+    uv run python -m ingest_equities backfill --source alpaca --symbols AAPL,MSFT --days 30
+
+    # Auto: picks polygon if POLYGON_API_KEY is set, else alpaca if Alpaca keys are set:
     uv run python -m ingest_equities backfill --symbols AAPL,MSFT --days 30
 
     # Offline synthetic backfill (no API key required):
@@ -14,9 +20,11 @@ import argparse
 import asyncio
 from datetime import UTC, datetime, timedelta
 
+from atlas_shared.config import get_settings
 from atlas_shared.logging import get_logger, setup_logging
 from feature_engine import gbm_bars
 
+from ingest_equities.alpaca import AlpacaClient
 from ingest_equities.polygon import PolygonClient
 from ingest_equities.store import upsert_bars
 
@@ -24,15 +32,35 @@ setup_logging()
 log = get_logger("ingest.cli")
 
 
-async def _backfill(symbols: list[str], days: int) -> None:
+def _resolve_source(requested: str) -> str:
+    """Pick a real-data source.
+
+    `auto` → polygon if its key is present, else alpaca if its pair is present,
+    else raise (synthetic is a different subcommand on purpose).
+    """
+    if requested != "auto":
+        return requested
+    s = get_settings()
+    if s.polygon_api_key:
+        return "polygon"
+    if s.alpaca_api_key and s.alpaca_api_secret:
+        return "alpaca"
+    raise SystemExit(
+        "no real-data credentials configured. Set POLYGON_API_KEY or "
+        "ALPACA_API_KEY+ALPACA_API_SECRET, or use the `synthetic` subcommand."
+    )
+
+
+async def _backfill(symbols: list[str], days: int, source: str) -> None:
     end = datetime.now(UTC).date()
     start = end - timedelta(days=days)
-    async with PolygonClient() as client:
+    client_cls = {"polygon": PolygonClient, "alpaca": AlpacaClient}[source]
+    async with client_cls() as client:
         for sym in symbols:
             n = 0
             async for chunk in client.aggs_1m(sym, start, end):
                 n += await upsert_bars(chunk)
-            log.info("backfill.done", symbol=sym, rows=n)
+            log.info("backfill.done", source=source, symbol=sym, rows=n)
 
 
 async def _synthetic(symbols: list[str], n_bars: int) -> None:
@@ -46,9 +74,15 @@ def main() -> None:
     p = argparse.ArgumentParser(prog="ingest-equities")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    bf = sub.add_parser("backfill", help="Pull historical bars from Polygon.")
+    bf = sub.add_parser("backfill", help="Pull historical bars from a real-data vendor.")
     bf.add_argument("--symbols", required=True, help="Comma-separated symbols.")
     bf.add_argument("--days", type=int, default=30)
+    bf.add_argument(
+        "--source",
+        choices=("auto", "polygon", "alpaca"),
+        default="auto",
+        help="Bar source. `auto` picks polygon if its key is set, else alpaca.",
+    )
 
     syn = sub.add_parser("synthetic", help="Generate synthetic bars (no API needed).")
     syn.add_argument("--symbols", required=True)
@@ -58,7 +92,8 @@ def main() -> None:
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
 
     if args.cmd == "backfill":
-        asyncio.run(_backfill(symbols, args.days))
+        source = _resolve_source(args.source)
+        asyncio.run(_backfill(symbols, args.days, source))
     elif args.cmd == "synthetic":
         asyncio.run(_synthetic(symbols, args.n_bars))
 

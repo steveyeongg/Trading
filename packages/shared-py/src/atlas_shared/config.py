@@ -27,10 +27,13 @@ class Settings(BaseSettings):
     # Redis
     redis_url: str = Field(default="redis://localhost:6379/0")
 
-    # Market data providers (Phase 1)
+    # Market data providers (Phase 1) — pick one or both; falls back to synthetic.
     polygon_api_key: str | None = None
     alpaca_api_key: str | None = None
     alpaca_api_secret: str | None = None
+
+    # LLM (Explanation engine). DeepSeek via the OpenAI-compatible API.
+    deepseek_api_key: str | None = None
 
     # Logging
     log_level: str = Field(default="INFO")
