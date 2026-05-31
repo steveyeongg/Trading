@@ -1,0 +1,102 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "schemaVersion": 39,
+  "title": "ATLAS — Engine Overview",
+  "tags": ["atlas"],
+  "time": { "from": "now-1h", "to": "now" },
+  "refresh": "10s",
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Signal outcomes (rate /s, 5m)",
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "decimals": 3 } },
+      "targets": [
+        { "expr": "sum by (result) (rate(atlas_signals_total[5m]))", "legendFormat": "{{result}}" }
+      ]
+    },
+    {
+      "type": "gauge",
+      "title": "Signal reject ratio (10m)",
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0, "max": 1, "unit": "percentunit",
+          "thresholds": { "steps": [
+            { "color": "green", "value": 0 },
+            { "color": "yellow", "value": 0.8 },
+            { "color": "red", "value": 0.95 }
+          ] }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(atlas_signals_total{result=~\"vetoed|gated\"}[10m])) / clamp_min(sum(rate(atlas_signals_total[10m])), 1e-9)",
+          "legendFormat": "reject ratio"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Active WS connections",
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 0 },
+      "targets": [{ "expr": "atlas_ws_connections", "legendFormat": "ws" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Pipeline latency P50/P95 by stage",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(atlas_pipeline_seconds_bucket[5m])) by (le, stage))",
+          "legendFormat": "p50 {{stage}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(atlas_pipeline_seconds_bucket[5m])) by (le, stage))",
+          "legendFormat": "p95 {{stage}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "HTTP request rate by route",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "fieldConfig": { "defaults": { "unit": "reqps" } },
+      "targets": [
+        { "expr": "sum by (path) (rate(atlas_http_requests_total[5m]))", "legendFormat": "{{path}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "HTTP P95 latency by route",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(atlas_http_request_seconds_bucket[5m])) by (le, path))",
+          "legendFormat": "p95 {{path}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Alerts fired by channel",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 14 },
+      "targets": [
+        { "expr": "sum by (channel, ok) (rate(atlas_alerts_fired_total[10m]))", "legendFormat": "{{channel}} ok={{ok}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Orders + monitor exits",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 14 },
+      "targets": [
+        { "expr": "sum by (status) (rate(atlas_orders_total[15m]))", "legendFormat": "order {{status}}" },
+        { "expr": "sum by (reason) (rate(atlas_monitor_exits_total[15m]))", "legendFormat": "exit {{reason}}" }
+      ]
+    }
+  ]
+}

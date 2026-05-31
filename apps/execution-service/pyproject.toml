@@ -1,0 +1,27 @@
+[project]
+name = "execution-service"
+version = "0.1.0"
+description = "Paper/Alpaca broker execution: open/close positions, journal on close."
+requires-python = ">=3.12"
+dependencies = [
+    "atlas-shared",
+    "portfolio-service",
+    "journal-service",
+    "ingest-equities",
+    "httpx>=0.27",
+    "sqlalchemy>=2.0",
+    "asyncpg>=0.29",
+]
+
+[tool.uv.sources]
+atlas-shared = { workspace = true }
+portfolio-service = { workspace = true }
+journal-service = { workspace = true }
+ingest-equities = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/execution_service"]

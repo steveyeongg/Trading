@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.uv-cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# Node / web
+node_modules/
+.next/
+out/
+.turbo/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# ML artifacts
+mlruns/
+.dvc/cache/
+*.pkl
+*.joblib
+*.onnx
+ml/datasets/raw/
+ml/datasets/processed/
+
+# Local data
+data/
+*.parquet
+*.db
+*.sqlite
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+secrets/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Docker volumes
+infra/docker/data/

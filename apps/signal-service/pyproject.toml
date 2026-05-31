@@ -1,0 +1,50 @@
+[project]
+name = "signal-service"
+version = "0.1.0"
+description = "FastAPI surface for /v1/signals, /v1/scan."
+requires-python = ">=3.12"
+dependencies = [
+    "atlas-shared",
+    "feature-engine",
+    "quant-engine",
+    "scoring-engine",
+    "risk-engine",
+    "explanation-engine",
+    "macro-engine",
+    "options-analytics",
+    "news-ingest",
+    "ingest-equities",
+    "backtest-service",
+    "portfolio-service",
+    "journal-service",
+    "alert-service",
+    "execution-service",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "httpx>=0.27",
+    "pandas>=2.2",
+]
+
+[tool.uv.sources]
+atlas-shared = { workspace = true }
+feature-engine = { workspace = true }
+quant-engine = { workspace = true }
+scoring-engine = { workspace = true }
+risk-engine = { workspace = true }
+explanation-engine = { workspace = true }
+macro-engine = { workspace = true }
+options-analytics = { workspace = true }
+news-ingest = { workspace = true }
+ingest-equities = { workspace = true }
+backtest-service = { workspace = true }
+portfolio-service = { workspace = true }
+journal-service = { workspace = true }
+alert-service = { workspace = true }
+execution-service = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/signal_service"]

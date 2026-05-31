@@ -1,0 +1,45 @@
+name: atlas-observability
+
+# Prometheus scrapes the signal-service /metrics on the host (:8000) and
+# Grafana renders the prebuilt ATLAS dashboard. Run alongside the app:
+#   docker compose -f infra/observability/docker-compose.yml up -d
+#   → Grafana http://localhost:3001  (admin / admin)
+#   → Prometheus http://localhost:9090
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: atlas-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prom_data:/prometheus
+    extra_hosts:
+      # Lets the container reach the host's uvicorn on Linux (Docker Desktop
+      # provides this automatically on macOS/Windows).
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: atlas-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+volumes:
+  prom_data:
+  grafana_data:

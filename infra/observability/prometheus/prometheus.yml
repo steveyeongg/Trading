@@ -1,0 +1,20 @@
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: atlas-signal-service
+    metrics_path: /metrics
+    static_configs:
+      # host.docker.internal reaches the uvicorn process running on the host.
+      # When the API is containerised, swap to its service name.
+      - targets: ["host.docker.internal:8000"]
+        labels:
+          service: signal-service
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

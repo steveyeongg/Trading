@@ -1,0 +1,25 @@
+[project]
+name = "portfolio-service"
+version = "0.1.0"
+description = "Portfolio holdings + risk analytics."
+requires-python = ">=3.12"
+dependencies = [
+    "atlas-shared",
+    "ingest-equities",
+    "risk-engine",
+    "numpy>=1.26",
+    "sqlalchemy>=2.0",
+    "asyncpg>=0.29",
+]
+
+[tool.uv.sources]
+atlas-shared = { workspace = true }
+ingest-equities = { workspace = true }
+risk-engine = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/portfolio_service"]

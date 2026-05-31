@@ -1,0 +1,53 @@
+groups:
+  - name: atlas-slo
+    rules:
+      # Veto/gate rate spike — the engine is rejecting most candidates.
+      - alert: HighSignalRejectRate
+        expr: |
+          sum(rate(atlas_signals_total{result=~"vetoed|gated"}[10m]))
+            /
+          clamp_min(sum(rate(atlas_signals_total[10m])), 1e-9) > 0.95
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: ">95% of signals rejected over 10m"
+          description: "Risk gate or scoring gate may be mis-tuned, or data is stale."
+
+      # Pipeline latency regression (P95 features stage).
+      - alert: PipelineLatencyHigh
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(atlas_pipeline_seconds_bucket{stage="features"}[5m])) by (le)
+          ) > 1.0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Feature-compute P95 > 1s"
+          description: "Indicator pipeline is slow — check feed volume / CPU."
+
+      # Alert delivery failures.
+      - alert: AlertDeliveryFailures
+        expr: sum(rate(atlas_alerts_fired_total{ok="false"}[10m])) > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Alert deliveries failing"
+          description: "A channel (webhook/telegram/email) is rejecting or unconfigured."
+
+      # Order rejections.
+      - alert: OrderRejections
+        expr: sum(rate(atlas_orders_total{status="rejected"}[15m])) > 0
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "Broker orders being rejected"
+          description: "Check broker connectivity, buying power, or symbol validity."
+
+      # Target is down / not scraping.
+      - alert: SignalServiceDown
+        expr: up{job="atlas-signal-service"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "signal-service /metrics unreachable"
+          description: "The API is down or not exposing metrics."

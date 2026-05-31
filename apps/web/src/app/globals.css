@@ -1,0 +1,17 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body {
+  background-color: #0b0d10;
+  color: #e6e9ee;
+  font-feature-settings: 'tnum' on;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+.bar-track {
+  background: linear-gradient(90deg, transparent 0%, transparent 49.9%, #3a434e 49.9%, #3a434e 50.1%, transparent 50.1%, transparent 100%);
+}

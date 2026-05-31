@@ -1,0 +1,6 @@
+# pnpm 11 reads build-allow settings here (no longer from package.json's
+# "pnpm" field). Allow unrs-resolver — a transitive eslint native resolver —
+# to run its build so `pnpm install` exits clean and the deps pre-check that
+# pnpm runs before `build` / `typecheck` doesn't hard-fail.
+allowBuilds:
+  unrs-resolver: true
