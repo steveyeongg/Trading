@@ -58,6 +58,7 @@ secrets/
 # Logs
 *.log
 logs/
+GAP_AUDIT.md
 
 # Docker volumes
 infra/docker/data/
