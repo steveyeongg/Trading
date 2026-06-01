@@ -6,14 +6,20 @@ import type {
   BarsResponse,
   ExecuteRequest,
   ExecuteResult,
+  ExplanationResponse,
+  FreshnessResponse,
   JournalResponse,
   Me,
   NewAlertRule,
   Order,
   PortfolioSummary,
+  ProvidersStatusResponse,
   RegimeSnapshot,
+  ScreenerRequest,
+  ScreenerResponse,
   Signal,
   SignalDebug,
+  UniversesResponse,
 } from './types';
 
 // All API traffic goes through Next.js rewrites (`/api/*` → backend).
@@ -121,4 +127,24 @@ export const api = {
   createAlert: (rule: NewAlertRule) => post<{ id: string }>('/alerts', rule),
   deleteAlert: (id: string) => del<{ deleted: string }>(`/alerts/${id}`),
   getDeliveries: (limit = 50) => get<{ deliveries: AlertDelivery[] }>(`/alerts/deliveries?limit=${limit}`),
+
+  // Screener — BLUEPRINT §4 / §13.2
+  getUniverses: () => get<UniversesResponse>('/screener/universes'),
+  runScreener: (req: ScreenerRequest) => post<ScreenerResponse>('/screener/run', req),
+
+  // BLUEPRINT §10.3 explanation payload (structured).
+  explainSignal: (symbol: string, horizon = 'swing') =>
+    post<ExplanationResponse>(
+      `/explain/signal?symbol=${encodeURIComponent(symbol.toUpperCase())}&horizon=${horizon}`,
+      {},
+    ),
+
+  // BLUEPRINT §13.1 — provider status + data freshness.
+  providersStatus: () => get<ProvidersStatusResponse>('/providers/status'),
+  dataFreshness: (symbols?: string[]) =>
+    get<FreshnessResponse>(
+      symbols && symbols.length > 0
+        ? `/data/freshness?symbols=${encodeURIComponent(symbols.join(','))}`
+        : '/data/freshness',
+    ),
 };

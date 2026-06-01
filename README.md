@@ -1,19 +1,27 @@
 # ATLAS
 
-**Adaptive Trading Logic & Allocation System** — an institutional-grade, multi-asset, AI-powered trading intelligence engine.
+**Adaptive Trading Logic & Allocation System** — a low-cost, multi-asset, AI-augmented stock screener + trading signal engine. Built to the spec in [`docs/architecture/BLUEPRINT.md`](docs/architecture/BLUEPRINT.md).
 
-**Docs map:** [docs/](docs/README.md) — start with [`architecture/SYSTEM.md`](docs/architecture/SYSTEM.md) for the delivered shape, [`architecture/BLUEPRINT.md`](docs/architecture/BLUEPRINT.md) for the design target, [`runbooks/OPERATIONS.md`](docs/runbooks/OPERATIONS.md) to run it, and [`CHANGELOG.md`](CHANGELOG.md) for the build log. ADRs in [`docs/adr/`](docs/adr/).
+**Docs map:** [docs/](docs/README.md) — start with [`architecture/SYSTEM.md`](docs/architecture/SYSTEM.md) for the delivered shape, [`architecture/BLUEPRINT.md`](docs/architecture/BLUEPRINT.md) for the design target, [`architecture/GAP_AUDIT.md`](docs/architecture/GAP_AUDIT.md) for the closed punch list, [`runbooks/OPERATIONS.md`](docs/runbooks/OPERATIONS.md) to run it, and [`CHANGELOG.md`](CHANGELOG.md) for the build log. ADRs in [`docs/adr/`](docs/adr/).
 
 ## What's built
 
 **16 Python packages + 1 Next.js app + observability stack**, end-to-end:
-ingest → 25 indicators → XGBoost quant → macro/sentiment/options sub-scores →
-composite + risk → LLM rationale → signal → WS push → alert engine → paper /
-Alpaca execution → ladder + chandelier-trail position monitor → journal →
-portfolio + VaR → Prometheus/Grafana. **221 backend tests, 0 lint errors.** See
+manual symbols / screener universe → ingest → **50 indicators** → XGBoost
+quant (with `feature_health`) → news / sentiment / macro / options / liquidity
+/ risk sub-scores → BLUEPRINT §8.2 composite weights + §8.5 confirmation gate
+→ §9 risk engine (Donchian-structure stops + time stops + news veto) →
+DeepSeek §10.3 structured JSON explanation (with §10.4 safety repair + §10.5
+local cache) → Signal → WS push → **§12.2 event-aware** alert engine
+(§12.3 Telegram format) → paper / Alpaca execution (**opt-in**) →
+ladder + chandelier-trail monitor → journal → portfolio + VaR →
+Prometheus / Grafana.
+
+**274 backend tests passing**, dashboard typecheck clean. **All 30
+GAP_AUDIT items closed; all 10 §22 non-negotiables satisfied.** See
 [`docs/architecture/SYSTEM.md`](docs/architecture/SYSTEM.md) for the full map
-and the **deferral ledger** (what's deliberately *not* built and when to revisit
-each).
+and the **deferral ledger** (what's deliberately *not* built and when to
+revisit each).
 
 ## Quick start
 
@@ -58,25 +66,40 @@ ATLAS_TREND_MODEL=ml/registry/trend/v1.joblib \
 
 # 11. Run the dashboard (Terminal 2)
 cd apps/web && pnpm install && pnpm dev                                       # :3000
-# open http://localhost:3000
+# open http://localhost:3000  → quick-scan box, scanner, alerts, settings...
 
 # 12. (optional) Observability stack — Prometheus + Grafana
 # docker compose -f infra/observability/docker-compose.yml up -d              # :9090, :3001
 ```
 
-After step 11, the dashboard renders the fallback watchlist
-(AAPL/MSFT/NVDA/TSLA/SPY/QQQ/BTC/ETH) and the WS broadcaster starts
-publishing signals every ~15s. Edit the watchlist at
-[http://localhost:3000/settings](http://localhost:3000/settings) or via
-`PUT /v1/watchlist` (see [`docs/runbooks/OPERATIONS.md`](docs/runbooks/OPERATIONS.md)).
+After step 11, the dashboard renders the default watchlist
+(AAPL/MSFT/NVDA/TSLA/SPY/QQQ — equities-only by default, BLUEPRINT §4.3) and
+the WS broadcaster publishes signals every ~15s. Edit the watchlist at
+[`/settings`](http://localhost:3000/settings) or via `PUT /v1/watchlist`.
+Crypto, US mega-cap, NASDAQ-100 seed, and Core ETFs ship as explicit opt-in
+universes in [`infra/data/universes.json`](infra/data/universes.json) — select
+them on the [Scanner page](http://localhost:3000/scanner).
+
+## What the dashboard surfaces
+
+| Page | What's there |
+|---|---|
+| `/` | Quick-scan input (1 ticker → symbol page; many → scanner), watchlist with live composite scores, "how signals are formed" explainer. |
+| `/scanner` | BLUEPRINT §11 + §13.2 — universe dropdown, manual symbols (append-friendly), horizon, min-composite, top-N, optional DeepSeek rationale. Rows that don't publish list their *gate reason*. Full §11.3 column set incl. Tech / Quant / News / Macro / Risk per-engine sub-scores. |
+| `/symbols/{symbol}` | Live price chart with entry/stop/T1-T3 lines, signal card, **structured §10.3 explanation panel** (summary, bull case, bear case, why entry/stop, target logic, confidence, final view — or the no-signal reason when gated), macro + sentiment snapshot. |
+| `/alerts` | Alert rules CRUD, deliveries audit. Rules fire on the §12.2 event set; Telegram body matches §12.3. |
+| `/settings` | Watchlist editor, **provider status panel** (12 dependencies × config / availability / fallback), tier switcher. |
+| `/backtest` | Walk-forward synthetic backtest with cost-sweep + Sharpe CI. |
+| `/portfolio` | Holdings, sector exposure, VaR strip. |
+| `/journal` | Closed-trade log + attribution (hit rate, expectancy R, exit reasons). |
 
 ## Configuration
 
 Everything is driven by env vars loaded from `.env` at the repo root. The
 **authoritative catalog with inline how-to-get-the-credentials notes** lives in
 [`.env.example`](.env.example); copy it to `.env` and uncomment what you use.
-Every feature is fail-soft — missing keys degrade gracefully, they don't crash
-the pipeline.
+Every feature is fail-soft — missing keys degrade gracefully and never crash
+the pipeline. `GET /v1/providers/status` returns the live availability matrix.
 
 | Group | Env var(s) | What it unlocks | Required? |
 |---|---|---|---|
@@ -84,15 +107,19 @@ the pipeline.
 | **Auth** | `ATLAS_AUTH_MODE` (`dev`\|`jwt`), `ATLAS_DEV_TIER` | `dev` trusts `X-Dev-User`/`X-Dev-Tier` headers for offline use | no — `dev` mode is the default |
 | | `ATLAS_JWKS_URL`, `ATLAS_JWT_ISSUER`, `ATLAS_JWT_AUDIENCE`, `ATLAS_JWT_TIER_CLAIM` | Real JWT via Clerk/Auth0 once `ATLAS_AUTH_MODE=jwt` | only in prod |
 | **Bars (equities)** | `POLYGON_API_KEY` | `ingest_equities backfill --source polygon` pulls real bars | one of Polygon OR Alpaca |
-| | `ALPACA_API_KEY` + `ALPACA_API_SECRET` (+ optional `ALPACA_FEED=iex\|sip`) | `--source alpaca` pulls bars from Alpaca Market Data v2 (free IEX feed, or paid SIP) | one of Polygon OR Alpaca |
-| **Macro** | `FRED_API_KEY` | `macro_engine.refresh` uses real FRED series (else synthetic) | no |
+| | `ALPACA_API_KEY` + `ALPACA_API_SECRET` (+ optional `ALPACA_FEED=iex\|sip`) | `--source alpaca` pulls bars from Alpaca Market Data v2 (free IEX feed by default) | one of Polygon OR Alpaca |
+| **Macro** | `FRED_API_KEY` | `macro_engine.refresh` uses real FRED series. *Any* failure (missing key, HTTP error, rate limit) silently degrades to synthetic series — never raises. | no |
 | **News** | `NEWSAPI_KEY` | `news_ingest.refresh --source newsapi` (else RSS / file replay) | no |
-| **LLM (rationales)** | `DEEPSEEK_API_KEY` (+ optional `ATLAS_EXPLAIN_MODEL=deepseek-chat\|deepseek-reasoner`) | LLM-generated trade explanations via DeepSeek (OpenAI-compat API, server-side prompt cache) | no — templated fallback otherwise |
+| **LLM (rationales)** | `DEEPSEEK_API_KEY` (+ optional `ATLAS_EXPLAIN_MODEL=deepseek-chat\|deepseek-reasoner`) | DeepSeek emits the strict §10.3 JSON contract; missing key → templated payload with the same schema | no — templated fallback otherwise |
 | **Execution** | reuses `ALPACA_API_KEY` + `ALPACA_API_SECRET` (+ optional `ALPACA_BASE_URL`) | `/v1/execute` routes to Alpaca paper instead of the in-process paper broker | no |
+| **Auto-execution** | `ATLAS_ENABLE_AUTO_EXECUTION=1` | Starts the 10s position-monitor loop (auto-closes on stop/target/time). **Off by default — §22 #6 non-negotiable.** | no |
+| **Risk thresholds** | `ATLAS_MIN_COMPOSITE`, `ATLAS_MIN_CONFIDENCE`, `ATLAS_MIN_CONFIRMING_ENGINES`, `ATLAS_MIN_AGREE_THRESHOLD`, `ATLAS_NEWS_VETO_THRESHOLD`, `ATLAS_MAX_BAR_AGE_SWING_H` | Loosen / tighten signal gates without code changes | no (defaults sensible) |
 | **ML registry** | `ATLAS_TREND_MODEL` | Points the signal service at a trained joblib model | recommended (else `s_quant` is null) |
 | **Alerts — webhook** | `ATLAS_WEBHOOK_URL`, `ATLAS_WEBHOOK_SECRET` | HMAC-SHA256 signed POST to your endpoint | no |
-| **Alerts — Telegram** | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Telegram bot push (see `.env.example` for the @BotFather + `getUpdates` flow) | no |
+| **Alerts — Telegram** | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Telegram bot push in the §12.3 layout (emoji header, full trade plan, invalidation, disclaimer) | no |
 | **Alerts — Email** | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `ALERT_EMAIL_FROM`, `ALERT_EMAIL_TO` | SMTP delivery | no |
+| **Explanation cache** | `ATLAS_EXPLAIN_CACHE_TTL_S` (default 900), `ATLAS_EXPLAIN_CACHE_SIZE` (default 256) | §10.5 LRU+TTL cache size and lifetime for structured rationales | no |
+| **Universes** | `ATLAS_UNIVERSES_PATH` | Override the screener universe file (default `infra/data/universes.json`) | no |
 | **Runtime** | `ENV` (`dev`\|`staging`\|`prod`), `LOG_LEVEL`, `LOG_JSON` | Log shape + level | defaults are fine |
 
 The `log` alert channel is **always on** — no env required — so you always
@@ -105,39 +132,48 @@ behavior matrix and the "going live" checklist.
 ```
 atlas/  (named "Trading" on disk for historical reasons)
 ├── apps/
-│   ├── ingest-equities/       # OHLCV ingestion (Polygon → Alpaca fallback; synthetic CLI for offline dev)
-│   ├── feature-engine/        # 25 technical indicators
-│   ├── quant-engine/          # XGBoost trend (triple-barrier + walk-fwd CV + isotonic)
-│   ├── scoring-engine/        # sub-scores → composite + gates
-│   ├── risk-engine/           # Kelly / vol-target / VaR / veto
-│   ├── explanation-engine/    # DeepSeek (OpenAI-compat, server-cached) + templated fallback
-│   ├── macro-engine/          # FRED + KMeans regime → s_macro
+│   ├── ingest-equities/       # OHLCV ingestion (Polygon ↔ Alpaca ↔ yfinance ↔ synthetic GBM)
+│   ├── feature-engine/        # 50 indicators (BLUEPRINT §5.2): EMAs, SMAs, RSI, MACD,
+│   │                          # ATR, BB, VWAP, OBV, ADX, Stoch, Ichimoku, Supertrend,
+│   │                          # Donchian, Keltner, Pivots, Fib, RVOL, 52-week dist, gap %,
+│   │                          # SMC BOS, divergences, realised vol
+│   ├── quant-engine/          # XGBoost trend (triple-barrier + walk-fwd CV + isotonic) +
+│   │                          # §6.2 predict_full → {p_up, p_down, s_quant, calibrated, feature_health}
+│   ├── scoring-engine/        # §5.3 s_tech weighted blocks · §8.2 composite weights ·
+│   │                          # s_news / s_risk / s_liq / §8.5 confirmation gate · GateResult
+│   ├── risk-engine/           # Kelly · vol-target · ATR-risk · Donchian-structure stops ·
+│   │                          # news-event veto · VaR/CVaR · veto reasons
+│   ├── explanation-engine/    # §10.3 ExplanationPayload + §10.4 safety_repair +
+│   │                          # §10.5 LRU+TTL cache + DeepSeek JSON contract + templated fallback
+│   ├── macro-engine/          # FRED (always fail-soft to synthetic) + KMeans regime → s_macro
 │   ├── sentiment-engine/      # lexicon + optional FinBERT → s_sent
 │   ├── options-analytics/     # BS Greeks + chain analytics → s_opt
 │   ├── news-ingest/           # RSS / NewsAPI / file → news_items
 │   ├── portfolio-service/     # positions + valuation + reduce_position
 │   ├── journal-service/       # closed-trade log + attribution
-│   ├── alert-service/         # rules + log/webhook/telegram/email channels
+│   ├── alert-service/         # §12.2 derive_events (7 triggers) + §12.3 Telegram format +
+│   │                          # log/webhook/email channels
 │   ├── backtest-service/      # event-driven sim + cost sweep + bootstrap CI
-│   ├── execution-service/     # paper/Alpaca + ladder monitor (plan_exit)
-│   ├── signal-service/        # FastAPI surface + WS + lifespan loops + /metrics
-│   └── web/                   # Next.js 14 dashboard (7 pages)
-├── packages/shared-py/        # logging · db · auth · entitlements · metrics
+│   ├── execution-service/     # paper/Alpaca + ladder monitor (opt-in via ATLAS_ENABLE_AUTO_EXECUTION)
+│   ├── signal-service/        # FastAPI surface + WS + lifespan loops + /metrics + screener
+│   └── web/                   # Next.js 14 dashboard — 8 pages
+├── packages/shared-py/        # logging · db · auth · entitlements · metrics · schemas
 ├── infra/
+│   ├── data/                  # universes.json (BLUEPRINT §4.3 built-in screener universes)
 │   ├── docker/                # Postgres+Timescale+Redis
 │   └── observability/         # Prometheus + Grafana + dashboard JSON + alerts
 ├── ml/                        # registry, notebooks, experiments
-├── docs/                      # SYSTEM.md, BLUEPRINT.md, ADRs, runbooks
-└── tests/                     # cross-package
+├── docs/                      # SYSTEM.md, BLUEPRINT.md, GAP_AUDIT.md, ADRs, runbooks
+└── tests/                     # cross-package (274 passing)
 ```
 
 ## What's next
 
-Tracked in [`docs/architecture/SYSTEM.md`'s deferral ledger](docs/architecture/SYSTEM.md#deferral-ledger--whats-deliberately-not-built). High-value items still ahead:
-real options / fundamentals / on-chain data adapters (the synthetic fallbacks are
-ready), Clerk/Auth0 wire-up (the entitlement layer is built), OTLP distributed
-tracing, and Kubernetes + multi-region deployment once paying users justify the
-operational tax.
+Tracked in [`docs/architecture/SYSTEM.md`'s deferral ledger](docs/architecture/SYSTEM.md#deferral-ledger--whats-deliberately-not-built). Now that BLUEPRINT v2 is fully aligned, the
+top remaining items are real options / fundamentals adapters (synthetic
+fallbacks exist), Clerk/Auth0 wire-up (entitlement layer is built), OTLP
+distributed tracing, and Kubernetes + multi-region deployment once paying
+users justify the operational tax.
 
 ## License
 

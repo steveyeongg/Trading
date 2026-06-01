@@ -31,7 +31,7 @@ def signal() -> Signal:
         confidence_pct=72.0,
         conviction=Conviction.HIGH,
         regime="risk-on",
-        sub_scores=SubScores(tech=22, quant=20, sent=12, opt=11, macro=8, fund=5, liq=5),
+        sub_scores=SubScores(tech=22, quant=20, sent=12, opt=11, macro=8, news=5, liq=5, risk=4),
         entry_price=214.30,
         stop_price=206.10,
         take_profit_levels=[222.5, 230.0, 238.0],
@@ -43,14 +43,19 @@ def signal() -> Signal:
 
 
 def test_templated_rationale_format(signal: Signal) -> None:
+    """BLUEPRINT §10.3 sections must all appear in the markdown render."""
     md = templated_rationale(signal, features={"rsi14": 58.0, "macd_hist": 0.5})
     assert "SIGNAL: AAPL — LONG" in md
     assert "Composite: +78.0" in md
     assert "Confidence: 72%" in md
     assert "$214.30" in md
     assert "Trade plan" in md
-    assert "Why" in md
-    assert "Devil's advocate" in md
+    assert "Summary" in md
+    assert "Bull case" in md
+    assert "Bear case" in md
+    assert "Why entry" in md
+    assert "Why stop" in md
+    assert "Target logic" in md
     assert "Disclaimer" in md
 
 

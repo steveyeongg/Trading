@@ -4,6 +4,7 @@ import { useQuery } from '@tanstack/react-query';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import { api, ApiError } from '@/lib/api';
+import { ExplanationPanel } from '@/components/ExplanationPanel';
 import { RegimeBar } from '@/components/RegimeBar';
 import { Watchlist } from '@/components/Watchlist';
 import { SignalCard } from '@/components/SignalCard';
@@ -54,6 +55,10 @@ export default function SymbolPage() {
               <PriceChart symbol={symbol} signal={data.signal} />
 
               <SignalCard signal={data.signal} veto={data.veto} />
+
+              {/* BLUEPRINT §11.2 — full structured explanation, or the
+                  no-signal reason when the gates killed the candidate. */}
+              <ExplanationPanel symbol={symbol} />
 
               <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
                 <Panel title="Macro Snapshot">

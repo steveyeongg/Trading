@@ -4,6 +4,247 @@ Chronological record of what shipped across the build. Newest first.
 Every entry maps to a turn in the build log; phase numbers reference
 `docs/architecture/BLUEPRINT.md` §18.
 
+## 0.23.0 — Phase 5 + 6: provider status, data freshness, §12.2 events, §12.3 Telegram, exec opt-in, dashboard polish
+
+Closes the last five GAP_AUDIT items (#22–#30) and the remaining three §22
+non-negotiables. Default watchlist trimmed to equities-only per §4.3
+(`BTC`/`ETH` removed from `Watchlist.tsx` and `watchlist.py`; crypto is now
+available only as an explicit opt-in universe).
+
+### Phase 5 — real-data observability
+
+- **New `GET /v1/providers/status`** ([providers.py](apps/signal-service/src/signal_service/providers.py))
+  returns configured + availability state for all 12 dependencies (alpaca,
+  polygon, yfinance, synthetic, fred, newsapi, rss, deepseek, telegram,
+  webhook, postgres, redis) grouped by category, each with its documented
+  fallback. §17 fail-soft policy block embedded so the dashboard can explain
+  *why* missing keys are safe.
+- **New `GET /v1/data/freshness`** — per-symbol last-bar age (seconds) +
+  macro snapshot age. Accepts `?symbols=AAPL,NVDA`; defaults to the default
+  watchlist.
+- **New end-to-end fail-soft test** — `test_pipeline_runs_with_no_provider_keys`
+  strips every external API key, runs the full pipeline, and asserts a
+  rationale is still produced with the disclaimer intact. Hard guarantee of
+  the §17 policy.
+- **Dashboard:** new [`ProvidersStatusPanel`](apps/web/src/components/ProvidersStatusPanel.tsx)
+  on `/settings` — green/grey dots per provider with the fallback string.
+
+### Phase 6 — alerts, exec, dashboard
+
+- **§12.2 event derivation** ([events.py](apps/alert-service/src/alert_service/events.py))
+  — new `derive_events()` computes all 7 triggers: `signal_new`,
+  `signal_upgraded`, `composite_threshold_crossed`,
+  `price_reached_entry/t1/t2/t3`, `price_hit_stop`, `risk_veto_changed`,
+  `macro_regime_changed`. Alert engine now tracks last-signal + last-regime
+  per symbol and surfaces the event flags on every dispatched payload.
+- **§12.3 Telegram format** — `format_alert` rewritten to the spec'd layout:
+  🚨 emoji header, score / confidence / conviction, entry / SL / T1-T3 / R:R,
+  "Why" bullets, **invalidation**, **disclaimer**. Closes §22 #5
+  ("no alert without invalidation").
+- **Auto-execution opt-in** — `_monitor_loop()` only starts when
+  `ATLAS_ENABLE_AUTO_EXECUTION=1`. Default off, with an explicit log line
+  explaining how to enable. Closes §22 #6 ("no auto-execution by default").
+- **`POST /v1/explain/signal`** — returns the structured §10.3 payload for a
+  symbol (or the no-signal reason if the gates failed). Cached server-side
+  via the §10.5 LRU+TTL.
+- **Dashboard:** new [`ExplanationPanel`](apps/web/src/components/ExplanationPanel.tsx)
+  on `/symbols/{symbol}` renders the §10.3 sections inline (summary,
+  bull/bear cases, why entry, why stop, target logic, confidence, final
+  view) — or a clean "no signal" card with the gate reason when the
+  candidate didn't publish. Closes the dashboard side of §11.2 #12.
+
+### Tests + checks
+
+- +29 new tests across `test_phase5_providers.py` (8) and
+  `test_phase6_alerts.py` (13) covering each §12.2 trigger and the §12.3
+  message body.
+- Backend test count **256 → 274** (+18 net; one test in `test_alerts.py`
+  rewritten to the new payload shape). Same 2 pre-existing
+  `test_bars_resolution.py` failures (older Timescale `time_bucket` test vs.
+  current Postgres-native SQL — unrelated to this work).
+- Dashboard `pnpm tsc --noEmit` clean against the new `quant_meta`,
+  `time_stop_at`, `invalidations`, `ExplanationPayload`,
+  `ProvidersStatusResponse`, and `FreshnessResponse` types.
+
+**All 30 GAP_AUDIT items now closed (100%). All 10 §22 non-negotiables
+satisfied.**
+
+## 0.22.0 — Phase 4: DeepSeek §10.3 JSON contract + §10.4 safety + §10.5 cache + §6.2 feature_health
+
+Tightens the LLM layer so DeepSeek can't be the source of trade fictions and
+so the quant model surfaces its own data-health state.
+
+- **§10.3 strict JSON I/O.** New shared `ExplanationPayload` pydantic schema
+  with `summary`, `bull_case`, `bear_case`, `why_entry`, `why_stop`,
+  `target_logic`, `confidence_comment`, `final_view`, plus `source` and
+  `safety_repaired` flags. [`payload.py`](apps/explanation-engine/src/explanation_engine/payload.py)
+  ships `parse_llm_json` (tolerates fenced blocks) and `render_markdown` (a
+  deterministic projection used for `Signal.rationale_md`). [System prompt](apps/explanation-engine/src/explanation_engine/prompts.py)
+  rewritten to demand raw JSON; writer requests
+  `response_format={"type": "json_object"}`.
+- **§10.4 safety rules.** `safety_repair()` strips/rewrites five forbidden
+  phrase patterns (`guaranteed`, `guarantees`, `risk-free`/`no risk`,
+  `sure thing`, `can't lose`) across all text fields and *guarantees* at
+  least one invalidation in `bear_case` (falls back to the deterministic
+  invalidations on `Signal` if the LLM omitted them). Sets
+  `safety_repaired=True` so the dashboard can label a repaired payload.
+  Disclaimer is appended by the markdown renderer, not requested from the
+  model.
+- **§10.5 cache key.** `make_cache_key(signal, features)` returns
+  `symbol:horizon:direction:bucket:feat_hash:news_hash`. Composite scores
+  round to the nearest 5, so signals at 73 and 74 share a slot. New
+  `_TTLCache` (LRU + TTL hybrid) fronts both the LLM and templated branches;
+  default 256 entries × 15-minute TTL, env-overridable.
+- **§6.2 quant feature_health.** `TrendModel.predict_full()` returns the full
+  blueprint output schema: `{p_up, p_down, s_quant, model_version,
+  calibrated, feature_health}`. `feature_health` is `ok` / `degraded` /
+  `missing` based on NaN count in the required feature columns. New
+  `Signal.quant_meta` field carries it through the pipeline; templated
+  rationale flags degraded feature health in `confidence_comment`.
+
+### Tests
+
+- +17 tests in [`test_phase4_deepseek.py`](tests/test_phase4_deepseek.py) —
+  JSON parse (clean / fenced / malformed); safety repair (forbidden phrases,
+  forced invalidation, clean pass-through); cache key
+  (bucket-stability, feature-hash split, news-hash split); writer cache
+  return-same-instance vs. bypass; templated payload required sections;
+  feature_health surfacing in degraded mode.
+- `test_explanation.py::test_templated_rationale_format` updated to the new
+  §10.3 sections.
+- Test count **239 → 256** (+17).
+
+## 0.21.0 — Phase 3: signal quality — 9 missing §5.2 indicators + §5.3 weighted blocks + Donchian-structure stops + time stops + news-event veto
+
+Tightens signal quality so individual signals are easier to trust.
+
+- **9 new indicators** ([feature-engine/indicators.py](apps/feature-engine/src/feature_engine/indicators.py)):
+  SMA 20/50/200, Supertrend (line + direction), Donchian (upper/middle/lower),
+  Keltner (upper/middle/lower), Pivot points (pivot/r1/s1), Fibonacci
+  (`fib_position` ∈ [0,1] + `fib_mid`), Relative Volume (`rvol_20`),
+  52-week high/low distance (high_52w_dist, low_52w_dist), Gap %. Total
+  feature surface 30 → 50 indicators.
+- **§5.3 s_tech weighted blocks.** [`sub_scores.py`](apps/scoring-engine/src/scoring_engine/sub_scores.py)
+  s_tech refactored to the explicit `25% trend + 20% momentum + 15%
+  volatility + 15% volume + 15% structure + 10% MTF` formula. Trend block
+  uses EMA stack alignment + ADX strength weighted by DI± + Supertrend
+  direction. Volume block uses OBV-z × relative volume. Structure block uses
+  BOS + divergences + Donchian breakout position + Fibonacci extremes. New
+  `s_tech_breakdown()` exposes per-block contributions for the debug
+  endpoint.
+- **Donchian-structure stop loss (§9.3).** `generate_signal()` picks
+  `max(ATR-stop, donchian_lower - 0.5×ATR)` for longs (mirror for shorts).
+  ATR-only fallback when Donchian is unavailable. Sanity guard prevents the
+  stop crossing entry. Targets re-derived from the resulting risk-per-share
+  so R-multiples stay coherent.
+- **Time stop (§9.1).** New `Signal.time_stop_at: datetime | None`. Populated
+  with horizon-dependent defaults: intraday 6.5h (one session), swing 10d,
+  position 60d, long-term 252d. Env-overridable.
+- **News-event veto (§9.6).** [`risk-engine/engine.py`](apps/risk-engine/src/risk_engine/engine.py)
+  vetoes a long if `s_news ≤ -60` (or a short if `s_news ≥ +60`). Threshold
+  env-overridable via `ATLAS_NEWS_VETO_THRESHOLD`.
+
+### Tests
+
+- +13 tests in [`test_phase3_signal_quality.py`](tests/test_phase3_signal_quality.py):
+  indicator surface, Fibonacci bounds, Donchian envelope ordering, Supertrend
+  direction set; s_tech bullish trend block / bearish blocks / weights sum to
+  1.0; structural stop tighter than ATR; structural stop looser than ATR;
+  time stop populated; news veto blocks severe-negative-news long; mild
+  negative news doesn't trigger veto.
+- `test_active_weight_renorm.py` fixture updated to populate the new §5.3
+  inputs (DI±, Supertrend, rvol, Donchian, fib).
+- Test count **226 → 239** (+13).
+
+## 0.20.0 — Phase 2: Screener MVP — universes config + `/v1/screener/*` + dashboard scanner/alerts
+
+Closes the BLUEPRINT §4 screener gap end-to-end.
+
+### Backend
+
+- **Universe config.** New [`infra/data/universes.json`](infra/data/universes.json)
+  ships 5 built-in universes: `default_watchlist` (6 tickers),
+  `us_megacap` (20), `nasdaq100_seed` (30), `etfs_core` (10),
+  `crypto_majors` (2). Loadable via `ATLAS_UNIVERSES_PATH` env override.
+- **`POST /v1/screener/run`** — universe + manual symbols (mix-and-match),
+  horizon, min-composite filter, top-N cap, optional DeepSeek rationale.
+  Rows that don't publish a signal are still returned with their
+  `no_signal_reason` so the dashboard can show *why* a candidate didn't
+  rank.
+- **`GET /v1/screener/universes`** — universe metadata for the dropdown.
+- New [`screener.py`](apps/signal-service/src/signal_service/screener.py)
+  module — pure resolution + run-shaping logic (no DB writes), keyed by
+  `resolve_symbols(universe, symbols)` which handles manual+universe merge
+  and dedup.
+
+### Dashboard
+
+- New `/scanner` page — universe dropdown, manual symbol append, horizon /
+  min-composite / top-N / explain controls. Full §11.3 column set: Symbol,
+  Direction, Composite, Confidence, Conviction, Entry, Stop, T1/T2/T3, R:R,
+  per-engine Tech/Quant/News/Macro/Risk sub-scores. Collapsible
+  no-signal-reasons + skipped-symbols sections.
+- New `/alerts` page — dedicated route for rules + deliveries (previously
+  buried in `/settings`).
+- New `ManualSymbolInput` on the dashboard home: 1 ticker → symbol page,
+  >1 ticker → scanner with prefilled query.
+- Nav updated with Scanner + Alerts links.
+- Types regenerated for the new schema (news/risk subscores,
+  `bar_age_seconds`, `time_stop_at`, `invalidations`, `quant_meta`,
+  `ExplanationPayload`).
+
+### Tests
+
+- +9 tests in [`test_screener.py`](tests/test_screener.py): default
+  universe loads, list payload shape, manual mode dedup, fallback to default
+  when empty, universe mode, mixed manual+universe, unknown universe
+  raises, env override, missing-file fallback.
+- Test count **217 → 226** (+9).
+
+## 0.19.0 — Phase 1: BLUEPRINT v2 alignment — composite weights, s_news/s_risk, stale-data veto, no-signal reason, FRED fail-soft
+
+Fixes a math bug in composite scoring and surfaces the missing "why isn't
+this signal firing" reason channel. Critical for downstream signal trust.
+
+- **§8.2 composite weights fixed.** Old weights had
+  `fund(0.15) + chain(0.05) = 0.20` allocated to two sub-scores that had no
+  adapter and never returned non-zero — they silently bled magnitude from
+  tech and quant. New weights match BLUEPRINT §8.2 exactly:
+  `tech 0.30, quant 0.25, news 0.10, sent 0.10, macro 0.10, opt 0.05, liq
+  0.05, risk 0.05`. `fund`/`chain` removed entirely.
+- **`s_news` and `s_risk` promoted to first-class sub-scores.** `s_news`
+  weights news tone by saturating headline count + scorer confidence;
+  `s_risk` is an ATR/price-band trade-acceptability pre-screen (rewards the
+  0.5–4% ATR/price sweet spot, penalises ultra-tight or ultra-wild names).
+- **Stale-data veto (§9.6 + §20.1).** Pipeline now refuses to score bars
+  older than the horizon's tolerance: intraday 2h, swing 30h, position 96h,
+  long-term 168h (env-overridable). Closes §22 #9.
+- **`no_signal_reason` everywhere.** `generate_signal()` returns a
+  `GateResult` (instead of bare `None`) carrying a human-readable reason
+  when the composite/confirming-engines/confidence gates fail.
+  `PipelineResult.no_signal_reason` populated for every non-publishable
+  terminal state. Surfaced in `/v1/signals/{symbol}/debug` and the WebSocket
+  stream payload.
+- **FRED fail-soft.** `FredClient.series()` now catches every failure
+  (missing key, HTTP error, rate limit, empty payload) and degrades to the
+  deterministic synthetic series. Closes §17 "missing macro key must not
+  crash" guarantee.
+- **§22 invalidation support.** New `Signal.invalidations: list[str]` +
+  `Signal.bar_age_seconds: float | None`. Templated rationale renders an
+  invalidation block.
+
+### Tests
+
+- +5 tests in [`test_no_signal_reason.py`](tests/test_no_signal_reason.py):
+  insufficient bars carries reason, empty bars carries reason, stale-data
+  veto trips at 48h, `generate_signal` always returns a `GateResult` (never
+  None) when gates fail.
+- `test_composite.py` + `test_active_weight_renorm.py` updated to the new
+  §8.2 weights.
+- `test_atlas_strategy_runs_without_errors` rewired around the new
+  `Signal | GateResult` return type.
+- Test count **209 → 217** (+8, net of one updated).
+
 ## 0.18.2 — Multi-resolution candle aggregation + chart timeframe selector
 
 The chart was showing ~5 hours of data because the `PriceChart` component

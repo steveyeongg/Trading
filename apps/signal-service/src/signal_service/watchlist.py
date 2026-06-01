@@ -19,7 +19,8 @@ from signal_service.auth_dep import current_user
 log = get_logger("watchlist")
 router = APIRouter(prefix="/v1")
 
-FALLBACK_SYMBOLS = ["AAPL", "MSFT", "NVDA", "TSLA", "SPY", "QQQ", "BTC", "ETH"]
+# BLUEPRINT §4.3 default. Equities + index ETFs only — crypto pipeline deferred.
+FALLBACK_SYMBOLS = ["AAPL", "MSFT", "NVDA", "TSLA", "SPY", "QQQ"]
 
 # Light sanity bound — keeps a fat-fingered paste from creating thousands of
 # live subscriptions on the WS broadcaster.

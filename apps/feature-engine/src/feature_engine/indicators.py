@@ -27,6 +27,10 @@ INDICATORS: list[str] = [
     "ema21",
     "ema50",
     "ema200",
+    # BLUEPRINT §5.2 — SMA institutional reference levels.
+    "sma20",
+    "sma50",
+    "sma200",
     "atr14",
     "adx",
     "di_plus",
@@ -40,6 +44,24 @@ INDICATORS: list[str] = [
     "ichimoku_kijun",
     "ichimoku_span_a",
     "ichimoku_span_b",
+    # BLUEPRINT §5.2 — additional trend / volatility / structure indicators.
+    "supertrend",
+    "supertrend_dir",
+    "donchian_upper",
+    "donchian_lower",
+    "donchian_middle",
+    "keltner_upper",
+    "keltner_lower",
+    "keltner_middle",
+    "pivot",
+    "pivot_r1",
+    "pivot_s1",
+    "fib_position",
+    "fib_mid",
+    "rvol_20",
+    "high_52w_dist",
+    "low_52w_dist",
+    "gap_pct",
     "divergence_bull",
     "divergence_bear",
     "smc_bos",
@@ -93,6 +115,116 @@ def _zscore(s: pd.Series, window: int = 20) -> pd.Series:
     return (s - mean) / std.replace(0, np.nan)
 
 
+def _add_supertrend(df: pd.DataFrame, period: int, multiplier: float) -> None:
+    """Supertrend line + direction (+1 trend up, -1 trend down). BLUEPRINT §5.2.
+
+    Built on ATR with the standard upper/lower-band flip logic. Slightly more
+    verbose than pandas-ta's helper but works on bar series of any length
+    (pandas-ta returns NaN on short series in some versions)."""
+    hl2 = (df["high"] + df["low"]) / 2.0
+    atr = ta.atr(df["high"], df["low"], df["close"], length=period)
+    upper = hl2 + multiplier * atr
+    lower = hl2 - multiplier * atr
+
+    st = pd.Series(np.nan, index=df.index, dtype="float64")
+    direction = pd.Series(0, index=df.index, dtype="int8")
+    # Walk the series — vectorising the band-flip logic is awkward because each
+    # step depends on the previous final band. O(n) but cheap.
+    prev_st = np.nan
+    prev_dir = 1
+    for i in range(len(df)):
+        if np.isnan(atr.iloc[i]):
+            continue
+        u, l = upper.iloc[i], lower.iloc[i]
+        c = df["close"].iloc[i]
+        if np.isnan(prev_st):
+            prev_st = l
+            prev_dir = 1
+        if prev_dir == 1:
+            cur = max(l, prev_st)
+            if c < cur:
+                prev_dir = -1
+                cur = u
+        else:
+            cur = min(u, prev_st)
+            if c > cur:
+                prev_dir = 1
+                cur = l
+        st.iloc[i] = cur
+        direction.iloc[i] = prev_dir
+        prev_st = cur
+    df["supertrend"] = st
+    df["supertrend_dir"] = direction
+
+
+def _add_donchian(df: pd.DataFrame, period: int) -> None:
+    """Donchian channel — breakout detection. BLUEPRINT §5.2."""
+    df["donchian_upper"] = df["high"].rolling(period, min_periods=1).max()
+    df["donchian_lower"] = df["low"].rolling(period, min_periods=1).min()
+    df["donchian_middle"] = (df["donchian_upper"] + df["donchian_lower"]) / 2.0
+
+
+def _add_keltner(df: pd.DataFrame, period: int, multiplier: float) -> None:
+    """Keltner channel — volatility-aware envelope around EMA. BLUEPRINT §5.2."""
+    ema_mid = ta.ema(df["close"], length=period)
+    atr = ta.atr(df["high"], df["low"], df["close"], length=period)
+    df["keltner_middle"] = ema_mid
+    df["keltner_upper"] = ema_mid + multiplier * atr
+    df["keltner_lower"] = ema_mid - multiplier * atr
+
+
+def _add_pivots(df: pd.DataFrame) -> None:
+    """Classic floor pivots from the *previous* bar's H/L/C. BLUEPRINT §5.2.
+
+    These are intentionally bar-rolling rather than session-rolling — for
+    intraday timeframes that produces too much churn to be useful, but the
+    composite scorer just uses pivot_r1 / pivot_s1 distance as another
+    support/resistance reference, not a hard level."""
+    pc = df["close"].shift(1)
+    ph = df["high"].shift(1)
+    pl = df["low"].shift(1)
+    df["pivot"] = (ph + pl + pc) / 3.0
+    df["pivot_r1"] = 2 * df["pivot"] - pl
+    df["pivot_s1"] = 2 * df["pivot"] - ph
+
+
+def _add_fibonacci(df: pd.DataFrame, lookback: int) -> None:
+    """Fibonacci position within the recent `lookback`-bar swing range.
+
+    `fib_position` ∈ [0, 1] is the close's position between the rolling low
+    and rolling high — 0 at swing low, 1 at swing high. `fib_mid` is the
+    50% retracement price level."""
+    hi = df["high"].rolling(lookback, min_periods=1).max()
+    lo = df["low"].rolling(lookback, min_periods=1).min()
+    span = (hi - lo).replace(0, np.nan)
+    df["fib_position"] = ((df["close"] - lo) / span).clip(0.0, 1.0)
+    df["fib_mid"] = (hi + lo) / 2.0
+
+
+def _add_relative_volume(df: pd.DataFrame, window: int) -> None:
+    """Volume / 20-bar average volume. >1 = above-normal participation."""
+    avg = df["volume"].rolling(window, min_periods=1).mean().replace(0, np.nan)
+    df["rvol_20"] = df["volume"] / avg
+
+
+def _add_52w_distance(df: pd.DataFrame, window: int) -> None:
+    """% distance from the rolling 52-week high / low.
+
+    `high_52w_dist` < 0 (close is below the high). `low_52w_dist` > 0 (close is
+    above the low). Uses `min_periods=1` so it produces values from bar 0 —
+    callers should be aware that early values are unreliable on short series."""
+    hi = df["high"].rolling(window, min_periods=1).max()
+    lo = df["low"].rolling(window, min_periods=1).min()
+    df["high_52w_dist"] = (df["close"] - hi) / hi.replace(0, np.nan)
+    df["low_52w_dist"] = (df["close"] - lo) / lo.replace(0, np.nan)
+
+
+def _add_gap_pct(df: pd.DataFrame) -> None:
+    """Open vs previous close, expressed as a percent. BLUEPRINT §5.2."""
+    prev_close = df["close"].shift(1)
+    df["gap_pct"] = (df["open"] - prev_close) / prev_close.replace(0, np.nan)
+
+
 def compute_features(bars: pd.DataFrame) -> pd.DataFrame:
     """Compute the full Phase 1 feature set."""
     if bars.empty:
@@ -128,6 +260,10 @@ def compute_features(bars: pd.DataFrame) -> pd.DataFrame:
     df["ema21"] = ta.ema(df["close"], length=21)
     df["ema50"] = ta.ema(df["close"], length=50)
     df["ema200"] = ta.ema(df["close"], length=200)
+    # SMA institutional reference levels — same lookback as EMA200 max.
+    df["sma20"] = df["close"].rolling(20, min_periods=1).mean()
+    df["sma50"] = df["close"].rolling(50, min_periods=1).mean()
+    df["sma200"] = df["close"].rolling(200, min_periods=1).mean()
     adx = ta.adx(df["high"], df["low"], df["close"], length=14)
     df["adx"] = adx["ADX_14"]
     df["di_plus"] = adx["DMP_14"]
@@ -161,6 +297,16 @@ def compute_features(bars: pd.DataFrame) -> pd.DataFrame:
     df["divergence_bull"] = bull
     df["divergence_bear"] = bear
     df["smc_bos"] = _bos(df["close"], lookback=20)
+
+    # --- BLUEPRINT §5.2 additional indicators ---
+    _add_supertrend(df, period=10, multiplier=3.0)
+    _add_donchian(df, period=20)
+    _add_keltner(df, period=20, multiplier=2.0)
+    _add_pivots(df)
+    _add_fibonacci(df, lookback=50)
+    _add_relative_volume(df, window=20)
+    _add_52w_distance(df, window=252)
+    _add_gap_pct(df)
 
     # --- Returns / realized vol ---
     df["ret_log"] = np.log(df["close"] / df["close"].shift(1))

@@ -15,7 +15,7 @@ import pandas as pd
 from atlas_shared.schemas import AssetClass, Direction, Horizon
 from feature_engine import compute_features
 from risk_engine import RiskEngine, RiskVeto
-from scoring_engine.signal import generate_signal
+from scoring_engine.signal import GateResult, generate_signal
 
 from backtest_service.strategies.base import Order
 from backtest_service.types import TradeSide
@@ -79,7 +79,7 @@ class AtlasStrategy:
         if self.trend_model is not None:
             p_up = self.trend_model.predict_proba(feats_df)
 
-        signal = generate_signal(
+        outcome = generate_signal(
             symbol=symbol,
             asset_class=self.asset_class,
             horizon=self.horizon,
@@ -88,8 +88,9 @@ class AtlasStrategy:
             regime="unknown",
             model_versions={"trend": self.trend_model.version} if self.trend_model else {},
         )
-        if signal is None:
+        if isinstance(outcome, GateResult):
             return None
+        signal = outcome
 
         sized = self.risk.build_plan(signal)
         if isinstance(sized, RiskVeto):

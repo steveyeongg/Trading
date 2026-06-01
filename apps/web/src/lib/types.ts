@@ -9,12 +9,12 @@ export type Conviction = 'low' | 'medium' | 'high' | 'very-high';
 export interface SubScores {
   tech: number;
   quant: number;
-  fund: number;
-  macro: number;
+  news: number;
   sent: number;
+  macro: number;
   opt: number;
   liq: number;
-  chain: number;
+  risk: number;
 }
 
 export interface Signal {
@@ -35,7 +35,70 @@ export interface Signal {
   position_size_pct: number | null;
   expected_rr: number | null;
   rationale_md: string | null;
+  invalidations: string[];
   model_versions: Record<string, string>;
+  bar_age_seconds: number | null;
+  time_stop_at: string | null;
+  quant_meta: Record<string, number | boolean | string>;
+}
+
+export interface ExplanationPayload {
+  summary: string;
+  bull_case: string[];
+  bear_case: string[];
+  why_entry: string;
+  why_stop: string;
+  target_logic: string;
+  confidence_comment: string;
+  final_view: string;
+  source: string;
+  safety_repaired: boolean;
+}
+
+export interface ExplanationResponse {
+  symbol: string;
+  explained: boolean;
+  payload?: ExplanationPayload;
+  signal?: Signal;
+  no_signal_reason?: string;
+}
+
+export interface ProviderRow {
+  name: string;
+  configured: boolean;
+  available: boolean;
+  fallback: string;
+  note: string;
+}
+
+export interface ProvidersStatusResponse {
+  checked_at: string;
+  summary: {
+    total: number;
+    available: number;
+    missing_keys: string[];
+  };
+  providers: Record<string, ProviderRow[]>;
+  policy: Record<string, boolean>;
+}
+
+export interface SymbolFreshness {
+  symbol: string;
+  ok: boolean;
+  has_bars?: boolean;
+  last_bar_ts?: string;
+  age_seconds: number | null;
+  error?: string;
+}
+
+export interface FreshnessResponse {
+  checked_at: string;
+  macro: {
+    snapshot_ts: string | null;
+    age_seconds: number | null;
+    regime: string;
+  };
+  symbols: SymbolFreshness[];
 }
 
 export interface RegimeSnapshot {
@@ -54,8 +117,77 @@ export interface RegimeSnapshot {
 export interface SignalDebug {
   signal: Signal | null;
   veto: { reason: string; detail: string } | null;
+  no_signal_reason: string | null;
   macro_snapshot: RegimeSnapshot | null;
   sentiment_snapshot: { news_sent_score: number; news_sent_confidence: number; news_count: number } | null;
+}
+
+// ── Screener ───────────────────────────────────────────────────────────────
+
+export interface Universe {
+  key: string;
+  label: string;
+  description: string;
+  symbol_count: number;
+}
+
+export interface UniversesResponse {
+  universes: Universe[];
+}
+
+export interface ScreenerRequest {
+  universe?: string;
+  symbols?: string[];
+  horizon?: Horizon;
+  asset_class?: AssetClass;
+  resolution?: string;
+  min_composite?: number;
+  top_n?: number | null;
+  include_explanation?: boolean;
+}
+
+export interface ScreenerPublishedRow {
+  rank: number;
+  symbol: string;
+  published: true;
+  direction: Direction;
+  composite_score: number;
+  confidence_pct: number;
+  conviction: Conviction;
+  regime: string;
+  entry_price: number | null;
+  stop_price: number | null;
+  take_profit_levels: number[];
+  position_size_pct: number | null;
+  expected_rr: number | null;
+  sub_scores: SubScores;
+  invalidations: string[];
+  bar_age_seconds: number | null;
+  rationale_md?: string | null;
+}
+
+export interface ScreenerSkippedRow {
+  rank: number;
+  symbol: string;
+  published: false;
+  composite_score: number | null;
+  direction_implied: string | null;
+  no_signal_reason: string | null;
+}
+
+export type ScreenerRow = ScreenerPublishedRow | ScreenerSkippedRow;
+
+export interface ScreenerResponse {
+  run_id: string;
+  universe: string;
+  horizon: Horizon;
+  generated_at: string;
+  min_composite: number;
+  top_n: number | null;
+  scanned: number;
+  published: number;
+  results: ScreenerRow[];
+  skipped: Array<{ symbol: string; reason: string }>;
 }
 
 export interface OhlcBar {

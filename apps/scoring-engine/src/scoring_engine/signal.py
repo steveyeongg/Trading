@@ -1,13 +1,16 @@
 """Signal generator — composes sub-scores into a Signal.
 
-This is the deterministic core of the engine. Risk gates, multi-engine
-confirmation gates, devil's-advocate counter-case, and the LLM rationale layer
-are Phase 1.5+.
+This is the deterministic core of the engine. When gates fail, returns a
+`GateResult` carrying a human-readable reason so the pipeline can surface it
+to the dashboard ("no signal: composite 42 < 50") instead of returning a
+silent None.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import os as _os
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -24,26 +27,48 @@ from options_analytics import s_options
 from sentiment_engine import s_sent
 
 from scoring_engine.composite import DEFAULT_WEIGHTS, composite
-from scoring_engine.sub_scores import s_liq, s_quant, s_tech
+from scoring_engine.sub_scores import s_liq, s_news, s_quant, s_risk, s_tech
 
-# Minimum gates — BLUEPRINT §9 step 4. Tunable per asset class / horizon.
-# All four are env-overridable so a Phase 1.5 deployment with sparse data
-# coverage can loosen them without code changes:
+# Minimum gates — BLUEPRINT §8.5. All env-overridable so deployments can loosen
+# them without code changes:
 #   ATLAS_MIN_COMPOSITE, ATLAS_MIN_CONFIDENCE,
 #   ATLAS_MIN_CONFIRMING_ENGINES, ATLAS_MIN_AGREE_THRESHOLD
-import os as _os
-
 MIN_COMPOSITE = float(_os.environ.get("ATLAS_MIN_COMPOSITE", "50.0"))
 MIN_CONFIDENCE = float(_os.environ.get("ATLAS_MIN_CONFIDENCE", "0.55"))
 MIN_CONFIRMING_ENGINES = int(_os.environ.get("ATLAS_MIN_CONFIRMING_ENGINES", "2"))
 MIN_AGREE_THRESHOLD = float(_os.environ.get("ATLAS_MIN_AGREE_THRESHOLD", "40.0"))
 
-# Sub-scores whose adapter is always available (always counted in the active
-# set). `fund` and `chain` are deferred — no adapter exists, the score would
-# always be 0, and including them would silently steal weight from the engines
-# that ARE wired. `macro`, `sent`, `opt` are conditional — included when their
-# feature dict is supplied.
-_ALWAYS_ACTIVE: frozenset[str] = frozenset({"tech", "quant", "liq"})
+# Sub-scores whose adapter is always available. Conditional engines (macro,
+# sent, opt, news) are added by `_build_active` only when their feature dict
+# is supplied — keeps the composite from auto-zeroing on missing inputs.
+_ALWAYS_ACTIVE: frozenset[str] = frozenset({"tech", "quant", "liq", "risk"})
+
+# Horizon-dependent time stop (bars equivalent; converted from days × hours).
+# BLUEPRINT §9.1 — `time_stop` is recommended for every signal.
+_TIME_STOP_HOURS: dict[Horizon, float] = {
+    Horizon.INTRADAY: 6.5,         # one US trading session
+    Horizon.SWING: 10 * 24,        # ~10 calendar days
+    Horizon.POSITION: 60 * 24,     # ~60 days
+    Horizon.LONG_TERM: 252 * 24,   # ~1 trading year
+}
+
+# Buffer added to the swing low/high before using it as a structural stop.
+# A few ATR ticks below the recent low — gives the trade room to breathe
+# without sitting right on the obvious level where stop-hunts happen.
+_STRUCTURAL_STOP_ATR_BUFFER: float = 0.5
+
+
+@dataclass(frozen=True)
+class GateResult:
+    """Returned when scoring gates kill a candidate. Carries the reason so
+    the dashboard can show *why* there's no signal."""
+
+    reason: str
+    sub_scores: SubScores
+    composite_score: float
+    direction_implied: Direction | None
+    confidence: float
+    active_engines: frozenset[str]
 
 
 def _conviction(composite_abs: float, confidence: float) -> Conviction:
@@ -59,9 +84,6 @@ def _conviction(composite_abs: float, confidence: float) -> Conviction:
 def _engines_agree(
     subs: SubScores, direction: Direction, thresh: float, active: frozenset[str]
 ) -> int:
-    """Count engines in the active set whose score leans `>= thresh` in the
-    signal direction. Inactive engines (deferred / not-wired adapters) are
-    skipped — they would always be 0 and would bias the count toward `gated`."""
     sign = 1 if direction == Direction.LONG else -1
     return sum(1 for k in active if sign * getattr(subs, k) >= thresh)
 
@@ -70,10 +92,11 @@ def _build_active(
     macro_features: dict | None,
     sentiment_features: dict | None,
     options_features: dict | None,
+    news_features: dict | None = None,
 ) -> frozenset[str]:
     """Active set = always-on engines + any optional engine whose feature dict
-    was supplied by the caller. Deferred adapters (fund, chain) are never
-    included until they're built."""
+    was supplied. Engines without input data are excluded so they don't dilute
+    the composite via renormalisation."""
     active = set(_ALWAYS_ACTIVE)
     if macro_features:
         active.add("macro")
@@ -81,7 +104,21 @@ def _build_active(
         active.add("sent")
     if options_features:
         active.add("opt")
+    if news_features and float(news_features.get("news_count", 0.0)) > 0:
+        active.add("news")
     return frozenset(active)
+
+
+def _invalidations(direction: Direction, stop: float | None) -> list[str]:
+    """BLUEPRINT §9.1 — every signal must declare the conditions that kill it."""
+    out: list[str] = []
+    if stop is not None:
+        out.append(
+            f"Close {'below' if direction == Direction.LONG else 'above'} {stop:.2f} (stop loss)"
+        )
+    out.append("Macro regime flips against direction")
+    out.append("High-impact adverse news event")
+    return out
 
 
 def generate_signal(
@@ -93,64 +130,121 @@ def generate_signal(
     regime: str = "unknown",
     macro_features: dict[str, Any] | None = None,
     sentiment_features: dict[str, Any] | None = None,
+    news_features: dict[str, Any] | None = None,
     options_features: dict[str, Any] | None = None,
     model_versions: dict[str, str] | None = None,
     weights: dict[str, float] = DEFAULT_WEIGHTS,
-) -> Signal | None:
-    """Return a Signal if all gates pass, else None.
-
-    `features` is a flat dict of the latest feature vector (see
-    feature_engine.latest_feature_row). `macro_features`, `sentiment_features`,
-    and `options_features` are optional flat dicts; missing → 0 (neutral).
+    bar_age_seconds: float | None = None,
+    quant_meta: dict | None = None,
+) -> Signal | GateResult:
+    """Return a `Signal` if all gates pass, else a `GateResult` carrying the
+    reason. Never returns None — callers always learn *why* a candidate failed.
     """
     macro_in = dict(macro_features or {})
     macro_in.setdefault("regime", regime)
+
+    # `news_features` and `sentiment_features` may be the same dict for now
+    # (both derived from `recent_sentiment_features`). The split is structural
+    # so social/analyst sources can land in `sentiment_features` later without
+    # touching the news scoring path.
+    news_in = news_features if news_features is not None else sentiment_features
+
     subs = SubScores(
         tech=s_tech(features),
         quant=s_quant(p_up),
         liq=s_liq(features),
+        risk=s_risk(features),
         macro=s_macro(macro_in),
         sent=s_sent(sentiment_features or {}),
         opt=s_options(options_features or {}),
+        news=s_news(news_in),
     )
-    # Only count engines that are actually wired. `fund` and `chain` are
-    # deferred — including them would steal 0.20 of the weight and make the
-    # composite mathematically unable to clear 50 on bars-only deployments.
-    active = _build_active(macro_features, sentiment_features, options_features)
+
+    active = _build_active(macro_features, sentiment_features, options_features, news_in)
     score = composite(subs, weights=weights, active=active)
-    if abs(score) < MIN_COMPOSITE:
-        return None
+    direction = Direction.LONG if score >= 0 else Direction.SHORT
+    confirming = _engines_agree(subs, direction, MIN_AGREE_THRESHOLD, active)
 
-    direction = Direction.LONG if score > 0 else Direction.SHORT
-
-    if _engines_agree(subs, direction, MIN_AGREE_THRESHOLD, active) < MIN_CONFIRMING_ENGINES:
-        return None
-
-    # Confidence: until we have a calibrated meta-model, derive from |p_up - 0.5|.
     if p_up is not None:
         confidence = float(min(1.0, abs(p_up - 0.5) * 2.0))
     else:
         confidence = min(1.0, abs(score) / 100.0)
-    if confidence < MIN_CONFIDENCE and p_up is not None:
-        return None
+
+    def _gate_failure(reason: str) -> GateResult:
+        return GateResult(
+            reason=reason,
+            sub_scores=subs,
+            composite_score=round(score, 2),
+            direction_implied=direction,
+            confidence=round(confidence, 3),
+            active_engines=active,
+        )
+
+    if abs(score) < MIN_COMPOSITE:
+        return _gate_failure(
+            f"composite |{score:.1f}| < {MIN_COMPOSITE:.0f} (need ≥{MIN_COMPOSITE:.0f})"
+        )
+
+    if confirming < MIN_CONFIRMING_ENGINES:
+        return _gate_failure(
+            f"only {confirming} engine(s) confirm {direction.value} at ≥{MIN_AGREE_THRESHOLD:.0f} "
+            f"(need ≥{MIN_CONFIRMING_ENGINES})"
+        )
+
+    if p_up is not None and confidence < MIN_CONFIDENCE:
+        return _gate_failure(
+            f"confidence {confidence:.2f} < {MIN_CONFIDENCE:.2f}"
+        )
 
     close = features.get("close")
     atr = features.get("atr14")
+    swing_low = features.get("donchian_lower")
+    swing_high = features.get("donchian_upper")
     entry = float(close) if close is not None else None
+
     if entry is not None and atr is not None:
-        # ATR-stop, 1.8x. Targets ladder 1R / 2R / 3R per blueprint §10.2.
-        risk = 1.8 * float(atr)
+        atr_f = float(atr)
+        atr_stop_dist = 1.8 * atr_f
+        buffer = _STRUCTURAL_STOP_ATR_BUFFER * atr_f
+
         if direction == Direction.LONG:
-            stop = entry - risk
-            targets = [entry + risk, entry + 2 * risk, entry + 3 * risk]
+            atr_stop = entry - atr_stop_dist
+            structural_stop = (
+                float(swing_low) - buffer if swing_low is not None else atr_stop
+            )
+            # BLUEPRINT §9.3 — pick the *higher* (tighter) of the two for a long
+            # so the trade isn't running with an oversized leash; never let
+            # structure go above entry (sanity guard).
+            stop = max(atr_stop, structural_stop)
+            stop = min(stop, entry - 0.25 * atr_f)
+            risk_per_share = max(entry - stop, 0.25 * atr_f)
+            targets = [
+                entry + risk_per_share,
+                entry + 2 * risk_per_share,
+                entry + 3 * risk_per_share,
+            ]
         else:
-            stop = entry + risk
-            targets = [entry - risk, entry - 2 * risk, entry - 3 * risk]
+            atr_stop = entry + atr_stop_dist
+            structural_stop = (
+                float(swing_high) + buffer if swing_high is not None else atr_stop
+            )
+            stop = min(atr_stop, structural_stop)
+            stop = max(stop, entry + 0.25 * atr_f)
+            risk_per_share = max(stop - entry, 0.25 * atr_f)
+            targets = [
+                entry - risk_per_share,
+                entry - 2 * risk_per_share,
+                entry - 3 * risk_per_share,
+            ]
         rr = 2.0
     else:
         stop = None
         targets = []
         rr = None
+
+    # BLUEPRINT §9.1 — every signal carries a time stop. If price hasn't
+    # progressed toward T1 by then, the thesis is stale.
+    time_stop_at = datetime.now(UTC) + timedelta(hours=_TIME_STOP_HOURS.get(horizon, 240.0))
 
     return Signal(
         id=uuid4(),
@@ -167,8 +261,12 @@ def generate_signal(
         entry_price=entry,
         stop_price=stop,
         take_profit_levels=targets,
-        position_size_pct=None,  # risk engine fills this in Phase 1.5
+        position_size_pct=None,
         expected_rr=rr,
         rationale_md=None,
+        invalidations=_invalidations(direction, stop),
         model_versions=model_versions or {},
+        bar_age_seconds=bar_age_seconds,
+        time_stop_at=time_stop_at,
+        quant_meta=quant_meta or {},
     )

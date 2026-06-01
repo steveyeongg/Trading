@@ -2,13 +2,24 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from atlas_shared.schemas import AssetClass, Horizon, Signal
 from fastapi import APIRouter, HTTPException, Query
 from ingest_equities.store import latest_bars
 from macro_engine.refresh import load_snapshot
 from news_ingest.retrieval import recent_sentiment_features
+from pydantic import BaseModel, Field
 
 from signal_service.pipeline import run_pipeline
+from signal_service.providers import data_freshness_payload, provider_status_payload
+from signal_service.screener import (
+    ScreenerRow,
+    ScreenerRun,
+    list_universes,
+    make_run_id,
+    resolve_symbols,
+)
 from signal_service.state import get_trend_model
 
 router = APIRouter(prefix="/v1")
@@ -141,6 +152,7 @@ async def signal_for_symbol(
         regime=regime,
         macro_features=snapshot,
         sentiment_features=sentiment,
+        news_features=sentiment,
         generate_explanation=explain,
     )
     return result.signal
@@ -176,6 +188,7 @@ async def scan(
             regime=regime,
             macro_features=snapshot,
             sentiment_features=sentiment,
+            news_features=sentiment,
             generate_explanation=explain,
         )
         if result.signal and abs(result.signal.composite_score) >= min_score:
@@ -210,7 +223,7 @@ async def signal_debug(
         _build_active,
         _engines_agree,
     )
-    from scoring_engine.sub_scores import s_liq, s_quant, s_tech
+    from scoring_engine.sub_scores import s_liq, s_news, s_quant, s_risk, s_tech
     from sentiment_engine import s_sent
 
     symbol = symbol.upper()
@@ -231,6 +244,7 @@ async def signal_debug(
         regime=regime,
         macro_features=snapshot,
         sentiment_features=sentiment,
+        news_features=sentiment,
         generate_explanation=False,
     )
 
@@ -253,11 +267,13 @@ async def signal_debug(
             tech=s_tech(latest),
             quant=s_quant(p_up),
             liq=s_liq(latest),
+            risk=s_risk(latest),
             macro=s_macro(macro_in),
             sent=s_sent(sentiment or {}),
+            news=s_news(sentiment or {}),
             opt=s_options({}),  # options never wired into prod route
         )
-        active = _build_active(snapshot, sentiment, None)
+        active = _build_active(snapshot, sentiment, None, sentiment)
         score = composite(subs, active=active)
         long_count = _engines_agree(subs, Direction.LONG, MIN_AGREE_THRESHOLD, active)
         short_count = _engines_agree(subs, Direction.SHORT, MIN_AGREE_THRESHOLD, active)
@@ -304,6 +320,7 @@ async def signal_debug(
     return {
         "signal": result.signal.model_dump(mode="json") if result.signal else None,
         "veto": {"reason": result.veto.reason, "detail": result.veto.detail} if result.veto else None,
+        "no_signal_reason": result.no_signal_reason,
         "macro_snapshot": snapshot,
         "sentiment_snapshot": sentiment,
         "diagnostics": diagnostics,
@@ -317,3 +334,221 @@ async def _safe_sentiment(symbol: str) -> dict[str, float]:
         return await recent_sentiment_features(symbol)
     except Exception:
         return {"news_sent_score": 0.0, "news_sent_confidence": 0.0, "news_count": 0.0}
+
+
+# ── Explanation — BLUEPRINT §10.3 ─────────────────────────────────────────────
+
+
+@router.post("/explain/signal")
+async def explain_signal(
+    symbol: str = Query(..., description="Symbol to explain"),
+    horizon: Horizon = Query(Horizon.SWING),
+    resolution: str = Query("1m"),
+    lookback: int = Query(500, ge=210, le=5000),
+) -> dict:
+    """Return the structured BLUEPRINT §10.3 explanation payload for the
+    current signal (or the templated fallback if the gates failed). Cached
+    locally by the writer using the §10.5 key — repeat calls are free."""
+    from explanation_engine import generate_payload
+
+    symbol = symbol.upper()
+    bars = await latest_bars(symbol, resolution=resolution, limit=lookback)
+    if bars.empty:
+        raise HTTPException(404, f"no bars stored for {symbol} @ {resolution}")
+
+    snapshot = await load_snapshot()
+    regime = (snapshot or {}).get("regime", "unknown")
+    sentiment = await _safe_sentiment(symbol)
+
+    result = run_pipeline(
+        bars=bars,
+        symbol=symbol,
+        horizon=horizon,
+        trend_model=get_trend_model(),
+        regime=regime,
+        macro_features=snapshot,
+        sentiment_features=sentiment,
+        news_features=sentiment,
+        generate_explanation=False,
+    )
+
+    # We need a Signal object to feed the explanation writer; when the gates
+    # killed the candidate, return the no-signal reason instead.
+    if result.signal is None:
+        return {
+            "symbol": symbol,
+            "explained": False,
+            "no_signal_reason": result.no_signal_reason
+                or (f"risk veto: {result.veto.reason}" if result.veto else "gated"),
+        }
+
+    # Re-derive the feature row for the explanation writer's context.
+    from feature_engine import compute_features
+    feats_df = compute_features(bars)
+    latest_row = {
+        k: v for k, v in feats_df.iloc[-1].to_dict().items()
+        if not (isinstance(v, float) and v != v)  # filter NaN
+    }
+    payload = generate_payload(result.signal, latest_row)
+    return {
+        "symbol": symbol,
+        "explained": True,
+        "payload": payload.model_dump(),
+        "signal": result.signal.model_dump(mode="json"),
+    }
+
+
+# ── Screener — BLUEPRINT §4 / §13.2 ───────────────────────────────────────────
+
+
+class ScreenerRequest(BaseModel):
+    """POST /v1/screener/run request body. BLUEPRINT §13.2."""
+
+    universe: str = Field(
+        default="manual",
+        description='Universe key from /v1/screener/universes, or "manual" for symbol-only.',
+    )
+    symbols: list[str] = Field(
+        default_factory=list,
+        description="Manual symbol list. Required when universe == 'manual'.",
+    )
+    horizon: Horizon = Horizon.SWING
+    asset_class: AssetClass = AssetClass.EQUITY
+    resolution: str = "1m"
+    min_composite: float = Field(default=60.0, ge=0.0, le=100.0)
+    top_n: int | None = Field(default=10, ge=1, le=500)
+    include_explanation: bool = False
+
+
+# ── Provider health + data freshness — BLUEPRINT §13.1 ────────────────────────
+
+
+@router.get("/providers/status")
+async def providers_status() -> dict:
+    """Configuration + availability of every external dependency.
+
+    Missing keys never crash here — this endpoint exists specifically so the
+    dashboard can show *which* features are degraded without inspecting logs.
+    """
+    return provider_status_payload()
+
+
+@router.get("/data/freshness")
+async def data_freshness(
+    symbols: str = Query(
+        "",
+        description="Comma-separated list. Empty → falls back to the default watchlist.",
+    ),
+) -> dict:
+    """Latest-bar age per symbol + macro snapshot age."""
+    syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    if not syms:
+        from signal_service.screener import load_universes
+        syms = list(load_universes()["default_watchlist"]["symbols"])
+    return await data_freshness_payload(syms)
+
+
+@router.get("/screener/universes")
+async def screener_universes() -> dict:
+    """Built-in universes available to the screener. BLUEPRINT §4.3."""
+    return {"universes": list_universes()}
+
+
+@router.post("/screener/run")
+async def screener_run(req: ScreenerRequest) -> dict:
+    """Rank symbols by composite score with reasons attached.
+
+    Manual mode: pass `universe="manual"` and a `symbols` list (BLUEPRINT §4.2).
+    Universe mode: pass a key from `/v1/screener/universes`. Mix both to append
+    one-off tickers to a named universe.
+
+    Rows that don't publish a signal are still returned — with `no_signal_reason`
+    populated — so the dashboard can show "why isn't NVDA on the list".
+    """
+    try:
+        symbols = resolve_symbols(req.universe, req.symbols)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+    snapshot = await load_snapshot()
+    regime = (snapshot or {}).get("regime", "unknown")
+    model = get_trend_model()
+
+    rows: list[ScreenerRow] = []
+    skipped: list[dict] = []
+
+    for sym in symbols:
+        bars = await latest_bars(sym, resolution=req.resolution, limit=500)
+        if bars.empty:
+            skipped.append({"symbol": sym, "reason": "no bars stored"})
+            continue
+        sentiment = await _safe_sentiment(sym)
+        result = run_pipeline(
+            bars=bars,
+            symbol=sym,
+            horizon=req.horizon,
+            asset_class=req.asset_class,
+            trend_model=model,
+            regime=regime,
+            macro_features=snapshot,
+            sentiment_features=sentiment,
+            news_features=sentiment,
+            generate_explanation=req.include_explanation,
+        )
+        if result.signal is not None:
+            rows.append(
+                ScreenerRow(
+                    symbol=sym,
+                    signal=result.signal,
+                    no_signal_reason=None,
+                    composite_score=result.signal.composite_score,
+                    direction_implied=result.signal.direction.value,
+                )
+            )
+        else:
+            # The veto path also surfaces a reason — prefer veto's detail when present.
+            reason = result.no_signal_reason or (
+                f"risk veto: {result.veto.reason}" if result.veto else "gated"
+            )
+            rows.append(
+                ScreenerRow(
+                    symbol=sym,
+                    signal=None,
+                    no_signal_reason=reason,
+                    composite_score=None,
+                    direction_implied=None,
+                )
+            )
+
+    # Rank: published rows by |composite| desc; non-published rows after, in
+    # input order so the user can still see the reasons they didn't publish.
+    def _rank_key(r: ScreenerRow) -> tuple[int, float]:
+        if r.signal is None:
+            return (1, 0.0)
+        return (0, -abs(r.signal.composite_score))
+
+    rows.sort(key=_rank_key)
+
+    published = [r for r in rows if r.signal is not None]
+    if req.min_composite > 0:
+        published = [
+            r for r in published if abs(r.signal.composite_score) >= req.min_composite
+        ]
+    if req.top_n is not None:
+        published = published[: req.top_n]
+
+    # Non-published rows are appended after the filtered published set.
+    final_rows = published + [r for r in rows if r.signal is None]
+
+    run = ScreenerRun(
+        run_id=make_run_id(),
+        universe=req.universe,
+        horizon=req.horizon,
+        requested_symbols=symbols,
+        min_composite=req.min_composite,
+        top_n=req.top_n,
+        generated_at=datetime.now(UTC),
+        results=final_rows,
+        skipped=skipped,
+    )
+    return run.to_payload(include_explanation=req.include_explanation)

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -36,6 +37,11 @@ log = get_logger("signal-service")
 
 MONITOR_INTERVAL = 10.0  # seconds between position-monitor sweeps
 
+# BLUEPRINT §22 #6 — non-negotiable: no auto-execution by default.
+# The monitor loop auto-closes positions on stop / target / time, which is an
+# execution action. Disabled unless `ATLAS_ENABLE_AUTO_EXECUTION=1` is set.
+_AUTO_EXEC_ENABLED = os.environ.get("ATLAS_ENABLE_AUTO_EXECUTION", "0") == "1"
+
 
 async def _monitor_loop() -> None:
     """Periodically auto-exit open positions on stop / target / time."""
@@ -60,7 +66,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     log.info("signal-service.start", env=settings.env)
     load_trend_model()  # warning-only if missing
-    tasks = [asyncio.create_task(broadcaster()), asyncio.create_task(_monitor_loop())]
+
+    tasks = [asyncio.create_task(broadcaster())]
+    if _AUTO_EXEC_ENABLED:
+        log.warning(
+            "monitor.auto_execution_enabled",
+            note="ATLAS_ENABLE_AUTO_EXECUTION=1 — positions will auto-close on stop/target/time",
+        )
+        tasks.append(asyncio.create_task(_monitor_loop()))
+    else:
+        log.info("monitor.disabled", reason="auto-execution opt-in; set ATLAS_ENABLE_AUTO_EXECUTION=1 to enable")
     try:
         yield
     finally:

@@ -6,7 +6,10 @@ import { api, ApiError } from '@/lib/api';
 import { useLiveSubjects } from '@/lib/stream';
 import type { SignalDebug } from '@/lib/types';
 
-const DEFAULT_WATCHLIST = ['AAPL', 'MSFT', 'NVDA', 'TSLA', 'SPY', 'QQQ', 'BTC', 'ETH'];
+// BLUEPRINT §4.3 default watchlist — equities-only by default. Crypto is
+// available as an explicit opt-in universe (`crypto_majors` in universes.json)
+// but the broader crypto pipeline is deferred.
+const DEFAULT_WATCHLIST = ['AAPL', 'MSFT', 'NVDA', 'TSLA', 'SPY', 'QQQ'];
 
 export function Watchlist({ symbols: override, selected }: { symbols?: string[]; selected?: string }) {
   // Symbols come from the server-side watchlist (editable in Settings). A

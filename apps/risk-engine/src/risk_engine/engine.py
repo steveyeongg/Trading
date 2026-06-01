@@ -8,10 +8,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import os
+
 from atlas_shared.schemas import Direction, Signal
 
 from risk_engine.portfolio import PortfolioContext
 from risk_engine.sizing import RiskConfig, size_position
+
+# BLUEPRINT §9.6 — block the trade when high-impact news is decisively against
+# its direction. The threshold is keyed off the news sub-score (already
+# saturation-weighted by count and confidence in s_news), so we don't need to
+# duplicate the headline math here.
+NEWS_VETO_THRESHOLD = float(os.environ.get("ATLAS_NEWS_VETO_THRESHOLD", "60.0"))
 
 
 @dataclass(frozen=True)
@@ -48,6 +56,15 @@ class RiskEngine:
 
         if (signal.expected_rr or 0) < cfg.min_rr:
             return RiskVeto("low_rr", f"{signal.expected_rr}")
+
+        # BLUEPRINT §9.6 — news event veto. A long signal walking into very
+        # negative news (or a short into very positive news) is a coin flip
+        # against macro flow. The price action will reprice — let it.
+        news_score = signal.sub_scores.news
+        if signal.direction == Direction.LONG and news_score <= -NEWS_VETO_THRESHOLD:
+            return RiskVeto("adverse_news", f"s_news={news_score:.0f}")
+        if signal.direction == Direction.SHORT and news_score >= NEWS_VETO_THRESHOLD:
+            return RiskVeto("adverse_news", f"s_news={news_score:.0f}")
 
         # Portfolio-level guardrails.
         max_corr = 0.0

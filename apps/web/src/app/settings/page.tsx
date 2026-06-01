@@ -5,6 +5,7 @@ import { useEffect, useState } from 'react';
 import { api, ApiError } from '@/lib/api';
 import { AlertRules } from '@/components/AlertRules';
 import { AlertDeliveries } from '@/components/AlertDeliveries';
+import { ProvidersStatusPanel } from '@/components/ProvidersStatusPanel';
 import { TierSwitcher } from '@/components/TierSwitcher';
 
 export default function SettingsPage() {
@@ -126,6 +127,8 @@ export default function SettingsPage() {
           )}
         </div>
       </section>
+
+      <ProvidersStatusPanel />
 
       <AlertRules />
       <AlertDeliveries />

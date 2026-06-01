@@ -140,14 +140,22 @@ async def _push_signals() -> None:
             payload = {
                 "signal": result.signal.model_dump(mode="json") if result.signal else None,
                 "veto": {"reason": result.veto.reason, "detail": result.veto.detail} if result.veto else None,
+                "no_signal_reason": result.no_signal_reason,
             }
             await manager.publish(f"signals.{sym}", payload)
 
             # Fire alerts on the freshly computed signal (cooldown-gated).
+            # Pass the latest close + regime so §12.2 event derivation can
+            # detect price-level breaches and regime changes.
             if result.signal and rules:
                 with contextlib.suppress(Exception):
+                    last_close = float(bars["close"].iloc[-1])
                     await _alert_engine.evaluate_signal(
-                        payload["signal"], rules, record=record_delivery
+                        payload["signal"],
+                        rules,
+                        last_price=last_close,
+                        regime=regime,
+                        record=record_delivery,
                     )
         except Exception as e:
             log.warning("stream.signal_push_failed", symbol=sym, error=str(e))

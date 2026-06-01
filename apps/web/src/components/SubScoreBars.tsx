@@ -5,12 +5,12 @@ import type { SubScores } from '@/lib/types';
 const ENGINES: Array<{ key: keyof SubScores; label: string }> = [
   { key: 'tech',  label: 'TECH'  },
   { key: 'quant', label: 'QUANT' },
-  { key: 'fund',  label: 'FUND'  },
-  { key: 'macro', label: 'MACRO' },
+  { key: 'news',  label: 'NEWS'  },
   { key: 'sent',  label: 'SENT'  },
+  { key: 'macro', label: 'MACRO' },
   { key: 'opt',   label: 'OPT'   },
   { key: 'liq',   label: 'LIQ'   },
-  { key: 'chain', label: 'CHAIN' },
+  { key: 'risk',  label: 'RISK'  },
 ];
 
 export function SubScoreBars({ subs, composite }: { subs: SubScores; composite?: number }) {

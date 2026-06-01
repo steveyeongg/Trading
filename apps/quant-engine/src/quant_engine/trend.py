@@ -67,14 +67,39 @@ class TrendModel:
     def predict_proba(self, features: dict[str, float] | pd.DataFrame) -> float:
         """Return calibrated P(up) for a single feature vector or the last row
         of a feature frame."""
+        return self.predict_full(features)["p_up"]
+
+    def predict_full(self, features: dict[str, float] | pd.DataFrame) -> dict:
+        """Return the full BLUEPRINT §6.2 quant output:
+            {p_up, p_down, s_quant, model_version, calibrated, feature_health}
+
+        `feature_health` is one of:
+          - "ok"        — no required features are NaN
+          - "degraded"  — 1–3 NaN; predictions median-imputed
+          - "missing"   — >3 NaN; prediction is still made but should be down-weighted
+        """
         row = pd.DataFrame([features]) if isinstance(features, dict) else features.tail(1)
         x = row[self.artifact.feature_cols].to_numpy(dtype=float)
-        # Replace NaN with column medians to be robust on the live path.
+        nan_count = int(np.isnan(x).sum())
+        if nan_count == 0:
+            health = "ok"
+        elif nan_count <= 3:
+            health = "degraded"
+        else:
+            health = "missing"
         col_med = np.nanmedian(x, axis=0)
         x = np.where(np.isnan(x), col_med, x)
         raw = self.artifact.model.predict_proba(x)[:, 1]
         cal = self.artifact.calibrator.predict(raw)
-        return float(np.clip(cal[0], 0.0, 1.0))
+        p_up = float(np.clip(cal[0], 0.0, 1.0))
+        return {
+            "p_up": p_up,
+            "p_down": 1.0 - p_up,
+            "s_quant": (2.0 * p_up - 1.0) * 100.0,
+            "model_version": self.artifact.version,
+            "calibrated": True,
+            "feature_health": health,
+        }
 
     @classmethod
     def load(cls, path: str | Path) -> TrendModel:

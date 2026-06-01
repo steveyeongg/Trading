@@ -70,20 +70,26 @@ class FredClient:
         return r.json()
 
     async def series(self, series_id: str, days: int = 365) -> pd.Series:
-        """Return a date-indexed pd.Series for the requested FRED series."""
+        """Return a date-indexed pd.Series. Any failure (missing key, HTTP error,
+        rate limit, malformed payload) degrades to a deterministic synthetic
+        series so the signal pipeline never blocks on macro data."""
         end = datetime.now(UTC)
         start = end - timedelta(days=days)
         if not self.available:
             return _synthetic_series(series_id, start, end)
-        payload = await self._series_raw(series_id, start, end)
-        obs = payload.get("observations", [])
-        rows = [(o["date"], o["value"]) for o in obs if o["value"] not in (".", "")]
-        if not rows:
-            return pd.Series(dtype=float, name=series_id)
-        idx = pd.to_datetime([r[0] for r in rows], utc=True)
-        vals = pd.to_numeric([r[1] for r in rows], errors="coerce")
-        s = pd.Series(vals, index=idx, name=series_id).dropna()
-        return s
+        try:
+            payload = await self._series_raw(series_id, start, end)
+            obs = payload.get("observations", [])
+            rows = [(o["date"], o["value"]) for o in obs if o["value"] not in (".", "")]
+            if not rows:
+                log.warning("macro.fred.empty", series=series_id)
+                return _synthetic_series(series_id, start, end)
+            idx = pd.to_datetime([r[0] for r in rows], utc=True)
+            vals = pd.to_numeric([r[1] for r in rows], errors="coerce")
+            return pd.Series(vals, index=idx, name=series_id).dropna()
+        except Exception as e:
+            log.warning("macro.fred.fallback_synthetic", series=series_id, error=str(e))
+            return _synthetic_series(series_id, start, end)
 
 
 def _synthetic_series(series_id: str, start: datetime, end: datetime) -> pd.Series:

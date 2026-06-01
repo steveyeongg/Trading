@@ -101,6 +101,7 @@ export function StreamProvider({ children }: { children: ReactNode }) {
             queryClient.setQueryData<SignalDebug>(['debug', sym], (prev) => ({
               signal: (data as SignalDebug).signal,
               veto: (data as SignalDebug).veto,
+              no_signal_reason: (data as SignalDebug).no_signal_reason ?? null,
               macro_snapshot: prev?.macro_snapshot ?? null,
               sentiment_snapshot: prev?.sentiment_snapshot ?? null,
             }));
