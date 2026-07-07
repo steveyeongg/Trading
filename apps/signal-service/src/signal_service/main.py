@@ -15,7 +15,7 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from atlas_shared import get_logger, get_settings, setup_logging
+from atlas_shared import get_logger, get_settings, load_env, setup_logging
 from atlas_shared import metrics as mx
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -63,6 +63,10 @@ async def _monitor_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # Bridge `.env` → os.environ before anything reads it. Fixes the provider
+    # status panel, the DeepSeek writer, and the Telegram channel, which all
+    # read os.environ directly (pydantic-settings only populates Settings).
+    load_env()
     settings = get_settings()
     log.info("signal-service.start", env=settings.env)
     load_trend_model()  # warning-only if missing

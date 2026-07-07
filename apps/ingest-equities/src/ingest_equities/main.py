@@ -71,6 +71,9 @@ async def _synthetic(symbols: list[str], n_bars: int) -> None:
 
 
 def main() -> None:
+    from atlas_shared import load_env
+
+    load_env()  # so Polygon/Alpaca clients see keys from .env
     p = argparse.ArgumentParser(prog="ingest-equities")
     sub = p.add_subparsers(dest="cmd", required=True)
 

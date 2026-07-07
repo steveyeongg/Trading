@@ -12,7 +12,7 @@ from typing import Any
 import httpx
 from atlas_shared.logging import get_logger
 
-from alert_service.channels.base import DeliveryResult
+from alert_service.channels.base import DeliveryResult, redact_secrets
 
 log = get_logger("alert.webhook")
 
@@ -51,5 +51,9 @@ class WebhookChannel:
                 r.raise_for_status()
             return DeliveryResult(ok=True, detail=f"http {r.status_code}")
         except Exception as e:
-            log.warning("alert.webhook.failed", error=str(e))
-            return DeliveryResult(ok=False, detail=str(e)[:200])
+            # A user's webhook URL may embed credentials (`https://user:pass@…`)
+            # and the httpx exception will echo the URL verbatim. Scrub before
+            # writing to logs / delivery detail.
+            safe = redact_secrets(str(e))
+            log.warning("alert.webhook.failed", error=safe)
+            return DeliveryResult(ok=False, detail=safe[:200])

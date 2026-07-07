@@ -2,10 +2,41 @@
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 
+from dotenv import dotenv_values
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def load_env(env_file: str = ".env") -> None:
+    """Mirror `.env` into ``os.environ`` — call once at application startup.
+
+    pydantic-settings reads `.env` into the ``Settings`` object but does NOT
+    export those values to the process environment. Several components read
+    ``os.environ`` directly — the provider-status panel, the FRED client, the
+    DeepSeek explanation writer, and the Telegram channel — so without this
+    bridge they are blind to `.env` and silently fall back even when the keys
+    are set.
+
+    This is an **application-entrypoint** concern (like the conventional
+    ``load_dotenv()`` call), NOT a library/import-time one: putting it inside
+    ``get_settings()`` would pollute the test suite, which runs from the repo
+    root next to a real `.env` and relies on os.environ being clean to exercise
+    the "no key → fallback" paths. Call it from service ``main()`` / lifespan
+    and CLI entrypoints instead.
+
+    Shell-exported variables win: we only fill in keys that are absent, so an
+    explicit ``FRED_API_KEY=… uvicorn …`` still overrides the file.
+    """
+    try:
+        values = dotenv_values(env_file)
+    except Exception:
+        return
+    for key, value in values.items():
+        if value is not None and key not in os.environ:
+            os.environ[key] = value
 
 
 class Settings(BaseSettings):

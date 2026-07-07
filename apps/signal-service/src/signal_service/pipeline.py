@@ -40,12 +40,20 @@ class PipelineResult:
       - signal != None and veto is None       → publishable
       - signal == None and veto != None       → killed by risk engine
       - signal == None and no_signal_reason   → killed by scoring gate / stale data / insufficient bars
+
+    `composite_score` and `direction_implied` are surfaced even for gated
+    candidates so alert rules keyed on raw composite (e.g. "notify on |X|>=20")
+    can fire without waiting for the pipeline's stricter trade-plan gate. The
+    alert engine treats them as read-only signal shape.
     """
 
     signal: Signal | None
     veto: RiskVeto | None
     rationale: str | None
     no_signal_reason: str | None = None
+    composite_score: float | None = None
+    direction_implied: str | None = None
+    sub_scores: dict | None = None
 
 
 def _scrub(features: dict[str, Any]) -> dict[str, Any]:
@@ -130,7 +138,17 @@ def run_pipeline(
     )
     if isinstance(outcome, GateResult):
         mx.SIGNALS_TOTAL.labels(result="gated").inc()
-        return PipelineResult(None, None, None, no_signal_reason=outcome.reason)
+        # Surface the composite + implied direction so alert rules keyed on
+        # raw score ("composite ≥ 20") can still fire without waiting for the
+        # trade-plan gate. Sub-scores are exposed so a rule on `s_news` etc.
+        # matches too.
+        return PipelineResult(
+            None, None, None,
+            no_signal_reason=outcome.reason,
+            composite_score=outcome.composite_score,
+            direction_implied=outcome.direction_implied.value if outcome.direction_implied else None,
+            sub_scores=outcome.sub_scores.model_dump(),
+        )
 
     signal = outcome
 
@@ -143,7 +161,15 @@ def run_pipeline(
     )
     if isinstance(plan, RiskVeto):
         mx.SIGNALS_TOTAL.labels(result="vetoed").inc()
-        return PipelineResult(None, plan, None, no_signal_reason=f"risk veto: {plan.reason}")
+        # Same surfacing as gated candidates — a risk veto shouldn't hide the
+        # composite from alert rules keyed on raw score.
+        return PipelineResult(
+            None, plan, None,
+            no_signal_reason=f"risk veto: {plan.reason}",
+            composite_score=signal.composite_score,
+            direction_implied=signal.direction.value,
+            sub_scores=signal.sub_scores.model_dump(),
+        )
 
     rationale: str | None = None
     if generate_explanation:
@@ -152,4 +178,9 @@ def run_pipeline(
         plan = plan.model_copy(update={"rationale_md": rationale})
 
     mx.SIGNALS_TOTAL.labels(result="published").inc()
-    return PipelineResult(plan, None, rationale)
+    return PipelineResult(
+        plan, None, rationale,
+        composite_score=plan.composite_score,
+        direction_implied=plan.direction.value,
+        sub_scores=plan.sub_scores.model_dump(),
+    )

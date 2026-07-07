@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -10,6 +11,42 @@ from typing import Any, Protocol
 class DeliveryResult:
     ok: bool
     detail: str = ""
+
+
+# ── Secret redaction ─────────────────────────────────────────────────────────
+#
+# httpx's HTTPStatusError message includes the full request URL, and Telegram's
+# Bot API embeds the token *in the URL path* (`/bot<TOKEN>/sendMessage`). Any
+# channel that does `str(exception)` without scrubbing has been leaking that
+# token straight into the alert_deliveries.detail column, log lines, and the
+# admin UI. This function is the single choke point every channel goes
+# through before writing an error string anywhere durable.
+
+# Telegram bot token: `bot<numeric_id>:<35+ char secret>`.
+_TELEGRAM_TOKEN_RE = re.compile(r"bot(\d+):[A-Za-z0-9_-]{20,}")
+
+# HTTP Basic-Auth headers rendered into logs by some clients.
+_BASIC_AUTH_RE = re.compile(r"(?i)(authorization:\s*basic\s+)\S+")
+_BEARER_AUTH_RE = re.compile(r"(?i)(authorization:\s*bearer\s+)\S+")
+
+# `smtp[s]://user:password@host` and similar URL-embedded credentials.
+_URL_USERINFO_RE = re.compile(r"([a-z][a-z0-9+.-]*://)([^:@/\s]+):[^@\s]+@")
+
+
+def redact_secrets(text: str) -> str:
+    """Scrub known secret shapes from a free-form message string.
+
+    Conservative — only patterns we've actually leaked in this codebase or
+    are known to appear in provider error responses. Extend as new sinks
+    show up. Idempotent; safe to call twice.
+    """
+    if not text:
+        return text
+    text = _TELEGRAM_TOKEN_RE.sub(r"bot\1:REDACTED", text)
+    text = _BASIC_AUTH_RE.sub(r"\1REDACTED", text)
+    text = _BEARER_AUTH_RE.sub(r"\1REDACTED", text)
+    text = _URL_USERINFO_RE.sub(r"\1\2:REDACTED@", text)
+    return text
 
 
 class Channel(Protocol):

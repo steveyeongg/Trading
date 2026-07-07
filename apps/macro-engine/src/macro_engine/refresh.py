@@ -89,6 +89,9 @@ async def load_snapshot() -> dict | None:
 
 
 def main() -> None:
+    from atlas_shared import load_env
+
+    load_env()  # so FredClient (reads os.environ) sees FRED_API_KEY from .env
     p = argparse.ArgumentParser()
     p.add_argument("--days", type=int, default=900)
     args = p.parse_args()

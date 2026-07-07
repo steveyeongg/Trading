@@ -93,6 +93,9 @@ async def _go(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    from atlas_shared import load_env
+
+    load_env()  # so the NewsAPI source (reads os.environ) sees NEWSAPI_KEY
     p = argparse.ArgumentParser()
     p.add_argument("--source", choices=["rss", "newsapi", "file"], default="rss")
     p.add_argument("--query", default="stock OR market OR earnings")

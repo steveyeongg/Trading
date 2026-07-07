@@ -69,6 +69,23 @@ DEFAULT_QUERY = "stock OR market OR earnings"
 MAX_PAGE_SIZE = 100              # NewsAPI hard cap per request
 DEFAULT_MAX_PAGES = 5            # 5 × 100 = 500 articles per fetch — sane upper bound
 
+# NewsAPI dev-plan quirk: `/v2/everything` returns HTTP 426 Upgrade Required
+# on `page=2` and beyond, even though `pageSize=100` implies pagination is
+# supported. Also emitted with `maximumResultsReached` on some accounts.
+# Treated as a benign cap in `fetch()` — we keep whatever page 1 returned.
+_BENIGN_CAP_CODES: frozenset[str] = frozenset({
+    "maximumResultsReached",
+    "planUpgradeRequired",      # our synthesised code for HTTP 426
+})
+
+# HTTP status → semantic code mapping for 4xx responses whose body is not JSON
+# (some NewsAPI 426s come back with a plain-text body).
+_CODE_BY_STATUS: dict[int, str] = {
+    401: "apiKeyInvalid",
+    426: "planUpgradeRequired",
+    429: "rateLimited",
+}
+
 
 class NewsApiError(RuntimeError):
     """Raised on a `status: error` body or HTTP 4xx/5xx that retries can't recover."""
@@ -116,9 +133,12 @@ class NewsApiSource:
         return bool(self.api_key)
 
     # `NewsApiError` is the application-layer signal that the API itself
-    # rejected the request (bad key, exhausted quota, invalid params). Those
-    # never self-heal, so we explicitly exclude them from retry — only
-    # transient httpx errors (network, 5xx, 429) get the backoff loop.
+    # rejected the request (bad key, exhausted quota, invalid params, dev-plan
+    # pagination cap). Those never self-heal, so we explicitly exclude them
+    # from retry — only transient httpx errors (network, 5xx) get the backoff
+    # loop. 4xx get promoted to NewsApiError with a semantic code so callers
+    # can distinguish benign caps (426 / maximumResultsReached) from real
+    # failures (401 bad key, 429 rate limit).
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=8),
@@ -126,7 +146,18 @@ class NewsApiSource:
     )
     async def _get_page(self, params: dict[str, str | int]) -> dict:
         r = await self._client.get(ENDPOINT, params=params)
-        r.raise_for_status()  # 4xx/5xx → httpx.HTTPStatusError → retried by tenacity
+        # 4xx: promote to NewsApiError so we skip retry. Try to read the JSON
+        # body for the semantic code; fall back to the HTTP status.
+        if 400 <= r.status_code < 500:
+            try:
+                body = r.json()
+                code = body.get("code") or _CODE_BY_STATUS.get(r.status_code, f"http_{r.status_code}")
+                message = body.get("message") or r.reason_phrase or ""
+            except Exception:
+                code = _CODE_BY_STATUS.get(r.status_code, f"http_{r.status_code}")
+                message = r.reason_phrase or f"HTTP {r.status_code}"
+            raise NewsApiError(code, message)
+        r.raise_for_status()  # 5xx → HTTPStatusError → retried by tenacity
         payload = r.json()
         if payload.get("status") != "ok":
             raise NewsApiError(
@@ -158,9 +189,10 @@ class NewsApiSource:
             try:
                 payload = await self._get_page({**base_params, "page": page})
             except NewsApiError as e:
-                # `maximumResultsReached` is benign — we hit the dev-plan cap.
-                # Any other code is worth surfacing.
-                if e.code in {"maximumResultsReached"}:
+                # Benign caps — dev plan hit its limit. Keep whatever pages
+                # we already collected; the ingest run succeeds with less
+                # data rather than failing outright.
+                if e.code in _BENIGN_CAP_CODES:
                     log.info("newsapi.cap_reached", page=page, code=e.code)
                     break
                 log.warning("newsapi.error", code=e.code, message=e.message, page=page)

@@ -45,16 +45,16 @@ uv run python -m atlas_shared.migrate up                     # migrations 0001�
 
 # 6. Ingest bars — pick ONE path
 #    (a) Real data (recommended) — auto-picks Polygon, else Alpaca:
-uv run python -m ingest_equities backfill --source auto --symbols AAPL,MSFT,NVDA,TSLA,SPY,QQQ --days 7
+uv run python -m ingest_equities backfill --source auto --symbols AAPL,MSFT,NVDA,TSLA,SPY,QQQ,IONQ,QBTS,NOW,TSM,MRVL --days 7
 #    (b) Offline / no API key — synthetic GBM bars (dev only):
 # uv run python -m ingest_equities synthetic --symbols AAPL,MSFT,NVDA,TSLA,SPY,QQQ --n-bars 1500
 
 # 7. Refresh macro + news (offline-friendly fallbacks if no FRED/NewsAPI keys)
 uv run python -m macro_engine.refresh
-uv run python -m news_ingest.refresh --source file --path data/news_seed.jsonl
+uv run python -m news_ingest.refresh --source newsapi --hours 48
 
 # 8. Train the trend model (else `s_quant` is null)
-uv run python -m quant_engine.train --symbols AAPL,MSFT,NVDA --version v1
+uv run python -m quant_engine.train --symbols AAPL,MSFT,NVDA,TSLA,SPY,QQQ,IONQ,QBTS,NOW,TSM,MRVL --version v1
 
 # 9. Seed portfolio + journal so the dashboard pages aren't empty
 uv run python -m portfolio_service.seed

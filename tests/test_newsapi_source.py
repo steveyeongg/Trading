@@ -175,6 +175,75 @@ async def test_pagination_capped_at_max_pages() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dev_plan_426_on_page_two_is_benign_cap_not_crash() -> None:
+    """NewsAPI dev plan returns HTTP 426 Upgrade Required on `page=2`+.
+    Historically this bubbled up as `RetryError` after tenacity retried 3×.
+    The fix: promote 4xx → NewsApiError (skips retry), treat the
+    `planUpgradeRequired` code as a benign cap, and keep whatever page 1
+    returned."""
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        page = int(request.url.params.get("page", "1"))
+        if page == 1:
+            # A full page — triggers the pagination loop to try page 2.
+            return httpx.Response(
+                200, json=_ok([_article(f"a{i}") for i in range(100)], total=10_000)
+            )
+        # Real NewsAPI response body is plain text; mimic that (no JSON).
+        return httpx.Response(426, text="Upgrade Required")
+
+    src = NewsApiSource(api_key="k")
+    src._client = httpx.AsyncClient(transport=httpx.MockTransport(handler), headers={"X-Api-Key": "k"})
+    items = await src.fetch()
+    # Fetch succeeded with page-1 articles; did NOT retry the 426.
+    assert len(items) == 100
+    assert call_count["n"] == 2, "page 1 + one attempt at page 2, no retry loop"
+
+
+@pytest.mark.asyncio
+async def test_dev_plan_426_with_json_body_uses_body_code() -> None:
+    """Some 426s carry a JSON body with `code=maximumResultsReached`. Handle both."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params.get("page", "1"))
+        if page == 1:
+            return httpx.Response(200, json=_ok([_article()] * 100, total=10_000))
+        return httpx.Response(
+            426,
+            json={
+                "status": "error",
+                "code": "maximumResultsReached",
+                "message": "You have reached the maximum number of results for your plan.",
+            },
+        )
+
+    src = NewsApiSource(api_key="k")
+    src._client = httpx.AsyncClient(transport=httpx.MockTransport(handler), headers={"X-Api-Key": "k"})
+    items = await src.fetch()
+    assert len(items) == 100  # benign — page 1 kept
+
+
+@pytest.mark.asyncio
+async def test_http_401_invalid_key_raises_immediately_no_retry() -> None:
+    """401 must NOT retry — it's a permanent error, retrying wastes time and
+    burns rate limit. This is the general form of the 426 fix."""
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        return httpx.Response(401, json={"status": "error", "code": "apiKeyInvalid", "message": "bad"})
+
+    src = NewsApiSource(api_key="bad")
+    src._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(NewsApiError) as exc:
+        await src.fetch()
+    assert exc.value.code == "apiKeyInvalid"
+    assert call_count["n"] == 1, "401 must not be retried"
+
+
+@pytest.mark.asyncio
 async def test_from_param_strips_microseconds() -> None:
     captured: list[httpx.Request] = []
 

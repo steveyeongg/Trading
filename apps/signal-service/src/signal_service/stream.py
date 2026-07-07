@@ -144,19 +144,42 @@ async def _push_signals() -> None:
             }
             await manager.publish(f"signals.{sym}", payload)
 
-            # Fire alerts on the freshly computed signal (cooldown-gated).
-            # Pass the latest close + regime so §12.2 event derivation can
-            # detect price-level breaches and regime changes.
-            if result.signal and rules:
+            # Fire alerts.
+            #
+            # We evaluate rules against every candidate, gated or published —
+            # a user rule like "composite ≥ 20" should match on the raw
+            # composite even when the pipeline's stricter trade-plan gate
+            # (default 50) hasn't cleared. The rule matcher is filter-only;
+            # sub-score / directional filters still apply, and cooldowns
+            # prevent spam. Published signals carry the full trade plan;
+            # gated candidates get a minimal shape with just composite +
+            # direction + sub-scores so composite/sub-score rules work.
+            if rules:
                 with contextlib.suppress(Exception):
                     last_close = float(bars["close"].iloc[-1])
-                    await _alert_engine.evaluate_signal(
-                        payload["signal"],
-                        rules,
-                        last_price=last_close,
-                        regime=regime,
-                        record=record_delivery,
-                    )
+                    if result.signal:
+                        candidate = payload["signal"]
+                    elif result.composite_score is not None:
+                        candidate = {
+                            "symbol": sym,
+                            "composite_score": result.composite_score,
+                            "direction": result.direction_implied,
+                            "sub_scores": result.sub_scores or {},
+                            # Gated marker — alert bodies can render "(gated)"
+                            # so users know there's no full trade plan.
+                            "gated": True,
+                            "no_signal_reason": result.no_signal_reason,
+                        }
+                    else:
+                        candidate = None
+                    if candidate is not None:
+                        await _alert_engine.evaluate_signal(
+                            candidate,
+                            rules,
+                            last_price=last_close,
+                            regime=regime,
+                            record=record_delivery,
+                        )
         except Exception as e:
             log.warning("stream.signal_push_failed", symbol=sym, error=str(e))
 

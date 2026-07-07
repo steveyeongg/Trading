@@ -123,11 +123,15 @@ class AlpacaClient:
         Each yielded frame has the same columns as `PolygonClient.aggs_1m`:
             ts, symbol, resolution, open, high, low, close, volume, vwap, trade_count
         """
+        # End must reach the *end* of the requested day, not the start. Using
+        # `datetime.min.time()` (00:00) here would exclude every intraday bar
+        # from that day — the whole reason MAX(ts) got stuck at
+        # `end_date - 1 day 23:59` on every backfill.
         params: dict[str, str | int] = {
             "symbols": symbol,
             "timeframe": "1Min",
             "start": datetime.combine(start, datetime.min.time(), UTC).isoformat(),
-            "end": datetime.combine(end, datetime.min.time(), UTC).isoformat(),
+            "end": datetime.combine(end, datetime.max.time(), UTC).isoformat(),
             "limit": 10_000,
             "feed": self.feed,
             "adjustment": "all" if adjusted else "raw",

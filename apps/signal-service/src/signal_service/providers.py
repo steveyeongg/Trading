@@ -133,7 +133,12 @@ def _provider_rows() -> list[ProviderStatus]:
 
 
 def provider_status_payload() -> dict[str, Any]:
-    """Return a serialisable status report grouped by category."""
+    """Return a serialisable status report grouped by category.
+
+    Reads os.environ, which the service populates from `.env` via
+    ``atlas_shared.config.load_env()`` at startup (see signal_service.main
+    lifespan). In tests os.environ is authoritative and controlled directly.
+    """
     rows = _provider_rows()
     by_category: dict[str, list[dict[str, Any]]] = {}
     for r in rows:

@@ -21,8 +21,10 @@ _OPS: dict[str, Callable[[float, float], bool]] = {
 }
 
 # Sub-score metrics resolve against signal.sub_scores; everything else is a
-# top-level signal field.
-_SUB_METRICS = {"tech", "quant", "fund", "macro", "sent", "opt", "liq", "chain"}
+# top-level signal field. Must match the SubScores schema keys — pre-Phase-1
+# this had stale `fund`/`chain` slots that never matched, silently swallowing
+# rules keyed on those metrics.
+_SUB_METRICS = {"tech", "quant", "news", "sent", "macro", "opt", "liq", "risk"}
 
 
 @dataclass(frozen=True)

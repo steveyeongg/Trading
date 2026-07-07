@@ -14,7 +14,7 @@ from typing import Any
 
 from atlas_shared.logging import get_logger
 
-from alert_service.channels.base import DeliveryResult, format_alert
+from alert_service.channels.base import DeliveryResult, format_alert, redact_secrets
 
 log = get_logger("alert.email")
 
@@ -54,5 +54,7 @@ class EmailChannel:
             await asyncio.to_thread(self._send_sync, title, text)
             return DeliveryResult(ok=True, detail="sent")
         except Exception as e:
-            log.warning("alert.email.failed", error=str(e))
-            return DeliveryResult(ok=False, detail=str(e)[:200])
+            # SMTP tracebacks can echo authentication headers on some servers.
+            safe = redact_secrets(str(e))
+            log.warning("alert.email.failed", error=safe)
+            return DeliveryResult(ok=False, detail=safe[:200])

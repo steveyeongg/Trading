@@ -140,6 +140,10 @@ async def latest_bars(symbol: str, resolution: str = "1m", limit: int = 500) -> 
     if resolution not in _BUCKETS:
         raise ValueError(f"unsupported resolution: {resolution!r}; expected one of {sorted(_BUCKETS)}")
 
+    # The aggregation SQL binds `:bucket_seconds` — historically this dict
+    # keyed it as `bucket`, which SQLAlchemy silently rejects (the parameter
+    # remains unbound), and every non-1m /bars request 500s. This is what
+    # made the dashboard chart perpetually empty on 5D / 1M / 3M timeframes.
     sql, params = (
         (_RAW_SQL, {"symbol": symbol, "resolution": "1m", "limit": limit})
         if resolution == "1m"
@@ -148,7 +152,7 @@ async def latest_bars(symbol: str, resolution: str = "1m", limit: int = 500) -> 
             {
                 "symbol": symbol,
                 "resolution": resolution,
-                "bucket": _BUCKETS[resolution],
+                "bucket_seconds": _BUCKETS[resolution],
                 "limit": limit,
             },
         )
