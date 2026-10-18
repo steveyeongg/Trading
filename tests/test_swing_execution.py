@@ -167,7 +167,7 @@ def test_entry_day_low_through_stop_exits_same_day_at_stop():
     assert out.entry_price == pytest.approx(101.0 * 1.001)
     assert out.sessions_held == 1
     assert out.current_stop == STOP
-    assert out.highest_close is None  # the trail never started: the stop hit before the close
+    assert out.highest_close == 102.0  # the entry session's close counts as a close seen
     assert out.r_multiple == pytest.approx((95.904 - 101.101) / (101.101 - 96.0))
 
 
@@ -192,7 +192,17 @@ def test_later_day_low_through_stop_fills_at_stop_when_open_is_above_it():
     assert out.exit_price == pytest.approx(STOP * 0.999)
     assert out.sessions_held == 2
     assert out.current_stop == STOP
-    assert out.highest_close == 102.0  # the stop-day close is not part of the trade's state
+    assert out.highest_close == 102.0  # 97 on the stop-out day is below the 102 already seen
+
+
+def test_stop_out_day_close_counts_toward_highest_close_but_does_not_lift_the_stop():
+    # An outside day: it trades down through the 96 stop, then closes at a new high of 106.
+    rows = [SIGNAL, (101.0, 103.0, 100.5, 102.0, ATR), (100.0, 107.0, 95.5, 106.0, ATR)]
+    out = _sim(rows)
+    assert out.exit_reason == ExitReason.STOP
+    assert out.exit_price == pytest.approx(STOP * 0.999)
+    assert out.highest_close == 106.0  # every held session's close, the exit session included
+    assert out.current_stop == STOP  # the level that was hit, not 106 - 6 = 100
 
 
 def test_later_day_low_exactly_at_the_stop_exits():
@@ -489,27 +499,14 @@ def test_missing_signal_row_raises():
         simulate_trade(frame, date(2024, 1, 6), TRIGGER, STOP, TRAIL, 30, ExecutionParams())
 
 
-def test_a_session_with_no_prices_is_not_a_session():
-    nan = float("nan")
-    rows = [
-        SIGNAL,
-        (nan, nan, nan, nan, nan),  # halted: no bar
-        (101.0, 103.0, 100.5, 102.0, ATR),
-    ]
-    frame = _bars(rows)
-    out = _sim(rows)
-    assert out.status == TrackStatus.OPEN
-    assert out.entry_date == _day(frame, 2)
-    assert out.sessions_held == 1
-
-
 def test_missing_columns_and_unsorted_bars_raise():
     frame = _bars([SIGNAL, (101.0, 103.0, 100.5, 102.0, ATR)])
     ex = ExecutionParams()
     with pytest.raises(ValueError, match="atr14"):
         simulate_trade(frame.drop(columns="atr14"), frame.index[0], TRIGGER, STOP, TRAIL, 30, ex)
+    backwards = frame.iloc[::-1]
     with pytest.raises(ValueError, match="ascending"):
-        simulate_trade(frame.iloc[::-1], frame.index[0], TRIGGER, STOP, TRAIL, 30, ex)
+        simulate_trade(backwards, backwards.index[0], TRIGGER, STOP, TRAIL, 30, ex)
 
 
 @pytest.mark.parametrize(
@@ -541,6 +538,209 @@ def test_nan_signal_atr_cannot_silently_disable_the_gap_check():
     assert _sim(rows, trigger=0.0, stop=100.0, ex=ex).status == TrackStatus.OPEN
 
 
+# ----------------------------------------- sessions with no bar: lapse, skip, and segment breaks
+
+NAN = float("nan")
+NO_BAR: Row = (NAN, NAN, NAN, NAN, NAN)
+D1: Row = (101.0, 103.0, 100.5, 102.0, ATR)  # fills at 101 and holds: far above the 96 stop
+NEW_COMPANY: Row = (15.5, 16.0, 14.9, 15.0, 0.4)  # a reused ticker, trading at a tenth of the price
+
+
+def _none(k: int) -> list[Row]:
+    """``k`` consecutive sessions on which the symbol has no bar."""
+    return [NO_BAR] * k
+
+
+@pytest.mark.parametrize("field", ["open", "high", "low", "close"])
+def test_a_next_session_with_no_price_lets_the_buy_stop_lapse(field):
+    row = {"open": 101.0, "high": 103.0, "low": 100.5, "close": 102.0}
+    row[field] = NAN
+    broken: Row = (row["open"], row["high"], row["low"], row["close"], ATR)
+    _assert_no_entry(_sim([SIGNAL, broken, D1]), TrackStatus.NOT_TRIGGERED)
+
+
+@pytest.mark.parametrize("missing", [1, 5, 10, 300])
+def test_the_buy_stop_is_not_carried_over_a_missing_session_or_a_segment_break(missing):
+    # The signal is the old company's last bar; the first bar after the break would have
+    # triggered a one-session order, but the order was good for the very next session only.
+    out = _sim([SIGNAL, *_none(missing), D1])
+    _assert_no_entry(out, TrackStatus.NOT_TRIGGERED)
+
+
+def test_unpriced_rows_inside_the_hold_are_skipped_and_not_counted():
+    d2: Row = (100.0, 104.0, 99.0, 103.0, ATR)
+    d3: Row = (103.0, 105.0, 102.0, 104.0, ATR)
+    rows = [SIGNAL, D1, *_none(10), d2, d3]  # ten missing sessions: still the same segment
+    frame = _bars(rows)
+    out = _sim(rows, max_hold=3)
+    assert out.status == TrackStatus.CLOSED
+    assert out.exit_reason == ExitReason.MAX_HOLD
+    assert out.sessions_held == 3  # the ten missing sessions are not held sessions
+    assert out.exit_date == _day(frame, 13)
+    assert out.exit_price == pytest.approx(104.0 * 0.999)
+    assert out.highest_close == 104.0
+    assert out.current_stop == pytest.approx(98.0)  # 104 - 3 * 2: moved only by priced closes
+
+
+def test_a_run_of_missing_sessions_does_not_stop_out_or_move_the_trail():
+    with_gap = _sim([SIGNAL, D1, *_none(7), (102.5, 103.0, 101.0, 102.5, ATR)])
+    without = _sim([SIGNAL, D1, (102.5, 103.0, 101.0, 102.5, ATR)])
+    assert with_gap.status == TrackStatus.OPEN
+    assert with_gap.sessions_held == without.sessions_held == 2
+    assert with_gap.current_stop == without.current_stop
+    assert with_gap.highest_close == without.highest_close == 102.5
+
+
+def test_a_gap_down_after_a_skipped_run_fills_at_that_sessions_open():
+    # day 1 close 105 lifts the stop to 99; after 4 missing sessions the stock reopens at 93.
+    d1: Row = (101.0, 106.0, 100.5, 105.0, ATR)
+    rows = [SIGNAL, d1, *_none(4), (93.0, 94.0, 90.0, 92.0, ATR)]
+    frame = _bars(rows)
+    out = _sim(rows)
+    assert out.exit_reason == ExitReason.TRAIL
+    assert out.exit_date == _day(frame, 6)
+    assert out.exit_price == pytest.approx(93.0 * 0.999)
+    assert out.sessions_held == 2
+    assert out.current_stop == pytest.approx(99.0)
+
+
+@pytest.mark.parametrize("delisted", [False, True])
+def test_ten_missing_sessions_are_skipped_and_eleven_end_the_segment(delisted):
+    ten_rows = [SIGNAL, D1, *_none(10), D1]
+    ten = _sim(ten_rows, delisted=delisted)
+    assert ten.sessions_held == 2  # both priced bars were held: the run did not end the trade
+    if delisted:  # the flag says the bars end: at the last priced bar, after the skipped run
+        assert ten.exit_reason == ExitReason.DELISTED
+        assert ten.exit_date == _day(_bars(ten_rows), 12)
+    else:
+        assert ten.status == TrackStatus.OPEN
+
+    frame = _bars([SIGNAL, D1, *_none(11), D1])
+    eleven = _sim([SIGNAL, D1, *_none(11), D1], delisted=delisted)
+    assert eleven.status == TrackStatus.CLOSED
+    assert eleven.exit_reason == ExitReason.DELISTED
+    assert eleven.exit_date == _day(frame, 1)  # the last priced bar before the break
+    assert eleven.exit_price == pytest.approx(102.0 * 0.999)
+    assert eleven.sessions_held == 1
+    assert eleven.highest_close == 102.0
+
+
+def test_only_consecutive_missing_sessions_make_a_segment_break():
+    # 6 + 6 missing sessions, split by a priced bar: neither run is longer than ten.
+    rows = [SIGNAL, D1, *_none(6), (102.0, 104.0, 101.5, 103.0, ATR), *_none(6), D1]
+    out = _sim(rows)
+    assert out.status == TrackStatus.OPEN
+    assert out.sessions_held == 3
+
+
+def test_a_reused_ticker_cannot_be_traded_into_across_a_segment_break():
+    # Open at 101.1, 300 sessions with no bar, then a different company on the same symbol at 15.
+    rows = [SIGNAL, D1, (102.0, 104.0, 101.5, 103.0, ATR), *_none(300), *[NEW_COMPANY] * 5]
+    frame = _bars(rows)
+    out = _sim(rows)
+    assert out.status == TrackStatus.CLOSED
+    assert out.exit_reason == ExitReason.DELISTED
+    assert out.exit_date == _day(frame, 2)  # the old company's last bar, not the new one's
+    assert out.exit_price == pytest.approx(103.0 * 0.999)
+    assert out.sessions_held == 2
+    assert out.r_multiple == pytest.approx((103.0 * 0.999 - 101.0 * 1.001) / (101.0 * 1.001 - STOP))
+    assert out.r_multiple > 0  # not a -17R loss on the new company's prices
+    assert _sim(rows, delisted=True) == out  # the flag changes nothing: the break is the end
+
+
+@pytest.mark.parametrize(
+    ("trailing", "flag", "status"), [(10, False, "open"), (11, False, "closed")]
+)
+def test_trailing_missing_sessions_close_only_once_they_are_a_segment_break(trailing, flag, status):
+    rows = [SIGNAL, D1, (102.0, 104.0, 101.5, 103.0, ATR), *_none(trailing)]
+    out = _sim(rows, delisted=flag)
+    assert out.status.value == status
+    if status == "closed":
+        assert out.exit_reason == ExitReason.DELISTED
+        assert out.exit_date == _day(_bars(rows), 2)
+
+
+def test_trailing_missing_sessions_with_the_delisted_flag_exit_on_the_last_priced_bar():
+    # The real shape of a delisted symbol's panel column: priced bars, then NaN to the end.
+    rows = [SIGNAL, D1, (102.0, 104.0, 101.5, 103.0, ATR), *_none(3)]
+    frame = _bars(rows)
+    flagged = _sim(rows, delisted=True)
+    assert flagged.status == TrackStatus.CLOSED
+    assert flagged.exit_reason == ExitReason.DELISTED
+    assert flagged.exit_date == _day(frame, 2)
+    assert flagged.exit_price == pytest.approx(103.0 * 0.999)
+    assert flagged.sessions_held == 2
+    assert flagged.highest_close == 103.0
+    assert flagged.r_multiple == pytest.approx(
+        (103.0 * 0.999 - 101.0 * 1.001) / (101.0 * 1.001 - STOP)
+    )
+    unflagged = _sim(rows, delisted=False)
+    assert unflagged.status == TrackStatus.OPEN
+    assert unflagged.exit_date is None and unflagged.exit_price is None
+    assert unflagged.sessions_held == 2
+    assert unflagged.highest_close == 103.0
+
+
+def test_trailing_missing_sessions_right_after_the_entry_session():
+    rows = [SIGNAL, D1, *_none(2)]
+    out = _sim(rows, delisted=True)
+    assert out.exit_reason == ExitReason.DELISTED
+    assert out.sessions_held == 1
+    assert out.exit_date == _day(_bars(rows), 1)
+    assert _sim(rows).status == TrackStatus.OPEN
+
+
+def test_a_real_exit_before_the_break_stands():
+    rows = [SIGNAL, D1, (100.0, 100.5, 95.5, 97.0, ATR), *_none(300), NEW_COMPANY]
+    out = _sim(rows)
+    assert out.exit_reason == ExitReason.STOP
+    assert out.exit_price == pytest.approx(STOP * 0.999)
+
+
+# ----------------------------------------------------------------- reading only what is needed
+
+
+def test_rows_after_the_exit_are_never_read():
+    stopped = _bars([SIGNAL, (101.0, 103.0, 95.0, 102.0, ATR)])
+    # Append rows whose dates run backwards and whose prices are NaN or absurd: if the scan
+    # touched anything past the exit it would raise on the ordering.
+    junk = pd.DataFrame(
+        [NO_BAR, (1e9, 1e9, -1e9, 1e9, 1e9)],
+        index=pd.DatetimeIndex(["2023-01-03", "2023-01-02"]),
+        columns=stopped.columns,
+    )
+    messy = pd.concat([stopped, junk])
+    assert not messy.index.is_monotonic_increasing
+    ex = ExecutionParams()
+    clean = simulate_trade(stopped, stopped.index[0], TRIGGER, STOP, TRAIL, 30, ex)
+    assert clean.exit_reason == ExitReason.STOP
+    assert simulate_trade(messy, stopped.index[0], TRIGGER, STOP, TRAIL, 30, ex) == clean
+
+
+def test_rows_out_of_order_inside_the_trade_raise():
+    frame = _bars([SIGNAL, D1, (102.0, 104.0, 101.5, 103.0, ATR)])
+    shuffled = frame.iloc[[0, 1, 2]].copy()
+    shuffled.index = frame.index[[0, 2, 1]]
+    with pytest.raises(ValueError, match="ascending"):
+        simulate_trade(shuffled, shuffled.index[0], TRIGGER, STOP, TRAIL, 30, ExecutionParams())
+
+
+def test_index_must_be_tz_naive_datetimes_with_one_row_per_signal_date():
+    frame = _bars([SIGNAL, D1])
+    ex = ExecutionParams()
+    aware = frame.tz_localize("UTC")
+    with pytest.raises(ValueError, match="tz-naive"):
+        simulate_trade(aware, frame.index[0], TRIGGER, STOP, TRAIL, 30, ex)
+    plain = frame.reset_index(drop=True)
+    with pytest.raises(ValueError, match="tz-naive"):
+        simulate_trade(plain, frame.index[0], TRIGGER, STOP, TRAIL, 30, ex)
+    with pytest.raises(ValueError, match="tz-naive"):
+        simulate_trade(frame, frame.index[0].tz_localize("UTC"), TRIGGER, STOP, TRAIL, 30, ex)
+    doubled = pd.concat([frame, frame.iloc[[0]]])
+    with pytest.raises(ValueError, match="more than one row"):
+        simulate_trade(doubled, frame.index[0], TRIGGER, STOP, TRAIL, 30, ex)
+
+
 # ----------------------------------------------------------------------- no look-ahead property
 
 
@@ -559,37 +759,17 @@ def _wander(n: int, seed: int) -> list[Row]:
     return rows
 
 
-@pytest.mark.parametrize("seed", range(40))
-def test_a_closed_trade_never_depends_on_bars_after_its_exit(seed):
-    rows = _wander(45, seed)
-    frame = _bars(rows)
-    sig = frame.index[0]
-    ex = ExecutionParams()
-    # trigger just above the first session's open so most seeds fill; stop 2 ATR under it
-    trigger = rows[1][0] * 0.999
-    stop = trigger - 2 * rows[0][4]
-    full = simulate_trade(frame, sig, trigger, stop, TRAIL, 20, ex)
-
-    def run(upto: int) -> TradeOutcome:
-        return simulate_trade(frame.iloc[: upto + 1], sig, trigger, stop, TRAIL, 20, ex)
-
-    for upto in range(len(frame)):
-        prefix = run(upto)
-        if prefix.status in {
-            TrackStatus.CLOSED,
-            TrackStatus.NOT_TRIGGERED,
-            TrackStatus.SKIPPED_GAP,
-        }:
-            # settled with bars through ``upto``: every longer window must agree exactly
-            assert prefix == full
-            assert (
-                simulate_trade(
-                    _with_scrambled_tail(frame, upto, seed), sig, trigger, stop, TRAIL, 20, ex
-                )
-                == prefix
-            )
-        else:
-            assert prefix.status in {TrackStatus.PENDING, TrackStatus.OPEN}
+def _with_missing_sessions(rows: list[Row], seed: int) -> list[Row]:
+    """Blank two short runs of sessions, and on odd seeds one 11-session run (a segment break)."""
+    rng = np.random.default_rng(2000 + seed)
+    out = list(rows)
+    runs = [int(rng.integers(1, 4)), int(rng.integers(1, 4))]
+    if seed % 2:
+        runs.append(11)
+    for length in runs:
+        start = int(rng.integers(3, 25))
+        out[start : start + length] = [NO_BAR] * length
+    return out
 
 
 def _with_scrambled_tail(frame: pd.DataFrame, upto: int, seed: int) -> pd.DataFrame:
@@ -603,6 +783,55 @@ def _with_scrambled_tail(frame: pd.DataFrame, upto: int, seed: int) -> pd.DataFr
             [base, base * 1.2, base * 0.8, base * 1.05, rng.uniform(0.5, 5, size=len(tail))]
         )
     return out
+
+
+@pytest.mark.parametrize("with_missing", [False, True], ids=["dense", "missing-sessions"])
+@pytest.mark.parametrize("mode", ["fills", "not_triggered", "skipped_gap"])
+@pytest.mark.parametrize("seed", range(20))
+def test_a_settled_trade_never_depends_on_bars_after_it_settled(seed, mode, with_missing):
+    rows = _wander(45, seed)
+    if with_missing:
+        rows = _with_missing_sessions(rows, seed)
+    frame = _bars(rows)
+    sig = frame.index[0]
+    ex = ExecutionParams()
+    open1, high1, atr0 = rows[1][0], rows[1][1], rows[0][4]
+    if mode == "fills":
+        trigger = open1 * 0.999  # just under the next open: always fills, at that open
+    elif mode == "not_triggered":
+        trigger = high1 + 0.01  # one cent above the next session's high: never touched
+    else:
+        trigger = open1 - 2 * atr0 - 0.5  # the next open sits 2.5 ATR-ish above the trigger
+    stop = trigger - 2 * atr0
+    full = simulate_trade(frame, sig, trigger, stop, TRAIL, 20, ex)
+    expected = {
+        "fills": TrackStatus.CLOSED,  # 20 held sessions, a stop, or a segment break: all exits
+        "not_triggered": TrackStatus.NOT_TRIGGERED,
+        "skipped_gap": TrackStatus.SKIPPED_GAP,
+    }[mode]
+    assert full.status == expected
+
+    for upto in range(len(frame)):
+        prefix = simulate_trade(frame.iloc[: upto + 1], sig, trigger, stop, TRAIL, 20, ex)
+        if prefix.status in {
+            TrackStatus.CLOSED,
+            TrackStatus.NOT_TRIGGERED,
+            TrackStatus.SKIPPED_GAP,
+        }:
+            # settled with bars through ``upto``: every longer window must agree exactly
+            assert prefix == full
+            scrambled = _with_scrambled_tail(frame, upto, seed)
+            assert simulate_trade(scrambled, sig, trigger, stop, TRAIL, 20, ex) == prefix
+        else:
+            assert prefix.status in {TrackStatus.PENDING, TrackStatus.OPEN}
+
+    if mode == "fills":
+        # highest_close is the best close over every held session, the exit session included,
+        # and sessions_held counts the priced sessions in that span.
+        assert full.entry_date is not None and full.exit_date is not None
+        held = frame.loc[str(full.entry_date) : str(full.exit_date)].dropna(subset=["close"])
+        assert full.highest_close == held["close"].max()
+        assert full.sessions_held == len(held)
 
 
 def test_open_trade_status_changes_only_when_a_later_bar_arrives():
