@@ -37,6 +37,8 @@ ml/datasets/processed/
 
 # Local data
 data/
+# ...but not the swing engine's `data` Python package (market-data clients)
+!apps/swing-engine/src/swing_engine/data/
 *.parquet
 *.db
 *.sqlite
