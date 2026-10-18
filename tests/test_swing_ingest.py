@@ -806,14 +806,14 @@ def test_ingest_result_failed_defaults_to_empty():
 # --- CLI -------------------------------------------------------------------------------
 
 
-def test_help_lists_backfill_and_update_only(capsys):
+def test_help_lists_the_data_jobs_and_scan_but_not_later_commands(capsys):
     with pytest.raises(SystemExit) as exit_:
         cli.main(["--help"])
 
     out = capsys.readouterr().out
     assert exit_.value.code == 0
-    assert "backfill" in out and "update" in out
-    for later in ("scan", "insample", "oos"):
+    assert "backfill" in out and "update" in out and "scan" in out
+    for later in ("insample", "oos"):
         assert later not in out
 
 
