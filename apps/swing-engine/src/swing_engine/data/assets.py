@@ -86,9 +86,12 @@ _ETF_NAME = _words(
 _FUND_NAME = _words(r"\bfunds?\b")
 _TRUST_NAME = _words(r"\btrust\b")
 # Words that show a "Trust" is an operating entity (a bank, a REIT) rather than a product.
+# "Shares of Beneficial Interest" is the REIT share form, which catches trust-form REITs
+# with no REIT keyword (Diversified Healthcare Trust). Royalty trusts issue "units" instead.
 _OPERATING_ENTITY = _words(
     r"\b(?:corporation|corp|incorporated|inc|co|company|bancorp|bancorporation|bancshares)\b"
     r"|\bcommon stock\b"
+    r"|\bshares? of beneficial interest\b"
     r"|\b(?:reit|realty|real estate|properties|property|mortgage|hotel|hospitality|lodging)\b"
 )
 _DEBT_NAME = _words(r"\bnotes?\s+due\b|\b(?:senior|subordinated)\s+notes?\b|\bdebentures?\b")

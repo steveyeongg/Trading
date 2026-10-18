@@ -73,10 +73,20 @@ def test_trust_in_an_operating_company_name_is_common(name):
         ("CPT", "Camden Property Trust Common Shares of Beneficial Interest"),
         ("PMT", "PennyMac Mortgage Investment Trust Common Shares of Beneficial Interest"),
         ("PEB", "Pebblebrook Hotel Trust Common Shares of Beneficial Interest"),
+        # No REIT keyword in the name: only the share form ("Shares of Beneficial Interest").
+        ("DHC", "Diversified Healthcare Trust Common Shares of Beneficial Interest"),
+        ("NSA", "National Storage Affiliates Trust Common Shares of Beneficial Interest"),
+        ("EXR", "Example Storage Trust Shares of Beneficial Interest"),
     ],
 )
 def test_real_estate_trusts_are_common(sym, name):
     assert classify_asset(_asset(sym, name, "NYSE")) == AssetKind.COMMON
+
+
+def test_royalty_trust_units_of_beneficial_interest_are_not_common():
+    # Only "shares" of beneficial interest are REIT equity; royalty trusts issue "units".
+    name = "Example Basin Royalty Trust Units of Beneficial Interest"
+    assert classify_asset(_asset("RTU", name, "NYSE")) == AssetKind.ETF
 
 
 @pytest.mark.parametrize(
