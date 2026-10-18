@@ -2,9 +2,12 @@
 
 :func:`simulate_portfolio` takes the trades a setup produced (from
 :func:`~swing_engine.backtest.trades.simulate_candidates`) and plays them through one cash
-account. Only entered trades count: those with an ``entry_date`` inside the window. A trade still
-held when the window ends, or whose exit is not yet known by then, is marked to market through
-the last session and never sold.
+account. The account starts flat: its first session only marks the starting equity, so an entry
+dated that session is skipped, like one dated before the window. Equity therefore starts at
+exactly ``settings.equity`` and the returns have the same base as the benchmark's first close.
+Only entered trades count: those with an ``entry_date`` after the first session and no later
+than the window's end. A trade still held when the window ends, or whose exit is not yet known by
+then, is marked to market through the last session and never sold.
 
 Each session ``d`` runs in this order:
 
@@ -119,13 +122,13 @@ def _result(equity: pd.Series, taken: pd.DataFrame, exposure: float) -> Portfoli
     )
 
 
-def _entered(trades: pd.DataFrame, lo: pd.Timestamp, hi: pd.Timestamp) -> pd.DataFrame:
-    """The trades entered in ``[lo, hi]``, in the order a session considers them."""
+def _entered(trades: pd.DataFrame, after: pd.Timestamp, hi: pd.Timestamp) -> pd.DataFrame:
+    """The trades entered in ``(after, hi]``, in the order a session considers them."""
     missing = [c for c in _REQUIRED if c not in trades.columns]
     if missing:
         raise ValueError(f"trades is missing columns: {missing}")
     entry = pd.to_datetime(trades["entry_date"])  # NaT (never filled) compares False below
-    inside = ((entry >= lo) & (entry <= hi)).to_numpy(dtype=bool)
+    inside = ((entry > after) & (entry <= hi)).to_numpy(dtype=bool)
     entered = trades.loc[inside].sort_values(
         ["entry_date", "rs_pct", "symbol"], ascending=[True, False, True]
     )
@@ -173,17 +176,19 @@ def simulate_portfolio(
     ``trades`` is a ``simulate_candidates`` table (it needs ``symbol``, ``rs_pct``, ``regime``,
     ``entry_date``, ``entry_price``, ``initial_stop``, ``exit_price`` and ``known_date``) and
     ``close`` is the panel's close frame. The module docstring gives the daily order. The account
-    starts flat with ``settings.equity`` in cash, so a trade entered before ``start`` is ignored,
-    not carried in. Equity is marked at every close, and the first mark is the first value of
-    ``equity``: a position entered on the first session has its first-session move left out of
-    the returns, which start from that mark.
+    starts flat with ``settings.equity`` in cash: a trade entered before ``start`` is ignored, not
+    carried in, and so is one entered on the window's first session, which is the base day. That
+    makes ``equity.iloc[0] == settings.equity`` exactly, so every move of the account is in the
+    returns, and the first session has the role of the first close in :func:`buy_and_hold`.
+    Callers that build ``trades`` from candidates dated before ``start`` (or on it) lose those
+    first-session entries by design.
 
     Raises ``ValueError`` when the window holds no session, a considered trade names a symbol
     missing from ``close`` or a regime with no factor, an ``entry_date`` or a ``known_date`` in
     the window is not a session of ``close``, or a required column is missing.
     """
     sessions = _sessions(close.index, start, end)
-    entered = _entered(trades, pd.Timestamp(start), pd.Timestamp(end))
+    entered = _entered(trades, sessions[0], pd.Timestamp(end))
     n_days, n_trades = len(sessions), len(entered)
 
     entry_row = sessions.get_indexer(pd.DatetimeIndex(pd.to_datetime(entered["entry_date"])))

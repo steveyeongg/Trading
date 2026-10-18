@@ -309,18 +309,45 @@ def test_max_dd_is_a_negative_fraction():
 
 def test_sizing_uses_the_start_of_day_marked_equity():
     rows = [
-        # 100 shares at 100 on D0, marked at 110 on D0, sold at 120 on D1.
-        _trade("A", entry=0, price=100.0, stop=90.0, rs=99.0, exit=1, exit_price=120.0),
-        _trade("B", entry=1, price=50.0, stop=45.0, rs=90.0),
+        # 100 shares at 100 on D1, marked at 110 on D1, sold at 120 on D2.
+        _trade("A", entry=1, price=100.0, stop=90.0, rs=99.0, exit=2, exit_price=120.0),
+        _trade("B", entry=2, price=50.0, stop=45.0, rs=90.0),
     ]
-    close = _close({"A": [110.0, 120.0, 120.0], "B": [50.0, 50.0, 50.0]})
+    close = _close({"A": [100.0, 110.0, 120.0, 120.0], "B": [50.0] * 4})
     res = _run(rows, close)
     # A is sized on the $100,000 starting equity (1,000 / 10 = 100 shares). B is sized on the
-    # $101,000 that D0 closed at: 1,010 / 5 = 202 shares, not 200 and not the 204 that D1's
+    # $101,000 that D1 closed at: 1,010 / 5 = 202 shares, not 200 and not the 204 that D2's
     # sale at 120 (cash 102,000) would give.
     assert list(res.taken["symbol"]) == ["A", "B"]
     assert list(res.taken["shares"]) == [100, 202]
-    assert res.equity.tolist() == pytest.approx([101_000.0, 102_000.0, 102_000.0])
+    assert res.equity.tolist() == pytest.approx([100_000.0, 101_000.0, 102_000.0, 102_000.0])
+
+
+def test_an_entry_on_the_first_session_is_skipped_so_equity_starts_at_settings_equity():
+    rows = [
+        # The base day: this entry would lose 2,000 (200 shares, 50 -> 40) before the first mark.
+        _trade("FIRST", entry=0, rs=99.0, exit=1, exit_price=40.0),
+        _trade("SECOND", entry=1, rs=50.0),
+    ]
+    res = _run(rows, _flat(["FIRST", "SECOND"], 50.0, 3))
+    assert list(res.taken["symbol"]) == ["SECOND"]  # FIRST, with the better RS, never enters
+    assert res.equity.iloc[0] == 100_000.0  # exactly, not a mark after a day of trading
+    assert res.equity.tolist() == [100_000.0] * 3 and res.max_dd == 0.0
+    # The same holds when the window opens later: its first session is the base day.
+    later = _run(rows, _flat(["FIRST", "SECOND"], 50.0, 3), start=1)
+    assert list(later.taken["symbol"]) == [] and later.equity.iloc[0] == 100_000.0
+    assert list(later.equity.index) == list(D[1:3])
+
+
+def test_a_loss_after_the_base_day_shows_in_the_drawdown_cagr_and_sharpe():
+    # 200 shares enter at 50 on the second session and are sold at 40 on the third.
+    rows = [_trade("X", entry=1, exit=2, exit_price=40.0)]
+    res = _run(rows, _close({"X": [50.0, 50.0, 40.0, 40.0]}))
+    path = [100_000.0, 100_000.0, 98_000.0, 98_000.0]  # 90,000 + 200 x 40 = 98,000
+    assert res.equity.tolist() == pytest.approx(path)
+    assert res.max_dd == pytest.approx(-0.02) and res.max_dd < 0  # -2,000 from the 100,000 peak
+    assert res.cagr == pytest.approx(0.98 ** (252 / 3) - 1)
+    assert res.sharpe == pytest.approx(_sharpe(path))
 
 
 def test_no_trade_leaves_equity_flat_with_empty_taken():
