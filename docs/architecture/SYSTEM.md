@@ -103,6 +103,7 @@ Background loops in the `signal-service` lifespan:
 | `apps/backtest-service` | event-driven simulator · walk-forward · cost sensitivity · bootstrap-CI Sharpe · deflated Sharpe |
 | `apps/execution-service` | paper + Alpaca brokers · `ExecutionEngine` · ladder `plan_exit` + chandelier trail · `run_monitor_once` (**opt-in**) |
 | `apps/signal-service` | FastAPI surface — routes / WS / lifespan loops / middleware · `/metrics` · `screener.py` · `providers.py` |
+| `apps/swing-engine` | Rules-based daily swing-trading engine (US stocks, long-only): versioned setup parameters · wide OHLCV `Panel` · strict per-segment indicators (SMA / EMA / Wilder ATR / RSI, a >10-session gap restarts a symbol) · synthetic test helpers |
 | `apps/web` | Next.js 14 dashboard — **8 pages**, WS-driven cache, lightweight-charts, full §11 surface |
 
 ## HTTP surface

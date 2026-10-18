@@ -24,6 +24,7 @@ dependencies = [
     "alert-service",
     "execution-service",
     "signal-service",
+    "swing-engine",
 ]
 
 [tool.uv.workspace]
@@ -44,6 +45,7 @@ members = [
     "apps/alert-service",
     "apps/execution-service",
     "apps/signal-service",
+    "apps/swing-engine",
     "packages/shared-py",
 ]
 
@@ -65,6 +67,7 @@ journal-service = { workspace = true }
 alert-service = { workspace = true }
 execution-service = { workspace = true }
 signal-service = { workspace = true }
+swing-engine = { workspace = true }
 
 [dependency-groups]
 dev = [
