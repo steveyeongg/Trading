@@ -19,8 +19,12 @@ from swing_engine.panel import Panel, segments
 MAX_GAP = 10
 
 
-def _per_segment(x: pd.DataFrame, fn: Callable[[pd.Series], pd.Series]) -> pd.DataFrame:
-    """Apply ``fn`` to each contiguous segment of each column, then realign to ``x``."""
+def per_segment(x: pd.DataFrame, fn: Callable[[pd.Series], pd.Series]) -> pd.DataFrame:
+    """Apply ``fn`` to each contiguous segment of each column, then realign to ``x``.
+
+    ``fn`` receives one symbol's non-NaN values within a single segment, so a shift or rolling
+    window inside it counts the symbol's own bars, never panel rows or another segment's bars.
+    """
     cols: dict[str, pd.Series] = {}
     for col in x.columns:
         parts = [fn(seg) for seg in segments(x[col], MAX_GAP)]
@@ -37,24 +41,24 @@ def _wilder(s: pd.Series, n: int) -> pd.Series:
 
 
 def sma(x: pd.DataFrame, n: int) -> pd.DataFrame:
-    return _per_segment(x, lambda s: s.rolling(n, min_periods=n).mean())
+    return per_segment(x, lambda s: s.rolling(n, min_periods=n).mean())
 
 
 def ema(x: pd.DataFrame, n: int) -> pd.DataFrame:
-    return _per_segment(x, lambda s: s.ewm(span=n, adjust=False, min_periods=n).mean())
+    return per_segment(x, lambda s: s.ewm(span=n, adjust=False, min_periods=n).mean())
 
 
 def wilder(x: pd.DataFrame, n: int) -> pd.DataFrame:
     """Wilder's smoothing (an EMA with ``alpha = 1/n``)."""
-    return _per_segment(x, lambda s: _wilder(s, n))
+    return per_segment(x, lambda s: _wilder(s, n))
 
 
 def rolling_max(x: pd.DataFrame, n: int) -> pd.DataFrame:
-    return _per_segment(x, lambda s: s.rolling(n, min_periods=n).max())
+    return per_segment(x, lambda s: s.rolling(n, min_periods=n).max())
 
 
 def rolling_min(x: pd.DataFrame, n: int) -> pd.DataFrame:
-    return _per_segment(x, lambda s: s.rolling(n, min_periods=n).min())
+    return per_segment(x, lambda s: s.rolling(n, min_periods=n).min())
 
 
 def true_range(p: Panel) -> pd.DataFrame:
@@ -94,7 +98,7 @@ def rsi(close: pd.DataFrame, n: int) -> pd.DataFrame:
         out = 100.0 * gain / total.where(total > 0.0)
         return out.where(~(total == 0.0), 50.0)
 
-    return _per_segment(close, one)
+    return per_segment(close, one)
 
 
 @dataclass(frozen=True)
