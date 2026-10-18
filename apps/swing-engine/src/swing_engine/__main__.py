@@ -4,9 +4,11 @@
     uv run python -m swing_engine update
 
 ``backfill`` loads daily bars (active and delisted common stock plus SPY) up to the last
-completed session. It is safe to interrupt and re-run: stored symbols are skipped and
-failed chunks are retried. ``update`` appends the newest sessions to everything stored and
-replaces the history of any symbol whose split/dividend adjustment moved. Both need
+completed session. It is safe to interrupt and re-run, even a session later: a symbol with
+no bars is loaded in full, a symbol that is behind is caught up from its last stored bar, a
+delisted symbol that already has bars and a symbol already at the target are skipped, and
+failed chunks are retried. ``update`` appends the newest sessions to everything stored.
+Both replace the history of any symbol whose split/dividend adjustment moved. Both need
 ``ALPACA_API_KEY`` and ``ALPACA_API_SECRET`` (a ``.env`` is loaded) and a migrated database,
 and both exit with status 1 when some symbols failed, so a re-run is needed.
 
@@ -58,7 +60,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="load daily bars up to the last completed session (resumable)",
         description=(
             "Load SIP daily bars for every candidate stock, active and delisted, plus SPY. "
-            "Symbols already current are skipped, so an interrupted run can be repeated."
+            "Only missing or outdated symbols are fetched, so an interrupted run can be "
+            "repeated, even on a later day."
         ),
     )
     bf.add_argument(

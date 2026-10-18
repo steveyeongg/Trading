@@ -4,18 +4,25 @@ Two jobs share one rule: a daily bar is only requested for sessions that have se
 target session is :meth:`TradingCalendar.last_completed_session` (close plus the 16 minute
 SIP delay), and every request ends there, so a partial in-progress bar never lands.
 
-**Backfill** walks the universe in chunks. Each chunk is fetched and then stored in one
-transaction before the next starts, and a chunk that raises is logged and skipped. Stored
-chunks stay stored, so a re-run resumes with whatever is still behind the target session.
+**Backfill** walks the universe in chunks, and each chunk is fetched and then stored in one
+transaction before the next starts. A chunk that raises is logged and skipped, and stored
+chunks stay stored. A re-run does only the work that is left, whatever session it runs in:
 
-**Incremental update** has to defeat one trap. Bars are requested with ``adjustment=all``,
-so when a stock splits or pays a dividend Alpaca rewrites that stock's whole history. Append
-only the new days to the old rows and two price scales meet at the join, which reads as a
-crash (or a spike) that never happened. So the update refetches the last few sessions and
-compares the earliest one that is also stored with its stored close. If they differ by more
-than the tolerance the symbol's full history is refetched instead. Until that succeeds none
-of the symbol's new bars are written, so a failed refetch leaves it whole on its old scale,
-and it is retried on the next run.
+* no stored bars: the full history from ``start``;
+* a delisted (inactive) symbol that has bars: skipped, its history is complete;
+* an active symbol behind the target: caught up from its newest stored bar, and refetched in
+  full only if a split or dividend moved its prices (the check below);
+* a symbol already at the target: skipped.
+
+**The adjustment trap.** Bars are requested with ``adjustment=all``, so when a stock splits
+or pays a dividend Alpaca rewrites that stock's whole history. Append only the new days to
+the old rows and two price scales meet at the join, which reads as a crash (or a spike) that
+never happened. So whenever new bars are added to a stored symbol, the job refetches an
+overlap and compares the earliest bar that is also stored with its stored close. If they
+differ by more than the tolerance the symbol's full history is refetched instead. Until that
+succeeds none of the symbol's new bars are written, so a failed refetch leaves it whole on
+its old scale, and it is retried on the next run. The incremental update runs this check on
+the last few sessions of every stored symbol.
 """
 
 from __future__ import annotations
@@ -43,6 +50,9 @@ CHUNK_SIZE = 100
 # The update only maintains symbols whose newest bar is at most this many sessions behind.
 MAX_STALE_SESSIONS = 30
 CALENDAR_LOOKBACK_DAYS = 10
+# A fetched overlap bar that differs from the stored close by more than this (relative)
+# means the adjustment moved. Dividend yields below it are accepted as noise.
+ADJUST_TOLERANCE = 0.005
 
 _SECRET_ENV_VARS = ("ALPACA_API_KEY", "ALPACA_API_SECRET")
 
@@ -79,10 +89,11 @@ class BarStore(Protocol):
 class IngestResult:
     """What a run did.
 
-    ``symbols_done`` is the symbols that ended up current (up to date already, or fetched
-    cleanly), so ``symbols_total - symbols_done == len(failed)``. ``rows`` counts bars
-    written. ``refetched`` lists symbols whose full history was replaced because their
-    price adjustment moved; ``failed`` lists symbols a re-run still has to do.
+    ``symbols_done`` is the symbols that ended up current (already up to date, complete and
+    delisted, or fetched cleanly), so ``symbols_total - symbols_done == len(failed)``. ``rows``
+    counts bars written. ``refetched`` lists symbols that already had history and got all of it
+    replaced because their price adjustment moved; ``failed`` lists symbols a re-run still has
+    to do.
     """
 
     symbols_done: int
@@ -102,9 +113,9 @@ def _describe(exc: BaseException) -> str:
     return text[:300]
 
 
-def _chunks(symbols: Sequence[str]) -> Iterator[list[str]]:
-    for i in range(0, len(symbols), CHUNK_SIZE):
-        yield list(symbols[i : i + CHUNK_SIZE])
+def _chunks[T](items: Sequence[T]) -> Iterator[list[T]]:
+    for i in range(0, len(items), CHUNK_SIZE):
+        yield list(items[i : i + CHUNK_SIZE])
 
 
 async def _calendar(client: BarSource, now: datetime, lookback_days: int) -> TradingCalendar:
@@ -141,77 +152,78 @@ async def refresh_assets(client: BarSource, store: BarStore) -> list[dict[str, A
     return out
 
 
-async def _universe(client: BarSource, store: BarStore, symbols: Sequence[str] | None) -> list[str]:
-    """The symbols to backfill: the caller's list, else the candidates from the asset table."""
+def _tickers(symbols: Sequence[str]) -> list[str]:
+    return list(dict.fromkeys(s.strip().upper() for s in symbols if s.strip()))
+
+
+async def _universe(
+    client: BarSource, store: BarStore, symbols: Sequence[str] | None
+) -> tuple[list[str], dict[str, str]]:
+    """The symbols to backfill, and the Alpaca status of each one the asset table knows.
+
+    The caller's list wins; otherwise the candidates come from the asset table, which is
+    refreshed from Alpaca first when it is empty. A symbol the table does not know has no
+    status and is treated as active.
+    """
     if isinstance(symbols, str):
         raise TypeError("symbols must be a sequence of tickers, not a single string")
-    if symbols is not None:
-        return list(dict.fromkeys(s.strip().upper() for s in symbols if s.strip()))
     stored = await store.load_assets()
     if stored.empty:
-        return candidate_symbols(await refresh_assets(client, store))
-    return candidate_symbols(stored.to_dict("records"))
+        if symbols is not None:
+            return _tickers(symbols), {}
+        rows = await refresh_assets(client, store)
+        return candidate_symbols(rows), {r["symbol"]: r["status"] for r in rows}
+    status = {str(a): str(b) for a, b in zip(stored["symbol"], stored["status"], strict=True)}
+    if symbols is not None:
+        return _tickers(symbols), status
+    return candidate_symbols(stored.to_dict("records")), status
 
 
-async def backfill(
+@dataclass
+class _Pass:
+    """What one pass over a list of chunks produced."""
+
+    rows: int = 0
+    failed: list[str] = field(default_factory=list)
+    returned: set[str] = field(default_factory=set)  # symbols that came back with bars
+    moved: list[str] = field(default_factory=list)  # symbols whose price adjustment moved
+
+
+def _log_chunk_failure(phase: str, chunk: Sequence[str], exc: Exception) -> None:
+    log.warning(
+        "ingest.chunk_failed", phase=phase, first=chunk[0], symbols=len(chunk), error=_describe(exc)
+    )
+
+
+async def _fetch_history(
     client: BarSource,
     store: BarStore,
+    symbols: Sequence[str],
     *,
     start: date,
+    target: date,
     now: datetime,
-    symbols: Sequence[str] | None = None,
-    progress: Callable[[int, int], None] | None = None,
-) -> IngestResult:
-    """Load daily bars from ``start`` through the last completed session; safe to re-run.
+    phase: str,
+    on_chunk: Callable[[int], None] | None = None,
+) -> _Pass:
+    """Fetch ``start`` through ``target`` for ``symbols``, storing each chunk before the next.
 
-    ``symbols`` defaults to every candidate in the stored asset table (listed common stock,
-    active and delisted, plus the reference ETF), refreshing that table first when it is
-    empty. A symbol whose newest stored bar is already at the target session is skipped; any
-    other symbol is fetched whole from ``start``, because ``adjustment=all`` may have
-    rewritten its older rows.
-
-    ``progress(handled, total)`` is called once up front (with the symbols that needed no
-    work) and after every chunk, ending at ``(total, total)`` even when some chunks failed.
+    A chunk that raises is logged and skipped. Its symbols land in ``failed`` and nothing of
+    them is stored, because a chunk is written in one transaction.
     """
-    cal = await _calendar(client, now, CALENDAR_LOOKBACK_DAYS)
-    target = cal.last_completed_session(now)
-    wanted = await _universe(client, store, symbols)
-    last = await store.last_bar_dates()
-    todo = [s for s in wanted if (newest := last.get(s)) is None or newest < target]
-    total = len(wanted)
-    handled = total - len(todo)
-    if progress is not None:
-        progress(handled, total)
-
-    rows = 0
-    failed: list[str] = []
-    for chunk in _chunks(todo):
+    out = _Pass()
+    for chunk in _chunks(symbols):
         try:
             bars = await client.daily_bars(chunk, start, target, now=now)
             if not bars.empty:
-                rows += await store.upsert_daily_bars(bars)
+                out.rows += await store.upsert_daily_bars(bars)
+                out.returned.update(str(sym) for sym in bars["symbol"].unique())
         except Exception as exc:  # one bad chunk must not sink the run; a re-run resumes it
-            failed.extend(chunk)
-            log.warning(
-                "ingest.backfill_chunk_failed",
-                first=chunk[0],
-                symbols=len(chunk),
-                error=_describe(exc),
-            )
-        handled += len(chunk)
-        if progress is not None:
-            progress(handled, total)
-
-    await store.refresh_asset_bar_ranges()
-    log.info(
-        "ingest.backfill_done",
-        target=target.isoformat(),
-        symbols=total,
-        fetched=len(todo) - len(failed),
-        failed=len(failed),
-        rows=rows,
-    )
-    return IngestResult(total - len(failed), total, rows, [], sorted(failed))
+            out.failed.extend(chunk)
+            _log_chunk_failure(phase, chunk, exc)
+        if on_chunk is not None:
+            on_chunk(len(chunk))
+    return out
 
 
 async def _price_scale_moved(
@@ -250,13 +262,153 @@ async def _moved_symbols(store: BarStore, bars: pd.DataFrame, tolerance: float) 
     return moved
 
 
+async def _catch_up(
+    client: BarSource,
+    store: BarStore,
+    jobs: Sequence[tuple[date, list[str]]],
+    *,
+    target: date,
+    now: datetime,
+    tolerance: float,
+    on_chunk: Callable[[int], None] | None = None,
+) -> _Pass:
+    """Append recent bars to symbols that already have history; flag those whose scale moved.
+
+    Each job is a chunk of stored symbols and the date to fetch it from (an overlap with what
+    is stored). A flagged symbol's fetched bars are withheld and it is returned in ``moved``
+    for :func:`_refetch_moved`, so nothing of it is written until its whole history is.
+    """
+    out = _Pass()
+    for fetch_from, chunk in jobs:
+        changed: set[str] = set()
+        try:
+            bars = await client.daily_bars(chunk, fetch_from, target, now=now)
+            changed = await _moved_symbols(store, bars, tolerance)
+            keep = bars[~bars["symbol"].isin(changed)]
+            if not keep.empty:
+                out.rows += await store.upsert_daily_bars(keep)
+        except Exception as exc:
+            out.failed.extend(chunk)
+            changed = set()
+            _log_chunk_failure("catch_up", chunk, exc)
+        out.moved.extend(sorted(changed))
+        if on_chunk is not None:
+            on_chunk(len(chunk))
+    return out
+
+
+async def _refetch_moved(
+    client: BarSource,
+    store: BarStore,
+    moved: Sequence[str],
+    *,
+    start: date,
+    target: date,
+    now: datetime,
+) -> tuple[int, list[str], list[str]]:
+    """Replace the history of symbols whose adjustment moved: ``(rows, refetched, failed)``.
+
+    Their catch-up bars were withheld, so a failed (or empty) refetch leaves them whole on the
+    old scale and they are flagged again next run.
+    """
+    symbols = sorted(moved)
+    redo = await _fetch_history(
+        client, store, symbols, start=start, target=target, now=now, phase="refetch"
+    )
+    refetched = [s for s in symbols if s in redo.returned]
+    failed = set(redo.failed)
+    empty = [s for s in symbols if s not in redo.returned and s not in failed]
+    if empty:
+        log.warning("ingest.refetch_empty", symbols=empty[:20], count=len(empty))
+    return redo.rows, refetched, [*redo.failed, *empty]
+
+
+async def backfill(
+    client: BarSource,
+    store: BarStore,
+    *,
+    start: date,
+    now: datetime,
+    symbols: Sequence[str] | None = None,
+    progress: Callable[[int, int], None] | None = None,
+) -> IngestResult:
+    """Load daily bars from ``start`` through the last completed session; safe to re-run.
+
+    ``symbols`` defaults to every candidate in the stored asset table (listed common stock,
+    active and delisted, plus the reference ETF), refreshing that table first when it is
+    empty. Each symbol is handled by what is already stored for it:
+
+    * no bars: fetched whole from ``start``;
+    * bars, but the asset is inactive (delisted): skipped, its history is complete;
+    * bars, active, newest before the target session: caught up from its newest stored bar.
+      If the overlap shows the price adjustment moved, the full history is refetched from
+      ``start`` instead (and the symbol is listed in ``refetched``);
+    * bars through the target session or later: skipped.
+
+    ``progress(handled, total)`` is called once up front (with the symbols that needed no
+    work) and after every chunk, ending at ``(total, total)`` even when some chunks failed.
+    """
+    cal = await _calendar(client, now, CALENDAR_LOOKBACK_DAYS)
+    target = cal.last_completed_session(now)
+    wanted, status = await _universe(client, store, symbols)
+    last = await store.last_bar_dates()
+
+    new: list[str] = []
+    behind: list[tuple[date, str]] = []
+    for symbol in wanted:
+        newest = last.get(symbol)
+        if newest is None:
+            new.append(symbol)
+        elif status.get(symbol) != "inactive" and newest < target:
+            behind.append((newest, symbol))
+    # Sorted by newest bar so a chunk's fetch start (its oldest bar) wastes little on the rest.
+    behind.sort()
+    jobs = [(group[0][0], [sym for _, sym in group]) for group in _chunks(behind)]
+
+    total = len(wanted)
+    handled = total - len(new) - len(behind)
+    if progress is not None:
+        progress(handled, total)
+
+    def advance(n: int) -> None:
+        nonlocal handled
+        handled += n
+        if progress is not None:
+            progress(handled, total)
+
+    fresh = await _fetch_history(
+        client, store, new, start=start, target=target, now=now, phase="backfill", on_chunk=advance
+    )
+    caught = await _catch_up(
+        client, store, jobs, target=target, now=now, tolerance=ADJUST_TOLERANCE, on_chunk=advance
+    )
+    redo_rows, refetched, redo_failed = await _refetch_moved(
+        client, store, caught.moved, start=start, target=target, now=now
+    )
+
+    failed = [*fresh.failed, *caught.failed, *redo_failed]
+    rows = fresh.rows + caught.rows + redo_rows
+    await store.refresh_asset_bar_ranges()
+    log.info(
+        "ingest.backfill_done",
+        target=target.isoformat(),
+        symbols=total,
+        new=len(new),
+        caught_up=len(behind),
+        refetched=len(refetched),
+        failed=len(failed),
+        rows=rows,
+    )
+    return IngestResult(total - len(failed), total, rows, refetched, sorted(failed))
+
+
 async def incremental_update(
     client: BarSource,
     store: BarStore,
     *,
     now: datetime,
     overlap_sessions: int = 5,
-    adjust_tolerance: float = 0.005,
+    adjust_tolerance: float = ADJUST_TOLERANCE,
 ) -> IngestResult:
     """Append the newest sessions to every stored symbol, replacing history after a split.
 
@@ -286,52 +438,17 @@ async def incremental_update(
         if len(cal.sessions_between(newest, target)) <= MAX_STALE_SESSIONS:
             by_start[min(window_start, newest)].append(symbol)
     total = sum(len(group) for group in by_start.values())
+    jobs = [(day, chunk) for day in sorted(by_start) for chunk in _chunks(by_start[day])]
 
-    rows = 0
-    failed: list[str] = []
-    moved: list[str] = []
-    for fetch_from in sorted(by_start):
-        for chunk in _chunks(by_start[fetch_from]):
-            try:
-                bars = await client.daily_bars(chunk, fetch_from, target, now=now)
-                changed = await _moved_symbols(store, bars, adjust_tolerance)
-                keep = bars[~bars["symbol"].isin(changed)]
-                if not keep.empty:
-                    rows += await store.upsert_daily_bars(keep)
-            except Exception as exc:
-                failed.extend(chunk)
-                log.warning(
-                    "ingest.update_chunk_failed",
-                    first=chunk[0],
-                    symbols=len(chunk),
-                    error=_describe(exc),
-                )
-                continue
-            moved.extend(changed)
+    caught = await _catch_up(
+        client, store, jobs, target=target, now=now, tolerance=adjust_tolerance
+    )
+    redo_rows, refetched, redo_failed = await _refetch_moved(
+        client, store, caught.moved, start=HISTORY_START, target=target, now=now
+    )
 
-    refetched: list[str] = []
-    for chunk in _chunks(sorted(moved)):
-        try:
-            bars = await client.daily_bars(chunk, HISTORY_START, target, now=now)
-            if not bars.empty:
-                rows += await store.upsert_daily_bars(bars)
-        except Exception as exc:
-            # Nothing of these symbols was written, so they keep their old scale whole.
-            failed.extend(chunk)
-            log.warning(
-                "ingest.refetch_failed",
-                first=chunk[0],
-                symbols=len(chunk),
-                error=_describe(exc),
-            )
-            continue
-        returned = set(bars["symbol"])
-        refetched.extend(s for s in chunk if s in returned)
-        empty = [s for s in chunk if s not in returned]
-        if empty:
-            failed.extend(empty)
-            log.warning("ingest.refetch_empty", symbols=empty[:20], count=len(empty))
-
+    failed = [*caught.failed, *redo_failed]
+    rows = caught.rows + redo_rows
     await store.refresh_asset_bar_ranges()
     log.info(
         "ingest.update_done",

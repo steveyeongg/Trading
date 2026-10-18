@@ -33,18 +33,27 @@ from swing_engine.ingest import (
 )
 
 FRI_EVENING = datetime(2026, 10, 16, 21, 0, tzinfo=UTC)  # 17:00 ET: Friday's session is final
+MON_EVENING = datetime(2026, 10, 19, 21, 0, tzinfo=UTC)
+TUE_EVENING = datetime(2026, 10, 20, 21, 0, tzinfo=UTC)
 FRIDAY = date(2026, 10, 16)
+MONDAY = date(2026, 10, 19)
 START = date(2016, 1, 1)
 
 
-def common(symbol: str, exchange: str = "NASDAQ", name: str | None = None) -> dict[str, Any]:
-    return {
+def common(
+    symbol: str, exchange: str = "NASDAQ", name: str | None = None, status: str | None = None
+) -> dict[str, Any]:
+    """An Alpaca asset row; ``status`` is left out (unknown) unless given."""
+    row: dict[str, Any] = {
         "symbol": symbol,
         "name": name or f"{symbol} Corporation Common Stock",
         "exchange": exchange,
         "class": "us_equity",
         "tradable": True,
     }
+    if status is not None:
+        row["status"] = status
+    return row
 
 
 def etf(symbol: str) -> dict[str, Any]:
@@ -273,23 +282,148 @@ async def test_backfill_skips_symbols_already_at_the_target_session():
     assert store_.ranges_refreshed == 1
 
 
-async def test_backfill_refetches_a_stale_symbol_from_the_start_not_from_its_last_bar():
-    """adjustment=all may have rewritten the old rows, so a stale symbol is fetched whole."""
-    store_ = FakeStore(last={"AAA": date(2026, 10, 9)}, assets=[common("AAA")])
+async def test_backfill_loads_a_symbol_with_no_stored_bars_whole_from_start():
+    store_ = FakeStore(assets=[common("AAA")])
     client = FakeClient(bars={"AAA": week()})
 
     await backfill(client, store_, start=START, now=FRI_EVENING, symbols=["AAA"])
 
-    assert [c["start"] for c in client.calls] == [START]
+    assert [(c["symbols"], c["start"]) for c in client.calls] == [(["AAA"], START)]
 
 
-async def test_backfill_fetches_a_symbol_that_is_one_session_behind():
-    store_ = FakeStore(last={"AAA": date(2026, 10, 15)}, assets=[common("AAA")])
-    client = FakeClient(bars={"AAA": week()})
+async def test_backfill_skips_a_delisted_symbol_that_already_has_bars():
+    """Its history is complete, and its newest bar can never reach the target session."""
+    store_ = FakeStore(
+        last={"OLD": date(2024, 3, 14)}, assets=[common("OLD", status="inactive"), common("AAA")]
+    )
+    client = FakeClient(bars={"AAA": week(), "SPY": week()})
+    seen: list[tuple[int, int]] = []
+
+    res = await backfill(
+        client, store_, start=START, now=FRI_EVENING, progress=lambda d, t: seen.append((d, t))
+    )
+
+    assert client.requested_symbols == ["AAA", "SPY"]
+    assert (res.symbols_done, res.symbols_total, res.failed) == (3, 3, [])
+    assert seen[0] == (1, 3) and seen[-1] == (3, 3)
+
+
+async def test_backfill_still_loads_a_delisted_symbol_that_has_no_bars():
+    store_ = FakeStore(assets=[common("OLD", status="inactive")])
+    client = FakeClient(bars={"OLD": week()})
+
+    await backfill(client, store_, start=START, now=FRI_EVENING, symbols=["OLD"])
+
+    assert [(c["symbols"], c["start"]) for c in client.calls] == [(["OLD"], START)]
+    assert store_.written_symbols == ["OLD"]
+
+
+async def test_backfill_catches_an_active_symbol_up_from_its_newest_bar():
+    store_ = FakeStore(closes={("AAA", date(2026, 10, 9)): 100.0}, assets=[common("AAA")])
+    client = FakeClient(bars={"AAA": [("2026-10-09", 100.0), *week(100.0)]})
+
+    res = await backfill(client, store_, start=START, now=FRI_EVENING, symbols=["AAA"])
+
+    (call,) = client.calls
+    assert (call["symbols"], call["start"], call["end"]) == (["AAA"], date(2026, 10, 9), FRIDAY)
+    assert client.full_history_requests == [] and res.refetched == []
+    assert (res.symbols_done, res.symbols_total, res.failed) == (1, 1, [])
+    assert store_.last["AAA"] == FRIDAY
+
+
+async def test_backfill_catches_up_a_symbol_that_is_one_session_behind():
+    store_ = FakeStore(closes={("AAA", date(2026, 10, 15)): 100.0})
+    client = FakeClient(bars={"AAA": week(100.0)})
 
     await backfill(client, store_, start=START, now=FRI_EVENING, symbols=["AAA"])
 
-    assert client.requested_symbols == ["AAA"]
+    assert [c["start"] for c in client.calls] == [date(2026, 10, 15)]
+    assert store_.last["AAA"] == FRIDAY
+
+
+async def test_backfill_neither_refetches_nor_fails_a_symbol_with_no_print_on_the_target_day():
+    """A halted or illiquid name is behind forever without being broken."""
+    store_ = FakeStore(closes={("HALT", date(2026, 10, 15)): 20.0})
+    client = FakeClient(bars={"HALT": [("2026-10-15", 20.0)]})  # nothing on the 16th
+
+    res = await backfill(client, store_, start=START, now=FRI_EVENING, symbols=["HALT"])
+
+    assert res.failed == [] and res.refetched == [] and res.symbols_done == 1
+    assert [c["start"] for c in client.calls] == [date(2026, 10, 15)]
+
+
+async def test_backfill_catch_up_chunks_are_ordered_and_start_at_their_oldest_bar(monkeypatch):
+    monkeypatch.setattr(ingest, "CHUNK_SIZE", 2)
+    newest = {"CCC": date(2026, 10, 14), "AAA": date(2026, 10, 2), "BBB": date(2026, 10, 9)}
+    store_ = FakeStore(closes={(sym, day): 50.0 for sym, day in newest.items()})
+    client = FakeClient(
+        bars={sym: [(day.isoformat(), 50.0), *week(50.0)] for sym, day in newest.items()}
+    )
+
+    await backfill(client, store_, start=START, now=FRI_EVENING, symbols=["CCC", "AAA", "BBB"])
+
+    assert [(c["symbols"], c["start"]) for c in client.calls] == [
+        (["AAA", "BBB"], date(2026, 10, 2)),
+        (["CCC"], date(2026, 10, 14)),
+    ]
+
+
+async def test_backfill_refetches_a_behind_symbol_whose_prices_were_adjusted():
+    store_ = FakeStore(closes={("AAA", date(2026, 10, 9)): 400.0})  # pre-split stored scale
+    client = FakeClient(bars={"AAA": [("2026-10-09", 100.0), *week(100.0)]})  # adjusted 4:1
+
+    res = await backfill(client, store_, start=START, now=FRI_EVENING, symbols=["AAA"])
+
+    assert res.refetched == ["AAA"] and client.full_history_requests == ["AAA"]
+    assert res.failed == [] and res.symbols_done == 1
+    assert store_.closes[("AAA", date(2026, 10, 9))] == 100.0  # one scale all the way back
+
+
+async def test_backfill_leaves_an_adjusted_symbol_whole_when_its_refetch_fails():
+    """Review Focus 1 on the backfill path: never a spliced series."""
+    store_ = FakeStore(closes={("AAA", date(2026, 10, 9)): 400.0})
+    bars = {"AAA": [("2026-10-09", 100.0), *week(100.0)]}
+
+    first = await backfill(
+        FakeClient(bars=bars, fail_full_history={"AAA"}),
+        store_,
+        start=START,
+        now=FRI_EVENING,
+        symbols=["AAA"],
+    )
+
+    assert first.failed == ["AAA"] and first.refetched == []
+    assert store_.closes == {("AAA", date(2026, 10, 9)): 400.0}  # nothing new spliced on
+
+    second = await backfill(
+        FakeClient(bars=bars), store_, start=START, now=FRI_EVENING, symbols=["AAA"]
+    )
+
+    assert second.refetched == ["AAA"] and second.failed == []
+
+
+async def test_backfill_resumed_after_the_next_session_settles_does_not_redownload(monkeypatch):
+    """Interrupted Monday night, resumed Tuesday: only the unfinished chunk starts from zero."""
+    monkeypatch.setattr(ingest, "CHUNK_SIZE", 2)
+    names = ["AAA", "BBB", "CCC", "DDD"]
+    bars = {n: [*week(), ("2026-10-19", 100.0), ("2026-10-20", 100.0)] for n in names}
+    store_ = FakeStore()
+
+    first = await backfill(
+        FakeClient(bars=bars, fail={"CCC"}), store_, start=START, now=MON_EVENING, symbols=names
+    )
+
+    assert first.failed == ["CCC", "DDD"]
+    assert store_.last == {"AAA": MONDAY, "BBB": MONDAY}
+
+    second_client = FakeClient(bars=bars)
+    second = await backfill(second_client, store_, start=START, now=TUE_EVENING, symbols=names)
+
+    starts = {tuple(c["symbols"]): c["start"] for c in second_client.calls}
+    assert starts == {("AAA", "BBB"): MONDAY, ("CCC", "DDD"): START}
+    assert second_client.full_history_requests == ["CCC", "DDD"]
+    assert (second.symbols_done, second.symbols_total, second.failed) == (4, 4, [])
+    assert set(store_.last.values()) == {date(2026, 10, 20)}
 
 
 async def test_backfill_processes_chunks_and_stores_each_before_the_next(monkeypatch):
