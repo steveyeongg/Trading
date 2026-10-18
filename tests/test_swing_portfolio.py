@@ -201,6 +201,59 @@ def test_entries_are_ordered_by_rs_desc_then_symbol_asc(pairs, first):
     assert list(res.taken["symbol"]) == [first]
 
 
+# ------------------------------------------------------------------ one position per symbol
+
+
+def test_a_second_signal_for_a_held_symbol_is_skipped_while_another_symbol_enters():
+    rows = [
+        _trade("X", entry=1, rs=90.0),  # held from D1, no exit
+        _trade("X", entry=2, rs=99.0),  # a fresh signal on the held name: skipped, despite best RS
+        _trade("Y", entry=2, rs=80.0),  # another name the same day: taken
+    ]
+    res = _run(rows, _flat(["X", "Y"], 50.0, 4))
+    assert list(res.taken["symbol"]) == ["X", "Y"]
+    assert list(res.taken.index) == [0, 2]  # the second X row (index 1) never entered
+    assert list(res.taken["shares"]) == [200, 200]
+    assert res.equity.tolist() == pytest.approx([100_000.0] * 4)
+    assert res.exposure == pytest.approx((0.0 + 0.1 + 0.2 + 0.2) / 4)  # X from D1, Y from D2
+
+
+def test_two_signals_for_one_symbol_on_the_same_day_take_the_better_ranked_one():
+    rows = [_trade("X", entry=1, rs=80.0), _trade("X", entry=1, rs=95.0)]
+    res = _run(rows, _flat(["X"], 50.0, 3))
+    assert list(res.taken.index) == [1] and list(res.taken["rs_pct"]) == [95.0]
+
+
+def test_a_symbol_can_be_entered_again_once_its_first_position_is_booked_out():
+    rows = [
+        _trade("X", entry=1, rs=90.0, exit=3, exit_price=55.0),  # held D1 .. D3
+        _trade("X", entry=2, rs=95.0),  # D2: still held, skipped
+        _trade("X", entry=3, rs=80.0),  # D3: the first is booked out in step 1, so it enters
+    ]
+    res = _run(rows, _flat(["X"], 50.0, 5))
+    assert list(res.taken.index) == [0, 2]
+    # D3: the first 200 shares are sold at 55 (cash 101,000), then 200 more are bought at 50
+    # (sized on D2's 100,000 mark) and marked at the 50 close.
+    assert list(res.taken["shares"]) == [200, 200]
+    assert res.equity.tolist() == pytest.approx([100_000.0] * 3 + [101_000.0] * 2)
+
+
+def test_a_symbol_stays_held_until_known_date_even_after_its_exit_date():
+    # X's exit is on D2 but known only on D5 (the delisting wait), so the name is blocked until
+    # D5; the D3 signal is skipped and the D5 one is taken once the exit is booked.
+    rows = [
+        _trade("X", entry=1, rs=90.0, exit=2, exit_price=39.0, known=5),
+        _trade("X", entry=3, rs=99.0),
+        _trade("X", entry=5, rs=80.0),
+    ]
+    res = _run(rows, _close({"X": [50.0, 50.0, 40.0, 40.0, 40.0, 40.0]}))
+    assert list(res.taken.index) == [0, 2]
+    # D5: the sale at 39 (cash 97,800), then 196 shares (980 / 5 on D4's 98,000 mark) at 50,
+    # marked at 40: 97,800 - 9,800 + 7,840.
+    assert list(res.taken["shares"]) == [200, 196]
+    assert res.equity.iloc[-1] == pytest.approx(95_840.0)
+
+
 # ----------------------------------------------------------------------------- the cash account
 
 
@@ -455,6 +508,7 @@ def test_simulate_portfolio_on_a_synthetic_universe_respects_every_limit():
         held = (taken["entry_date"] <= day) & ~(taken["known_date"] <= day)
         entered_today = (taken["entry_date"] == day).any()
         assert held.sum() <= settings.max_positions
+        assert taken.loc[held, "symbol"].is_unique  # one open position per symbol
         if entered_today:
             assert risk[held].sum() <= settings.max_total_risk_pct * prev + 1e-6
         bought = cost[taken["entry_date"] <= day].sum()

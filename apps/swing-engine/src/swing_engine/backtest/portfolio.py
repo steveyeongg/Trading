@@ -12,14 +12,17 @@ Each session ``d`` runs in this order:
    in at ``exit_price`` and the slot and the open risk are freed. Capital is freed on
    ``known_date`` and not ``exit_date``, because a DELISTED exit is not known for ``MAX_GAP + 1``
    sessions after the bars stop (see :mod:`~swing_engine.backtest.trades`).
-2. Take the entries with ``entry_date == d``, best ``rs_pct`` first and then by symbol. Each is
-   sized by :func:`~swing_engine.sizing.size_idea` on the equity marked at the previous close
-   (the starting equity on the first session) and the regime factor of its candidate date. It is
-   skipped when that is 0 shares (a downtrend, or a stop not under the entry). A cash account has
-   no margin, so shares are then cut to ``floor(cash / entry_price)``, and the entry is skipped
-   when that is 0. It is taken only when fewer than ``max_positions`` are held and the open risk
-   after it, the sum of ``shares * (entry_price - initial_stop)`` over the held positions, stays
-   within ``max_total_risk_pct`` of that same equity. A skipped entry never stops one behind it.
+2. Take the entries with ``entry_date == d``, best ``rs_pct`` first and then by symbol. An entry
+   is skipped first of all when its symbol is already held: one open position per symbol, so a
+   fresh signal on a held name (or a second same-day signal on one name) adds nothing. A symbol
+   booked out in step 1 is free again that same session. Every other entry is sized by
+   :func:`~swing_engine.sizing.size_idea` on the equity marked at the previous close (the starting
+   equity on the first session) and the regime factor of its candidate date. It is skipped when
+   that is 0 shares (a downtrend, or a stop not under the entry). A cash account has no margin, so
+   shares are then cut to ``floor(cash / entry_price)``, and the entry is skipped when that is 0.
+   It is taken only when fewer than ``max_positions`` are held and the open risk after it, the sum
+   of ``shares * (entry_price - initial_stop)`` over the held positions, stays within
+   ``max_total_risk_pct`` of that same equity. A skipped entry never stops one behind it.
 3. Book the exits of the positions just entered whose ``known_date == d`` (a same-day round trip).
    They held their slot and risk through step 2.
 4. Mark to market at the close: equity is cash plus each held position at its symbol's last known
@@ -214,6 +217,8 @@ def simulate_portfolio(
         sizing = dataclasses.replace(settings, equity=marked)
         while nxt < n_trades and entry_day[nxt] == d:
             j, nxt = nxt, nxt + 1
+            if any(col[k] == col[j] for k in held):  # one open position per symbol
+                continue
             if len(held) >= settings.max_positions:
                 continue
             fit = size_idea(price[j], stop[j], sizing, factor[j]).shares
