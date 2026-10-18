@@ -7,6 +7,11 @@ volume clears the liquidity floor, its current segment is long enough, and its a
 is tradeable. Segments follow :func:`swing_engine.panel.segments`, so a reused ticker
 restarts both the history count and the dollar-volume window, and a missing day is never
 filled.
+
+The price floor is judged on the raw (unadjusted) close when the panel has one, because
+``adjustment=all`` rewrites history on every split: a stock that later split 10:1 reads under
+$10 in years it traded at $30-$250, and one that later reverse-split reads far above what it
+traded at. Only the floor looks at raw prices; dollar volume and everything else stay adjusted.
 """
 
 from __future__ import annotations
@@ -26,8 +31,13 @@ def eligibility(panel: Panel, kinds: Mapping[str, AssetKind], f: UniverseFilter)
 
     ``kinds`` maps symbol to :class:`AssetKind`. A symbol with no entry (``SPY`` is a
     reference series, not a candidate) is never eligible.
+
+    The price floor uses ``panel.raw_close`` where it has a value and the adjusted close
+    where it does not (cell by cell); with no ``raw_close`` it uses the adjusted close.
     """
     close = panel.close
+    raw = panel.raw_close
+    price = close if raw is None else raw.where(raw.notna(), close)
     dollar_volume = (close * panel.volume).to_numpy()
     window = f.dollar_volume_window
     history = np.zeros(close.shape)  # bars in the current segment, up to and including the row
@@ -44,7 +54,7 @@ def eligibility(panel: Panel, kinds: Mapping[str, AssetKind], f: UniverseFilter)
     tradeable = np.array([kinds.get(str(symbol)) in TRADEABLE_KINDS for symbol in close.columns])
     ok = (
         close.notna().to_numpy()
-        & (close.to_numpy() >= f.min_price)
+        & (price.to_numpy() >= f.min_price)
         & (median_dv >= f.min_median_dollar_volume)
         & (history >= f.min_history_sessions)
         & tradeable[np.newaxis, :]

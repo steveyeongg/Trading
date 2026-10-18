@@ -1,8 +1,11 @@
 """Swing-engine persistence: the ``assets`` table and daily bars in the ``bars`` hypertable.
 
-Daily bars are rows of ``bars`` with ``resolution='1d'`` and ``ts`` the session date at
-00:00 UTC (the storage convention shared with :mod:`swing_engine.data.alpaca`). Every read
-here filters on that resolution, so minute bars from the legacy pipeline never leak in.
+Daily bars are rows of ``bars`` with ``resolution='1d'`` (split/dividend adjusted) and ``ts``
+the session date at 00:00 UTC (the storage convention shared with
+:mod:`swing_engine.data.alpaca`). The same sessions are also stored unadjusted as
+``resolution='1d_raw'``, for the point-in-time price floor and nothing else. Every read here
+filters on one of those two resolutions, so minute bars from the legacy pipeline never leak in.
+The close lookup, the liquidity prefilter and the asset ranges are adjusted-only.
 
 Writing is built for a full-market backfill, millions of rows, so rows do not go through
 ``executemany``. Each batch is streamed with the binary ``COPY`` protocol into a staging
@@ -25,7 +28,7 @@ import numpy as np
 import pandas as pd
 from atlas_shared.db import session_scope
 from atlas_shared.logging import get_logger
-from sqlalchemy import text
+from sqlalchemy import TextClause, text
 
 from swing_engine.data.alpaca import BAR_COLUMNS
 
@@ -33,6 +36,8 @@ log = get_logger("swing.store")
 
 BATCH_ROWS = 50_000
 DAILY = "1d"
+RAW_DAILY = "1d_raw"
+_DAILY_RESOLUTIONS = (DAILY, RAW_DAILY)
 
 _STAGING_TABLE = "_bars_in"
 _PRICE_COLUMNS = ["open", "high", "low", "close", "volume", "vwap"]
@@ -144,6 +149,32 @@ _LIQUID_SQL = text(
     """
 )
 
+
+def _by_resolution(statement: TextClause) -> dict[str, TextClause]:
+    """``statement`` (written for ``'1d'``) for each stored daily resolution.
+
+    The resolution stays a literal in the SQL, as it always was for ``'1d'``, and the raw
+    statement is the same text with the other literal. Both come from this module's own
+    constants and never from the caller, who only picks a key (after :func:`_check_resolution`).
+    """
+    return {
+        DAILY: statement,
+        RAW_DAILY: text(statement.text.replace(f"'{DAILY}'", f"'{RAW_DAILY}'")),
+    }
+
+
+_LAST_BAR_DATES = _by_resolution(_LAST_BAR_DATES_SQL)
+_LOAD_BARS = _by_resolution(_LOAD_BARS_SQL)
+_LOAD_ALL_BARS = _by_resolution(_LOAD_ALL_BARS_SQL)
+
+
+def _check_resolution(resolution: str) -> str:
+    if resolution not in _DAILY_RESOLUTIONS:
+        allowed = list(_DAILY_RESOLUTIONS)
+        raise ValueError(f"resolution must be one of {allowed}, got {resolution!r}")
+    return resolution
+
+
 # --- assets ----------------------------------------------------------------------------
 
 
@@ -202,20 +233,26 @@ def _numeric(df: pd.DataFrame, column: str) -> pd.Series:
 def _prepare_bars(df: pd.DataFrame) -> pd.DataFrame:
     """Validate and normalise a daily-bars frame into the shape that gets copied.
 
-    ``resolution`` may be absent but must otherwise be ``'1d'``; ``vwap`` and
-    ``trade_count`` may be absent (NULL). ``trade_count`` becomes a nullable integer, so
-    NaN stands for NULL and a fractional count is an error. The result is sorted by
-    symbol and time (better index locality on insert) and has one row per key, the last
-    one winning.
+    ``resolution`` may be absent (then ``'1d'``) but must otherwise be ``'1d'`` or
+    ``'1d_raw'``, and may differ per row. ``vwap`` and ``trade_count`` may be absent (NULL);
+    ``trade_count`` becomes a nullable integer, so NaN stands for NULL and a fractional
+    count is an error. The result is sorted by symbol, resolution and time (better index
+    locality on insert) and has one row per primary key ``(symbol, resolution, ts)``, the
+    last one winning.
     """
     missing = [c for c in _REQUIRED_COLUMNS if c not in df.columns]
     if missing:
         raise ValueError(f"daily bars are missing columns {missing}")
     df = df.reset_index(drop=True)
     if "resolution" in df.columns:
-        others = sorted({str(r) for r in df["resolution"].unique() if r != DAILY})
+        resolution = df["resolution"].astype(str)
+        others = sorted(set(resolution) - set(_DAILY_RESOLUTIONS))
         if others:
-            raise ValueError(f"only '1d' bars are stored, got resolution {others}")
+            raise ValueError(
+                f"only {list(_DAILY_RESOLUTIONS)} bars are stored, got resolution {others}"
+            )
+    else:
+        resolution = pd.Series(DAILY, index=df.index)
     if df["symbol"].isna().any():
         raise ValueError("daily bars have a missing symbol")
     ts = pd.to_datetime(df["ts"])
@@ -229,13 +266,13 @@ def _prepare_bars(df: pd.DataFrame) -> pd.DataFrame:
         {
             "ts": ts,
             "symbol": df["symbol"].astype(str),
-            "resolution": DAILY,
+            "resolution": resolution,
             **{c: _numeric(df, c).astype("float64") for c in _PRICE_COLUMNS},
             "trade_count": _numeric(df, "trade_count").astype("Int64"),
         }
     )[BAR_COLUMNS]
-    out = out.sort_values(["symbol", "ts"], kind="stable")
-    deduped = out.drop_duplicates(["symbol", "ts"], keep="last")
+    out = out.sort_values(["symbol", "resolution", "ts"], kind="stable")
+    deduped = out.drop_duplicates(["symbol", "resolution", "ts"], keep="last")
     if len(deduped) < len(out):
         log.warning("swing.store.duplicate_bars_dropped", n=len(out) - len(deduped))
     return deduped.reset_index(drop=True)
@@ -262,8 +299,8 @@ async def upsert_daily_bars(df: pd.DataFrame) -> int:
     """Insert or update daily bars; returns the number of distinct bars written.
 
     ``df`` has the columns of ``AlpacaData.daily_bars``. ``resolution`` must be ``'1d'``
-    (or absent) and ``ts`` the timezone-aware session date at 00:00 UTC; anything else
-    raises ``ValueError`` before the database is touched.
+    or ``'1d_raw'`` (or absent, meaning ``'1d'``) and ``ts`` the timezone-aware session
+    date at 00:00 UTC; anything else raises ``ValueError`` before the database is touched.
     """
     if df.empty:
         return 0
@@ -305,32 +342,41 @@ def _bars_frame(rows: Sequence[Any]) -> pd.DataFrame:
     return df.sort_values(["symbol", "ts"], kind="stable").reset_index(drop=True)
 
 
-async def load_daily_bars(symbols: Sequence[str] | None, start: date, end: date) -> pd.DataFrame:
+async def load_daily_bars(
+    symbols: Sequence[str] | None, start: date, end: date, resolution: str = DAILY
+) -> pd.DataFrame:
     """Daily bars for ``symbols`` (all symbols when None) from ``start`` to ``end`` inclusive.
 
-    Both dates are session dates. The frame has the columns of ``AlpacaData.daily_bars``,
-    sorted by ``symbol, ts`` with ``ts`` timezone-aware UTC, and is empty (same columns)
-    when nothing matches. An empty ``symbols`` list loads nothing, not everything.
+    Both dates are session dates. ``resolution`` is ``'1d'`` (adjusted, the default) or
+    ``'1d_raw'`` (unadjusted); any other value raises ``ValueError``. The frame has the
+    columns of ``AlpacaData.daily_bars``, sorted by ``symbol, ts`` with ``ts``
+    timezone-aware UTC, and is empty (same columns) when nothing matches. An empty
+    ``symbols`` list loads nothing, not everything.
     """
+    _check_resolution(resolution)
     if isinstance(symbols, str):
         raise TypeError("symbols must be a sequence of tickers, not a single string")
     params: dict[str, Any] = {"start": _utc_midnight(start), "end": _utc_midnight(end)}
     if symbols is None:
-        statement = _LOAD_ALL_BARS_SQL
+        statement = _LOAD_ALL_BARS[resolution]
     elif not symbols:
         return _bars_frame([])
     else:
-        statement = _LOAD_BARS_SQL
+        statement = _LOAD_BARS[resolution]
         params["symbols"] = list(dict.fromkeys(symbols))
     async with session_scope() as session:
         rows = (await session.execute(statement, params)).all()
     return _bars_frame(rows)
 
 
-async def last_bar_dates() -> dict[str, date]:
-    """The session date of each symbol's newest stored daily bar."""
+async def last_bar_dates(resolution: str = DAILY) -> dict[str, date]:
+    """The session date of each symbol's newest stored bar of ``resolution``.
+
+    ``resolution`` is ``'1d'`` (adjusted, the default) or ``'1d_raw'``; others raise ``ValueError``.
+    """
+    statement = _LAST_BAR_DATES[_check_resolution(resolution)]
     async with session_scope() as session:
-        rows = (await session.execute(_LAST_BAR_DATES_SQL)).all()
+        rows = (await session.execute(statement)).all()
     return {row[0]: row[1] for row in rows}
 
 

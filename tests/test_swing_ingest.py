@@ -85,12 +85,22 @@ class FakeClient:
         self.calls: list[dict[str, Any]] = []
         self.requested_symbols: list[str] = []
         self.full_history_requests: list[str] = []
+        # adjustment=raw requests are kept apart (see test_swing_raw_close.py)
+        self.raw_calls: list[dict[str, Any]] = []
         self.asset_calls: list[str] = []
         self.calendar_calls: list[tuple[date, date]] = []
 
     async def daily_bars(
-        self, symbols: Sequence[str], start: date, end: date, now: datetime | None = None
+        self,
+        symbols: Sequence[str],
+        start: date,
+        end: date,
+        now: datetime | None = None,
+        adjustment: str = "all",
     ) -> pd.DataFrame:
+        if adjustment == "raw":  # kept apart so these tests only see the adjusted requests
+            self.raw_calls.append({"symbols": list(symbols), "start": start, "end": end})
+            return _bars_frame([])
         self.calls.append({"symbols": list(symbols), "start": start, "end": end, "now": now})
         self.requested_symbols.extend(symbols)
         if start <= START:
@@ -168,8 +178,8 @@ class FakeStore:
             self.last[row.symbol] = max(day, self.last.get(row.symbol, day))
         return len(df)
 
-    async def last_bar_dates(self) -> dict[str, date]:
-        return dict(self.last)
+    async def last_bar_dates(self, resolution: str = "1d") -> dict[str, date]:
+        return dict(self.last) if resolution == "1d" else {}  # no raw bars in these tests
 
     async def stored_close(self, symbol: str, day: date) -> float | None:
         return self.closes.get((symbol, day))
@@ -498,7 +508,9 @@ async def test_backfill_failure_log_names_the_error_but_not_the_credentials(monk
     monkeypatch.setattr(ingest, "log", rec)
 
     class Leaky(FakeClient):
-        async def daily_bars(self, symbols, start, end, now=None):  # type: ignore[override]
+        async def daily_bars(self, symbols, start, end, now=None, adjustment="all"):  # type: ignore[override]
+            if adjustment == "raw":
+                return await super().daily_bars(symbols, start, end, now, adjustment)
             raise AlpacaError("request failed for s3cr3t-value, key-id-value")
 
     res = await backfill(Leaky(), FakeStore(), start=START, now=FRI_EVENING, symbols=["AAA"])
@@ -732,10 +744,10 @@ async def test_incremental_treats_an_empty_refetch_as_a_failure():
     store_ = FakeStore(closes={("AAA", date(2026, 10, 15)): 400.0})
 
     class VanishingHistory(FakeClient):
-        async def daily_bars(self, symbols, start, end, now=None):  # type: ignore[override]
-            if start <= START:
+        async def daily_bars(self, symbols, start, end, now=None, adjustment="all"):  # type: ignore[override]
+            if adjustment == "all" and start <= START:
                 return _bars_frame([])
-            return await super().daily_bars(symbols, start, end, now)
+            return await super().daily_bars(symbols, start, end, now, adjustment)
 
     client = VanishingHistory(bars={"AAA": [("2026-10-15", 100.0), ("2026-10-16", 101.0)]})
 

@@ -23,13 +23,19 @@ differ by more than the tolerance the symbol's full history is refetched instead
 succeeds none of the symbol's new bars are written, so a failed refetch leaves it whole on
 its old scale, and it is retried on the next run. The incremental update runs this check on
 the last few sessions of every stored symbol.
+
+**Raw closes.** The universe's price floor has to see the price a stock traded at on the day,
+which ``adjustment=all`` rewrites after every split. So after the adjusted pass both jobs also
+run :func:`sync_raw`, which keeps ``adjustment=raw`` bars (``resolution='1d_raw'``) for the same
+symbols. Raw history is never rewritten by a corporate action, so it is only ever appended and
+never needs the scale check or a refetch. Its failures are reported with the adjusted ones.
 """
 
 from __future__ import annotations
 
 import os
 from collections import defaultdict
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any, Literal, Protocol
@@ -39,6 +45,7 @@ from atlas_shared.logging import get_logger
 
 from swing_engine.calendar import ET, Session, TradingCalendar
 from swing_engine.data.assets import candidate_symbols, classify_asset
+from swing_engine.store import RAW_DAILY
 
 log = get_logger("swing.ingest")
 
@@ -61,7 +68,12 @@ class BarSource(Protocol):
     """The part of ``AlpacaData`` the ingest jobs use."""
 
     async def daily_bars(
-        self, symbols: Sequence[str], start: date, end: date, now: datetime | None = None
+        self,
+        symbols: Sequence[str],
+        start: date,
+        end: date,
+        now: datetime | None = None,
+        adjustment: Literal["all", "raw"] = "all",
     ) -> pd.DataFrame: ...
 
     async def assets(self, status: Literal["active", "inactive"]) -> list[dict[str, Any]]: ...
@@ -78,7 +90,7 @@ class BarStore(Protocol):
 
     async def upsert_daily_bars(self, df: pd.DataFrame) -> int: ...
 
-    async def last_bar_dates(self) -> dict[str, date]: ...
+    async def last_bar_dates(self, resolution: str = "1d") -> dict[str, date]: ...
 
     async def stored_close(self, symbol: str, day: date) -> float | None: ...
 
@@ -91,9 +103,10 @@ class IngestResult:
 
     ``symbols_done`` is the symbols that ended up current (already up to date, complete and
     delisted, or fetched cleanly), so ``symbols_total - symbols_done == len(failed)``. ``rows``
-    counts bars written. ``refetched`` lists symbols that already had history and got all of it
-    replaced because their price adjustment moved; ``failed`` lists symbols a re-run still has
-    to do.
+    counts adjusted bars written and ``raw_rows`` the raw (unadjusted) ones. ``refetched`` lists
+    symbols that already had history and got all of it replaced because their price adjustment
+    moved; ``failed`` lists symbols a re-run still has to do, whether the adjusted pass, the raw
+    pass or both failed for them.
     """
 
     symbols_done: int
@@ -101,6 +114,7 @@ class IngestResult:
     rows: int
     refetched: list[str]
     failed: list[str] = field(default_factory=list)
+    raw_rows: int = 0
 
 
 def _describe(exc: BaseException) -> str:
@@ -202,9 +216,10 @@ async def _fetch_history(
     *,
     start: date,
     target: date,
-    now: datetime,
+    now: datetime | None,
     phase: str,
     on_chunk: Callable[[int], None] | None = None,
+    adjustment: Literal["all", "raw"] = "all",
 ) -> _Pass:
     """Fetch ``start`` through ``target`` for ``symbols``, storing each chunk before the next.
 
@@ -214,7 +229,7 @@ async def _fetch_history(
     out = _Pass()
     for chunk in _chunks(symbols):
         try:
-            bars = await client.daily_bars(chunk, start, target, now=now)
+            bars = await client.daily_bars(chunk, start, target, now=now, adjustment=adjustment)
             if not bars.empty:
                 out.rows += await store.upsert_daily_bars(bars)
                 out.returned.update(str(sym) for sym in bars["symbol"].unique())
@@ -323,6 +338,80 @@ async def _refetch_moved(
     return redo.rows, refetched, [*redo.failed, *empty]
 
 
+async def sync_raw(
+    client: BarSource,
+    store: BarStore,
+    *,
+    symbols: Sequence[str],
+    status: Mapping[str, str],
+    start: date,
+    target: date,
+    now: datetime | None = None,
+) -> IngestResult:
+    """Bring the raw (``adjustment=raw``) daily bars of ``symbols`` up to ``target``.
+
+    Raw prices are what printed on the day, so a split or dividend never rewrites them: this
+    only ever appends, with no scale check and no refetch. Each symbol is handled by what raw
+    history is stored for it:
+
+    * none: the full history from ``start``;
+    * some, but ``status`` says the asset is inactive (delisted): skipped, it is complete;
+    * some, active, newest before ``target``: fetched from its newest raw bar to ``target``;
+    * some, through ``target`` or later: skipped.
+
+    A symbol missing from ``status`` is treated as active. Chunking and failure handling are
+    those of the adjusted pass: a failing chunk is logged and its symbols go to ``failed``.
+    ``now`` is passed to the client for its SIP delay clamp. The result carries the raw bars
+    written in ``raw_rows`` (``rows`` is 0, since it counts adjusted bars).
+    """
+    last = await store.last_bar_dates(RAW_DAILY)
+    new: list[str] = []
+    behind: list[tuple[date, str]] = []
+    for symbol in symbols:
+        newest = last.get(symbol)
+        if newest is None:
+            new.append(symbol)
+        elif status.get(symbol) != "inactive" and newest < target:
+            behind.append((newest, symbol))
+    behind.sort()
+
+    fresh = await _fetch_history(
+        client,
+        store,
+        new,
+        start=start,
+        target=target,
+        now=now,
+        phase="raw_backfill",
+        adjustment="raw",
+    )
+    rows = fresh.rows
+    failed = list(fresh.failed)
+    for group in _chunks(behind):  # sorted by newest bar, so the first one is the oldest
+        caught = await _fetch_history(
+            client,
+            store,
+            [symbol for _, symbol in group],
+            start=group[0][0],
+            target=target,
+            now=now,
+            phase="raw_catch_up",
+            adjustment="raw",
+        )
+        rows += caught.rows
+        failed.extend(caught.failed)
+    log.info(
+        "ingest.raw_synced",
+        target=target.isoformat(),
+        symbols=len(symbols),
+        new=len(new),
+        caught_up=len(behind),
+        failed=len(failed),
+        rows=rows,
+    )
+    return IngestResult(len(symbols) - len(failed), len(symbols), 0, [], sorted(failed), rows)
+
+
 async def backfill(
     client: BarSource,
     store: BarStore,
@@ -345,8 +434,12 @@ async def backfill(
       ``start`` instead (and the symbol is listed in ``refetched``);
     * bars through the target session or later: skipped.
 
+    The adjusted pass is followed by :func:`sync_raw` for the same symbols (raw bars for the
+    price floor), and its failures are merged into ``failed``.
+
     ``progress(handled, total)`` is called once up front (with the symbols that needed no
-    work) and after every chunk, ending at ``(total, total)`` even when some chunks failed.
+    work) and after every chunk of the adjusted pass, ending at ``(total, total)`` even when
+    some chunks failed. The raw pass does not report progress.
     """
     cal = await _calendar(client, now, CALENDAR_LOOKBACK_DAYS)
     target = cal.last_completed_session(now)
@@ -385,8 +478,11 @@ async def backfill(
     redo_rows, refetched, redo_failed = await _refetch_moved(
         client, store, caught.moved, start=start, target=target, now=now
     )
+    raw = await sync_raw(
+        client, store, symbols=wanted, status=status, start=start, target=target, now=now
+    )
 
-    failed = [*fresh.failed, *caught.failed, *redo_failed]
+    failed = {*fresh.failed, *caught.failed, *redo_failed, *raw.failed}
     rows = fresh.rows + caught.rows + redo_rows
     await store.refresh_asset_bar_ranges()
     log.info(
@@ -398,8 +494,9 @@ async def backfill(
         refetched=len(refetched),
         failed=len(failed),
         rows=rows,
+        raw_rows=raw.raw_rows,
     )
-    return IngestResult(total - len(failed), total, rows, refetched, sorted(failed))
+    return IngestResult(total - len(failed), total, rows, refetched, sorted(failed), raw.raw_rows)
 
 
 async def incremental_update(
@@ -423,6 +520,9 @@ async def incremental_update(
     Dividends adjust history by their yield, so a difference under the tolerance is accepted
     as the stored scale and the older rows drift from Alpaca's current figures by less than
     that. New listings are not discovered here; they enter through :func:`backfill`.
+
+    The symbols maintained here also get :func:`sync_raw` (from :data:`HISTORY_START` for a
+    symbol with no raw bars yet), and its failures are merged into ``failed``.
     """
     if overlap_sessions < 1:
         raise ValueError("overlap_sessions must be at least 1")
@@ -437,7 +537,8 @@ async def incremental_update(
     for symbol, newest in sorted((await store.last_bar_dates()).items()):
         if len(cal.sessions_between(newest, target)) <= MAX_STALE_SESSIONS:
             by_start[min(window_start, newest)].append(symbol)
-    total = sum(len(group) for group in by_start.values())
+    maintained = sorted(symbol for group in by_start.values() for symbol in group)
+    total = len(maintained)
     jobs = [(day, chunk) for day in sorted(by_start) for chunk in _chunks(by_start[day])]
 
     caught = await _catch_up(
@@ -446,8 +547,17 @@ async def incremental_update(
     redo_rows, refetched, redo_failed = await _refetch_moved(
         client, store, caught.moved, start=HISTORY_START, target=target, now=now
     )
+    raw = await sync_raw(
+        client,
+        store,
+        symbols=maintained,
+        status={},
+        start=HISTORY_START,
+        target=target,
+        now=now,
+    )
 
-    failed = [*caught.failed, *redo_failed]
+    failed = {*caught.failed, *redo_failed, *raw.failed}
     rows = caught.rows + redo_rows
     await store.refresh_asset_bar_ranges()
     log.info(
@@ -457,5 +567,6 @@ async def incremental_update(
         refetched=len(refetched),
         failed=len(failed),
         rows=rows,
+        raw_rows=raw.raw_rows,
     )
-    return IngestResult(total - len(failed), total, rows, refetched, sorted(failed))
+    return IngestResult(total - len(failed), total, rows, refetched, sorted(failed), raw.raw_rows)

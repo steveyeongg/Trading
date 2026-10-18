@@ -6,7 +6,8 @@ Free-plan rules baked in here (Alpaca Market Data v2):
   request's ``end`` is clamped to ``now - 16 minutes``.
 * ``adjustment=all`` rewrites history on a split or dividend. Callers that append
   incrementally must notice that (see the backfill job), because this client only
-  returns what Alpaca says today.
+  returns what Alpaca says today. ``adjustment=raw`` never changes: it is what printed on
+  the day, which is what a price floor has to look at (stored as ``resolution='1d_raw'``).
 * About 200 requests/minute, so requests are spaced ``min_interval_s`` apart (default
   0.3 s) and 429/5xx responses are retried with exponential backoff.
 
@@ -63,6 +64,9 @@ BAR_COLUMNS = [
     "trade_count",
 ]
 _FLOAT_COLUMNS = ["open", "high", "low", "close", "volume", "vwap"]
+# Alpaca's ``adjustment`` parameter and the ``resolution`` its bars are stored under
+# (``DAILY`` and ``RAW_DAILY`` in :mod:`swing_engine.store`, which imports from here).
+RESOLUTIONS = {"all": "1d", "raw": "1d_raw"}
 _ALPACA_FIELDS = {
     "o": "open",
     "h": "high",
@@ -106,7 +110,7 @@ def _empty_bars() -> pd.DataFrame:
     )[BAR_COLUMNS]
 
 
-def _bars_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
+def _bars_frame(rows: list[dict[str, Any]], resolution: str) -> pd.DataFrame:
     """Flat Alpaca bar dicts (each with its ``symbol``) to the storage-shaped frame."""
     if not rows:
         return _empty_bars()
@@ -117,7 +121,7 @@ def _bars_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
         pd.to_datetime(df["t"], utc=True).dt.tz_convert(ET).dt.tz_localize(None).dt.normalize()
     )
     df["ts"] = session_date.dt.tz_localize("UTC")
-    df["resolution"] = "1d"
+    df["resolution"] = resolution
     df = df.reindex(columns=BAR_COLUMNS)
     df[_FLOAT_COLUMNS] = df[_FLOAT_COLUMNS].astype("float64")
     return df.sort_values(["symbol", "ts"], kind="stable").reset_index(drop=True)
@@ -199,17 +203,25 @@ class AlpacaData:
         start: date,
         end: date,
         now: datetime | None = None,
+        adjustment: Literal["all", "raw"] = "all",
     ) -> pd.DataFrame:
-        """Split/dividend-adjusted SIP daily bars for ``symbols`` from ``start`` to ``end``.
+        """SIP daily bars for ``symbols`` from ``start`` to ``end``.
+
+        ``adjustment="all"`` (the default) gives split/dividend-adjusted bars, labelled
+        ``resolution="1d"``. ``adjustment="raw"`` gives the unadjusted prices as they
+        printed, labelled ``resolution="1d_raw"``; they are only for questions about the
+        price on the day (the price floor), never for indicators or returns.
 
         Both dates are New York session dates, inclusive. The request ``end`` never goes
         past ``now - 16 minutes`` (the free-plan SIP delay), so the newest returned bar
         may be earlier than ``end``. Symbols without bars are simply absent; no bars at
         all gives an empty frame with the same columns.
 
-        Columns: ``ts`` (session date at 00:00 UTC), ``symbol``, ``resolution`` (``"1d"``),
+        Columns: ``ts`` (session date at 00:00 UTC), ``symbol``, ``resolution``,
         ``open``, ``high``, ``low``, ``close``, ``volume``, ``vwap``, ``trade_count``.
         """
+        if adjustment not in RESOLUTIONS:
+            raise ValueError(f"adjustment must be one of {sorted(RESOLUTIONS)}, got {adjustment!r}")
         now = now if now is not None else datetime.now(UTC)
         if now.tzinfo is None:
             raise ValueError("now must be timezone-aware")
@@ -225,7 +237,7 @@ class AlpacaData:
             "start": start_dt.isoformat(),
             "end": end_dt.isoformat(),
             "limit": PAGE_LIMIT,
-            "adjustment": "all",
+            "adjustment": adjustment,
             "feed": "sip",
             "sort": "asc",
         }
@@ -240,7 +252,7 @@ class AlpacaData:
                 if not token:
                     break
                 params = {**params, "page_token": token}
-        return _bars_frame(rows)
+        return _bars_frame(rows, RESOLUTIONS[adjustment])
 
     async def assets(self, status: Literal["active", "inactive"]) -> list[dict[str, Any]]:
         """Alpaca's US-equity asset list (symbol, exchange, tradable flags, ...)."""
