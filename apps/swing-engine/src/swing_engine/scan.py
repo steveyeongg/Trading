@@ -32,9 +32,7 @@ import pandas as pd
 
 from swing_engine.config import (
     REGIME_FACTOR,
-    BreakoutParams,
     LeaderParams,
-    PullbackParams,
     RiskSettings,
     SetupParams,
     UniverseFilter,
@@ -258,20 +256,38 @@ def run_scan(
 
 
 def default_setups(repo: Path | None = None) -> list[SetupSpec]:
-    """Both setup families at their default parameters, all unproven (``live=False``).
+    """Both setup families (breakout, then pullback) as their committed validation left them.
 
-    ``repo`` is where validation verdicts will be read from once there are any; until then
-    every setup is unproven whatever it is.
+    Each family runs with the parameters pre-registered for its latest out-of-sample version
+    (its defaults before the first run), is Live only when that run passed the gate, and keeps
+    the regime gate unless that run found the regime filter did not help. ``repo`` is where
+    ``ml/validation/`` lives; None means the current directory. Nothing is re-run here.
     """
-    return [SetupSpec(BreakoutParams(), live=False), SetupSpec(PullbackParams(), live=False)]
+    # Imported here: the validation harness itself builds on this module.
+    from swing_engine.validation.run import latest_report, load_verdicts, params_for
+
+    root = Path.cwd() if repo is None else repo
+    specs = []
+    for family, verdict in load_verdicts(root).items():
+        report = latest_report(root, family)
+        specs.append(
+            SetupSpec(
+                params_for(family, verdict["version"], root),
+                live=verdict["live"],
+                regime_gate=True if report is None else bool(report["regime_filter"]["helps"]),
+            )
+        )
+    return specs
 
 
-def _json_safe(value: Any) -> Any:
+def json_safe(value: Any) -> Any:
     """Plain JSON types: ISO dates, enum values, Python numbers, NaN and infinities as None."""
     if isinstance(value, Enum):
-        return _json_safe(value.value)
+        return json_safe(value.value)
     if value is None or isinstance(value, (str, bool)):
         return value
+    if isinstance(value, np.bool_):
+        return bool(value)
     if isinstance(value, (int, np.integer)):
         return int(value)
     if isinstance(value, (float, np.floating)):
@@ -279,13 +295,13 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, date):
         return value.isoformat()
     if isinstance(value, Mapping):
-        return {str(k): _json_safe(v) for k, v in value.items()}
+        return {str(k): json_safe(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_json_safe(v) for v in value]
+        return [json_safe(v) for v in value]
     raise TypeError(f"not JSON-serialisable: {type(value).__name__}")
 
 
 def scan_to_dict(r: ScanResult) -> dict[str, Any]:
     """The scan as a JSON-safe dict (``json.dumps`` works, NaN becomes None)."""
-    safe: dict[str, Any] = _json_safe(dataclasses.asdict(r))
+    safe: dict[str, Any] = json_safe(dataclasses.asdict(r))
     return safe

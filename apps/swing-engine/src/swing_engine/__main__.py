@@ -3,6 +3,8 @@
     uv run python -m swing_engine backfill [--start 2016-01-01] [--symbols AAPL,MSFT]
     uv run python -m swing_engine update
     uv run python -m swing_engine scan [--as-of 2026-10-16]
+    uv run python -m swing_engine insample --family breakout [--hypothesis "..."]
+    uv run python -m swing_engine oos --family breakout --version breakout-v1
 
 ``backfill`` loads daily bars (active and delisted common stock plus SPY) up to the last
 completed session. It is safe to interrupt and re-run, even a session later: a symbol with
@@ -15,7 +17,16 @@ and both exit with status 1 when some symbols failed, so a re-run is needed.
 
 ``scan`` reads the stored bars only (no Alpaca keys) and prints tonight's regime and the top
 ranked swing ideas for the latest SPY session, or for ``--as-of``. It exits with status 1 and a
-message when there is no data or SPY has no bar on that date.
+message when there is no data or SPY has no bar on that date. It ranks by relative strength
+unless a validated setup's report found that RS ranking did not help.
+
+``insample`` and ``oos`` are the validation protocol (spec §7.8), run from the repo root because
+they read and write ``ml/validation/``. ``insample`` runs the declared grid on 2016-2022 only and
+writes the chosen variant as a draft pre-registration; a revision (v2, v3) needs
+``--hypothesis``. Commit that file, then ``oos`` runs the one out-of-sample test of that version
+and writes its report, Live or Research only. Both read the stored bars only and exit with status
+1 and the reason when the budget is spent, the pre-registration is not committed and unchanged,
+or the data is missing.
 
 Importing this module has no side effects; everything starts in :func:`main`.
 """
@@ -25,9 +36,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 from atlas_shared.config import load_env
@@ -46,6 +58,15 @@ from swing_engine.scan import (
     ScanResult,
     default_setups,
     run_scan,
+)
+from swing_engine.validation.prereg import PreregError
+from swing_engine.validation.protocol import FAMILIES, IS_END, IS_START
+from swing_engine.validation.run import (
+    VALIDATION_DIR,
+    BudgetError,
+    ranking_choice,
+    run_insample,
+    run_oos,
 )
 
 log = get_logger("swing.cli")
@@ -126,6 +147,38 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="YYYY-MM-DD",
         help="session to scan (default: the latest stored SPY session)",
+    )
+
+    ins = commands.add_parser(
+        "insample",
+        help="run a setup's in-sample grid and draft its pre-registration",
+        description=(
+            f"Run the declared parameter grid on {IS_START.year}-{IS_END.year} only, choose the "
+            "variant with the highest expectancy among those with 100+ trades, and write it to "
+            "ml/validation/<family>/<version>.prereg.json as a draft to review and commit. "
+            "Needs a database loaded by backfill/update."
+        ),
+    )
+    ins.add_argument("--family", required=True, choices=FAMILIES, help="setup family")
+    ins.add_argument(
+        "--hypothesis",
+        default="",
+        metavar="TEXT",
+        help="why this revision should do better, from in-sample analysis (required for v2+)",
+    )
+
+    oos = commands.add_parser(
+        "oos",
+        help="run a pre-registered version's one out-of-sample test",
+        description=(
+            "Check the budget (3 runs per family) and that the version's pre-registration is "
+            "committed and unchanged, freeze the window at the last stored session, run the "
+            "out-of-sample test once and write its report with the Live / Research-only verdict."
+        ),
+    )
+    oos.add_argument("--family", required=True, choices=FAMILIES, help="setup family")
+    oos.add_argument(
+        "--version", required=True, metavar="FAMILY-vN", help="pre-registered version to test"
     )
     return parser
 
@@ -273,10 +326,95 @@ def format_scan(r: ScanResult, top_n: int = TOP_N_DEFAULT) -> str:
 def _scan_report(as_of: date | None) -> str:
     try:
         panel, kinds, session = asyncio.run(_load_scan_inputs(as_of))
-        result = run_scan(panel, kinds, session, RiskSettings(), default_setups(Path.cwd()))
+        result = run_scan(
+            panel,
+            kinds,
+            session,
+            RiskSettings(),
+            default_setups(Path.cwd()),
+            rank_by=ranking_choice(Path.cwd()),
+        )
     except ScanError as exc:
         raise SystemExit(f"error: {exc}") from exc
     return format_scan(result)
+
+
+def _num(value: float | None, spec: str, suffix: str = "") -> str:
+    """``value`` formatted, or ``n/a`` for a missing value (NaN is stored as null)."""
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return "n/a"
+    return f"{value:{spec}}{suffix}"
+
+
+def format_insample(summary: Mapping[str, Any]) -> str:
+    """The grid as a table (the chosen variant starred), then the draft and what to do next."""
+    grid, chosen = summary["grid"], summary["chosen"]
+    keys = list(grid[0]["params"]) if grid else []
+    header = ["", *keys, "Trades", "Win %", "Expectancy", "PF", "Avg hold"]
+    rows = [
+        [
+            "*" if row["params"] == chosen["params"] else "",
+            *(f"{row['params'][k]:g}" for k in keys),
+            str(row["n"]),
+            _num(row["win_rate"], ".1%"),
+            _num(row["expectancy_r"], ".2f", "R"),
+            _num(row["profit_factor"], ".2f"),
+            _num(row["avg_hold"], ".1f"),
+        ]
+        for row in grid
+    ]
+    widths = [max(len(h), *(len(r[k]) for r in rows)) for k, h in enumerate(header)]
+    family, version = summary["family"], summary["version"]
+    lines = [
+        f"{version} in sample ({IS_START} to {IS_END}): {len(grid)} variants",
+        "",
+        *(
+            "  ".join(f"{cell:>{w}}" for cell, w in zip(row, widths, strict=True)).rstrip()
+            for row in (header, *rows)
+        ),
+        "",
+        "chosen (*): "
+        + ", ".join(f"{k}={v:g}" for k, v in chosen["params"].items())
+        + " (highest expectancy among variants with 100+ trades)",
+        f"draft pre-registration: {summary['prereg_path']}",
+        f"next: review and commit it, then run "
+        f"`python -m swing_engine oos --family {family} --version {version}`",
+    ]
+    return "\n".join(lines)
+
+
+def format_oos(report: Mapping[str, Any]) -> str:
+    """The verdict line, the numbers the gate read, every failure, and where the report is."""
+    family, version = report["family"], report["version"]
+    passed = report["verdict"]["passed"]
+    start, end = report["oos_window"]
+    oos = report["oos_trades"]
+    dd, spy = report["portfolio_alone"]["max_dd"], report["spy"]["max_dd"]
+    lines = [
+        f"{version} out of sample {start} to {end}: "
+        + ("PASSED, now Live" if passed else "FAILED, stays Research only"),
+        f"  {oos['n']} trades, expectancy {_num(oos['expectancy_r'], '.2f', 'R')}, "
+        f"profit factor {_num(oos['profit_factor'], '.2f')}, "
+        f"random entry median {_num(report['baseline']['median'], '.2f', 'R')}",
+        f"  max drawdown {_num(abs(dd), '.0%')} (SPY {_num(abs(spy), '.0%')}), "
+        f"delisted coverage {_num(report['coverage'], '.0%')}, "
+        f"deflated Sharpe {_num(report['deflated_sharpe']['value'], '.2f')}",
+    ]
+    if report["verdict"]["failures"]:
+        lines += ["failures:", *(f"  - {f}" for f in report["verdict"]["failures"])]
+    path = VALIDATION_DIR / family / f"{version}.report.json"
+    lines.append(f"report: {path.as_posix()} (commit it)")
+    return "\n".join(lines)
+
+
+def _validation_report(args: argparse.Namespace) -> str:
+    repo = Path.cwd()
+    try:
+        if args.cmd == "insample":
+            return format_insample(run_insample(args.family, repo, hypothesis=args.hypothesis))
+        return format_oos(run_oos(args.family, args.version, repo, datetime.now(UTC)))
+    except (BudgetError, PreregError, ValueError) as exc:
+        raise SystemExit(f"error: {exc}") from exc
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -285,6 +423,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     setup_logging()
     if args.cmd == "scan":
         print(_scan_report(args.as_of))
+        return
+    if args.cmd in ("insample", "oos"):
+        print(_validation_report(args))
         return
     job = _run_backfill(args) if args.cmd == "backfill" else _run_update()
     try:

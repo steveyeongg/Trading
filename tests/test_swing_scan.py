@@ -55,6 +55,13 @@ SETTINGS = RiskSettings()
 _FIELDS = ("open", "high", "low", "close", "volume")
 
 
+@pytest.fixture(autouse=True)
+def _no_validation_reports(tmp_path, monkeypatch):
+    """Run from an empty directory: ``default_setups()`` and the scan CLI read the verdicts
+    under the current directory, and these tests are about unvalidated default setups."""
+    monkeypatch.chdir(tmp_path)
+
+
 def _scan(panel: Panel = PANEL, **kw) -> ScanResult:
     kw.setdefault("setups", default_setups())
     kw.setdefault("kinds", KINDS)
@@ -607,6 +614,31 @@ def test_scan_command_lists_the_ideas_run_scan_ranks_in_the_same_order(monkeypat
         line.split() for line in out.splitlines() if line.split()[:1] and line.split()[0].isdigit()
     ]
     assert [(r[1], r[2]) for r in rows] == [(i.symbol, i.setup) for i in _scan().ideas]
+
+
+def test_scan_command_ranks_by_proximity_when_a_live_setup_found_rs_did_not_help(
+    monkeypatch, tmp_path
+):
+    _FakeStore(monkeypatch)
+    report = tmp_path / "ml" / "validation" / "breakout" / "breakout-v1.report.json"
+    report.parent.mkdir(parents=True)
+    report.write_text(
+        json.dumps(
+            {
+                "version": "breakout-v1",
+                "run_index": 1,
+                "verdict": {"passed": True, "failures": []},
+                "regime_filter": {"helps": True},
+                "ranking": {"rs_helps": False},
+            }
+        )
+    )
+    out = _run_cli("--as-of", AS_OF.isoformat())
+
+    rows = [w for w in map(str.split, out.splitlines()) if w and w[0].isdigit()]
+    by_proximity = [(i.symbol, i.setup) for i in _scan(rank_by="proximity").ideas]
+    assert by_proximity != [(i.symbol, i.setup) for i in _scan().ideas]  # premise
+    assert [(r[1], r[2]) for r in rows] == by_proximity
 
 
 def test_scan_command_shows_only_the_top_20_and_says_how_many_more(monkeypatch):
