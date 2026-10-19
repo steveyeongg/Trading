@@ -371,36 +371,85 @@ def _num(value: object, spec: str, suffix: str = "") -> str:
     return "n/a" if math.isnan(x) else f"{x:{spec}}{suffix}"
 
 
+def _count(value: object) -> str:
+    """A stored count, or ``n/a`` when it is missing (a record written before it existed)."""
+    return _num(value, ",.0f")
+
+
+def _aligned(header: Sequence[str], rows: Sequence[Sequence[str]]) -> list[str]:
+    """``header`` and ``rows`` as right-aligned text columns."""
+    widths = [max(len(h), *(len(r[k]) for r in rows)) for k, h in enumerate(header)]
+    return [
+        "  ".join(f"{cell:>{w}}" for cell, w in zip(row, widths, strict=True)).rstrip()
+        for row in (header, *rows)
+    ]
+
+
+def _stats_cells(stats: Mapping[str, Any]) -> list[str]:
+    return [
+        str(stats["n"]),
+        _count(stats.get("n_distinct")),
+        _num(stats["win_rate"], ".1%"),
+        _num(stats["expectancy_r"], ".2f", "R"),
+        _num(stats["profit_factor"], ".2f"),
+    ]
+
+
+def _data_lines(summary: Mapping[str, Any]) -> list[str]:
+    """The data fingerprint, delisted coverage and universe size, when the record has them."""
+    lines = []
+    fp = summary.get("fingerprint")
+    if fp:
+        lines.append(
+            f"data: {fp['symbols']:,} symbols, {fp['first_date']} to {fp['last_date']}, "
+            f"{fp['rows']:,} bars (sha256 {str(fp['sha256'])[:12]}), "
+            f"delisted coverage {_num(summary.get('coverage'), '.0%')}"
+        )
+    universe = summary.get("universe")
+    if universe:
+        lines.append(
+            f"universe: median {_num(universe.get('median_eligible'), ',.0f')} eligible stocks "
+            f"per session over {_count(universe.get('sessions'))} in-sample sessions"
+        )
+    return lines
+
+
 def format_insample(summary: Mapping[str, Any]) -> str:
-    """The grid as a table (the chosen variant starred), then the draft and what to do next."""
+    """The data, the grid as a table (the chosen variant starred), the chosen variant by year,
+    then the draft and what to do next."""
     grid, chosen = summary["grid"], summary["chosen"]
     keys = list(grid[0]["params"]) if grid else []
-    header = ["", *keys, "Trades", "Win %", "Expectancy", "PF", "Avg hold"]
+    header = ["", *keys, "Trades", "Distinct", "Win %", "Expectancy", "PF", "Avg hold"]
     rows = [
         [
             "*" if row["params"] == chosen["params"] else "",
             *(f"{row['params'][k]:g}" for k in keys),
-            str(row["n"]),
-            _num(row["win_rate"], ".1%"),
-            _num(row["expectancy_r"], ".2f", "R"),
-            _num(row["profit_factor"], ".2f"),
+            *_stats_cells(row),
             _num(row["avg_hold"], ".1f"),
         ]
         for row in grid
     ]
-    widths = [max(len(h), *(len(r[k]) for r in rows)) for k, h in enumerate(header)]
     family, version = summary["family"], summary["version"]
     lines = [
         f"{version} in sample ({IS_START} to {IS_END}): {len(grid)} variants",
+        *_data_lines(summary),
         "",
-        *(
-            "  ".join(f"{cell:>{w}}" for cell, w in zip(row, widths, strict=True)).rstrip()
-            for row in (header, *rows)
-        ),
+        *_aligned(header, rows),
         "",
         "chosen (*): "
         + ", ".join(f"{k}={v:g}" for k, v in chosen["params"].items())
         + " (highest expectancy among variants with 100+ trades)",
+    ]
+    years = summary.get("chosen_by_year")
+    if years:
+        year_rows = [[str(year), *_stats_cells(stats)] for year, stats in years.items()]
+        lines += [
+            "",
+            "chosen variant by year (in sample, regime on):",
+            *_aligned(["Year", "Trades", "Distinct", "Win %", "Expectancy", "PF"], year_rows),
+        ]
+    lines += [
+        "",
         f"draft pre-registration: {summary['prereg_path']}",
         f"next: review and commit it, then run "
         f"`python -m swing_engine oos --family {family} --version {version}`",
@@ -418,7 +467,8 @@ def format_oos(report: Mapping[str, Any]) -> str:
     lines = [
         f"{version} out of sample {start} to {end}: "
         + ("PASSED, now Live" if passed else "FAILED, stays Research only"),
-        f"  {oos['n']} trades, expectancy {_num(oos['expectancy_r'], '.2f', 'R')}, "
+        f"  {oos['n']} closed ideas, {_count(oos.get('n_distinct'))} distinct trades, "
+        f"expectancy {_num(oos['expectancy_r'], '.2f', 'R')}, "
         f"profit factor {_num(oos['profit_factor'], '.2f')}, "
         f"random entry median {_num(report['baseline']['median'], '.2f', 'R')}",
         f"  max drawdown {_num(abs(_float(dd)), '.0%')} (SPY {_num(abs(_float(spy)), '.0%')}), "

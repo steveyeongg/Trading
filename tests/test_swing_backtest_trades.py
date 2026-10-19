@@ -4,7 +4,10 @@ Three layers, each checked on exact numbers:
 
 * ``trade_stats`` / ``by_year`` / ``regime_on`` on hand-built trade tables: only closed trades
   count (a DELISTED exit is a closed trade), scratch trades count as losses, and a year is the
-  year of the entry.
+  year of the entry. ``n_distinct`` (the trade floor of the ship gate) counts a trade only when no
+  earlier trade on its symbol was still open at its entry. The incident it pins: a stock that sits
+  near its high triggers a breakout every day, and each day was its own "trade", so 300 triggered
+  ideas could be 50 trades a person could actually have taken, one position per symbol.
 * ``simulate_candidates`` on small hand-built panels with zero slippage, so every fill, exit and R
   is a number worked out by hand. A cross-check on a synthetic universe compares every row with a
   direct ``simulate_trade`` call, so the backtest and the model it wraps can never disagree. The
@@ -25,7 +28,13 @@ import numpy as np
 import pandas as pd
 import pytest
 from swing_engine.backtest.baseline import random_entry_baseline
-from swing_engine.backtest.stats import by_year, regime_on, trade_stats
+from swing_engine.backtest.stats import (
+    by_year,
+    distinct_mask,
+    distinct_trades,
+    regime_on,
+    trade_stats,
+)
 from swing_engine.backtest.trades import candidate_history, simulate_candidates
 from swing_engine.config import BreakoutParams, ExecutionParams, PullbackParams
 from swing_engine.execution import TrackStatus, TradeOutcome, simulate_trade
@@ -109,14 +118,20 @@ def closed_trades(
     entry: list[str] | None = None,
     regime: list[str] | None = None,
 ) -> pd.DataFrame:
-    """A trade table of closed trades with the given R multiples and holding periods."""
+    """A trade table of closed trades with the given R multiples and holding periods.
+
+    Each trade is on its own symbol (``T0``, ``T1``, ...), so every one of them is distinct.
+    """
     n = len(r)
+    entry_date = pd.to_datetime(entry if entry is not None else ["2023-03-01"] * n)
     return pd.DataFrame(
         {
+            "symbol": [f"T{i}" for i in range(n)],
             "status": "closed",
             "r_multiple": r,
             "sessions_held": hold if hold is not None else [5] * n,
-            "entry_date": pd.to_datetime(entry if entry is not None else ["2023-03-01"] * n),
+            "entry_date": entry_date,
+            "known_date": entry_date + pd.Timedelta(days=7),
             "regime": regime if regime is not None else ["uptrend"] * n,
         }
     )
@@ -130,6 +145,7 @@ def test_trade_stats_on_known_r_values():
     assert s["avg_win_r"] == pytest.approx(1.5) and s["avg_loss_r"] == pytest.approx(-1.0)
     assert set(s) == {
         "n",
+        "n_distinct",
         "win_rate",
         "avg_win_r",
         "avg_loss_r",
@@ -137,7 +153,7 @@ def test_trade_stats_on_known_r_values():
         "profit_factor",
         "avg_hold",
     }
-    assert type(s["n"]) is int
+    assert type(s["n"]) is int and s["n_distinct"] == 4 and type(s["n_distinct"]) is int
 
 
 def test_open_and_untriggered_rows_excluded_from_stats():
@@ -145,10 +161,12 @@ def test_open_and_untriggered_rows_excluded_from_stats():
     closed["exit_reason"] = ["trail", "stop", "delisted"]  # a DELISTED exit is a closed trade
     others = pd.DataFrame(
         {
+            "symbol": ["O0", "O1", "O2", "O3"],
             "status": ["open", "not_triggered", "skipped_gap", "pending"],
             "r_multiple": [np.nan] * 4,
             "sessions_held": [40, 0, 0, 0],
             "entry_date": pd.to_datetime(["2023-03-01", None, None, None]),
+            "known_date": pd.to_datetime([None] * 4),
             "regime": ["uptrend"] * 4,
             "exit_reason": [None] * 4,
         }
@@ -164,17 +182,19 @@ def test_open_and_untriggered_rows_excluded_from_stats():
 def test_no_closed_trades_gives_n_zero_and_nan_values_without_raising():
     only_open = pd.DataFrame(
         {
+            "symbol": ["O0", "O1"],
             "status": ["open", "pending"],
             "r_multiple": [np.nan, np.nan],
             "sessions_held": [4, 0],
             "entry_date": pd.to_datetime(["2023-03-01", None]),
+            "known_date": pd.to_datetime([None, None]),
             "regime": ["uptrend", "mixed"],
         }
     )
     empty = only_open.iloc[0:0]
     for table in (only_open, empty):
         s = trade_stats(table)
-        assert s["n"] == 0 and type(s["n"]) is int
+        assert s["n"] == 0 and type(s["n"]) is int and s["n_distinct"] == 0
         for key in ("win_rate", "avg_win_r", "avg_loss_r", "expectancy_r", "avg_hold"):
             assert math.isnan(s[key]), key
         assert math.isnan(s["profit_factor"])
@@ -204,10 +224,12 @@ def test_by_year_groups_closed_trades_by_the_year_of_the_entry():
     )
     open_2023 = pd.DataFrame(
         {
+            "symbol": ["O0"],
             "status": ["open"],
             "r_multiple": [np.nan],
             "sessions_held": [2],
             "entry_date": pd.to_datetime(["2023-06-01"]),
+            "known_date": pd.to_datetime([None]),
             "regime": ["uptrend"],
         }
     )
@@ -217,6 +239,88 @@ def test_by_year_groups_closed_trades_by_the_year_of_the_entry():
     assert out[2022]["avg_hold"] == pytest.approx(9.0)
     assert out[2023]["n"] == 1 and out[2023]["expectancy_r"] == pytest.approx(1.0)
     assert by_year(t.iloc[0:0]) == {}
+
+
+def _book() -> pd.DataFrame:
+    """Overlapping trades on one setup. AAA re-triggers while its earlier trades are open, BBB's
+    first trade never closes, and CCC never filled. Rows are deliberately not in date order."""
+    nan = np.nan
+    return pd.DataFrame(
+        {
+            "symbol": ["AAA", "BBB", "AAA", "AAA", "AAA", "BBB", "CCC"],
+            "status": ["closed", "open", "closed", "closed", "closed", "closed", "not_triggered"],
+            "entry_date": pd.to_datetime(
+                [
+                    "2023-01-20",
+                    "2023-01-03",
+                    "2023-01-03",
+                    "2023-01-04",
+                    "2023-01-10",
+                    "2023-01-05",
+                    None,
+                ]
+            ),
+            "known_date": pd.to_datetime(
+                ["2023-01-25", None, "2023-01-10", "2023-01-12", "2023-01-15", "2023-01-09", None]
+            ),
+            "r_multiple": [0.5, nan, 1.0, -1.0, 2.0, -1.0, nan],
+            "sessions_held": [3, 20, 5, 6, 3, 2, 0],
+            "regime": "uptrend",
+        }
+    )
+
+
+def test_a_trade_is_distinct_only_when_no_earlier_trade_on_its_symbol_is_still_open():
+    book = _book()
+    assert distinct_mask(book).tolist() == [
+        True,  # AAA 01-20: every earlier AAA trade was known closed by 01-15
+        True,  # BBB 01-03: the first BBB trade (it never closes)
+        True,  # AAA 01-03: the first AAA trade
+        False,  # AAA 01-04: the 01-03 trade is open until 01-10
+        False,  # AAA 01-10: the 01-03 trade closed that morning, but the 01-04 one is open
+        False,  # BBB 01-05: the 01-03 BBB trade is still open (to the end of the data)
+        False,  # CCC: never filled, so not a trade at all
+    ]
+    s = trade_stats(book)
+    assert (s["n"], s["n_distinct"]) == (5, 2)  # five closed ideas, two takeable trades
+    assert s["expectancy_r"] == pytest.approx((0.5 + 1.0 - 1.0 + 2.0 - 1.0) / 5)  # every idea
+
+    distinct = distinct_trades(book)
+    assert list(distinct.index) == [0, 1, 2]
+    assert trade_stats(distinct)["n"] == 2 == trade_stats(distinct)["n_distinct"]
+    assert trade_stats(distinct)["expectancy_r"] == pytest.approx(0.75)
+
+    shuffled = book.sample(frac=1.0, random_state=4)  # the table's order does not matter
+    assert distinct_mask(shuffled).tolist() == distinct_mask(book)[shuffled.index].tolist()
+
+
+def test_an_exit_known_on_the_entry_day_frees_the_symbol_and_a_same_day_twin_does_not_count():
+    book = pd.DataFrame(
+        {
+            "symbol": ["AAA", "AAA", "AAA"],
+            "status": "closed",
+            "entry_date": pd.to_datetime(["2023-01-03", "2023-01-10", "2023-01-10"]),
+            "known_date": pd.to_datetime(["2023-01-10", "2023-01-12", "2023-01-11"]),
+            "r_multiple": [1.0, 1.0, 1.0],
+            "sessions_held": [5, 2, 1],
+            "regime": "uptrend",
+        }
+    )
+    # Exits are booked before entries on a session (as in the portfolio simulation), so the
+    # 01-10 entry is free; the second 01-10 entry overlaps the first one.
+    assert distinct_mask(book).tolist() == [True, True, False]
+
+
+def test_by_year_counts_distinct_trades_against_the_whole_book():
+    book = _book()
+    book.loc[0, "entry_date"] = pd.Timestamp("2024-01-20")  # the last AAA trade moves a year on
+    book.loc[0, "known_date"] = pd.Timestamp("2024-01-25")
+    book.loc[5, "entry_date"] = pd.Timestamp("2024-01-05")  # so does BBB's second trade
+    book.loc[5, "known_date"] = pd.Timestamp("2024-01-09")
+    out = by_year(book)
+    assert (out[2023]["n"], out[2023]["n_distinct"]) == (3, 1)
+    # BBB's 2024 trade is closed but the open 2023 BBB trade still held the symbol.
+    assert (out[2024]["n"], out[2024]["n_distinct"]) == (2, 1)
 
 
 def test_regime_on_drops_downtrend_trades_and_keeps_everything_else():

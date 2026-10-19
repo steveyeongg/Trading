@@ -46,6 +46,7 @@ from swing_engine.setups import candidates_for
 from swing_engine.sizing import Capacity, Sizing, size_idea
 from swing_engine.testing import scramble_after, synthetic_kinds, synthetic_universe_panel
 from swing_engine.validation.prereg import Prereg, write_draft
+from swing_engine.validation.protocol import protocol_block
 
 # SPY + 40 stocks, 600 sessions. Seed 5 gives session 450 three breakout and three pullback
 # candidates whose RS order and proximity order differ, which the ranking tests need.
@@ -626,6 +627,7 @@ def test_scan_command_ranks_by_proximity_when_a_live_setup_found_rs_did_not_help
     prereg = Prereg.create(
         family="breakout", version="breakout-v1", params=dataclasses.asdict(BreakoutParams()),
         gate={}, is_window=[], oos_start="2023-01-01", hypothesis="", created_at="2026-10-19",
+        protocol=protocol_block("breakout"),  # Live needs the rules it was registered under
     )  # fmt: skip
     write_draft(folder / "breakout-v1.prereg.json", prereg)
     report = {

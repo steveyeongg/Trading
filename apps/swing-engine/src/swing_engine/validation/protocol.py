@@ -6,19 +6,36 @@ and is spent at most :data:`MAX_OOS_RUNS` times per setup family. A fresh window
 :data:`REFRESH_MONTHS` after the last freeze.
 
 :func:`evaluate_gate` is the ship gate. Its failure messages are user-facing and fixed. Every
-comparison is written so that a NaN (no trades, no baseline) fails rather than passes.
+comparison is written so that a NaN (no trades, no baseline) fails rather than passes. Its trade
+floor counts distinct trades (``n_distinct``, one open trade per symbol at a time), not every
+triggered idea: a stock near its high re-triggers daily.
+
+:func:`protocol_block` is every rule outside a setup's own parameters that decides its trades or
+its gate: the leader gate, the universe filter, the fill model, the gate portfolio's risk
+settings, the regime size factors and the declared grid. The pre-registration seals it, and a
+family stays Live only while the code still has exactly those rules.
 """
 
 from __future__ import annotations
 
 import itertools
+import json
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date
 from typing import Any
 
-from swing_engine.config import BreakoutParams, PullbackParams, SetupParams
+from swing_engine.config import (
+    REGIME_FACTOR,
+    BreakoutParams,
+    ExecutionParams,
+    LeaderParams,
+    PullbackParams,
+    RiskSettings,
+    SetupParams,
+    UniverseFilter,
+)
 
 IS_START = date(2016, 1, 1)
 IS_END = date(2022, 12, 31)
@@ -26,6 +43,10 @@ OOS_START = date(2023, 1, 1)
 MAX_OOS_RUNS = 3
 REFRESH_MONTHS = 12
 MIN_IS_TRADES = 100
+MIN_REGIME_OFF_TRADES = 30
+"""Closed out-of-sample downtrend trades needed before the regime filter can be judged unhelpful."""
+FREEZE_COVERAGE = 0.95
+"""The freeze session needs bars for this share of the symbols that had one the session before."""
 
 GRIDS: dict[str, dict[str, list[float]]] = {
     "breakout": {"stop_atr": [1.5, 2.0, 2.5], "trail_atr": [2.5, 3.0, 3.5]},
@@ -63,6 +84,26 @@ class Verdict:
     failures: list[str]
 
 
+def protocol_block(family: str) -> dict[str, Any]:
+    """The rules outside ``family``'s own parameters that decide its trades and its gate.
+
+    ``leader``, ``universe`` and ``execution`` are the defaults every validation run and scan
+    uses, ``risk`` the settings of the gate's portfolio simulation, ``regime_factor`` the size
+    factor per regime, and ``grid`` the in-sample search declared for the family. The block is
+    plain JSON (it reads back from a file unchanged), so it compares with ``==``.
+    """
+    block = {
+        "leader": asdict(LeaderParams()),
+        "universe": asdict(UniverseFilter()),
+        "execution": asdict(ExecutionParams()),
+        "risk": asdict(RiskSettings()),
+        "regime_factor": dict(REGIME_FACTOR),
+        "grid": GRIDS[check_family(family)],
+    }
+    plain: dict[str, Any] = json.loads(json.dumps(block, allow_nan=False))
+    return plain
+
+
 def check_family(family: str) -> str:
     """``family`` when it is a known setup family; otherwise ``ValueError``."""
     if family not in GRIDS:
@@ -86,12 +127,13 @@ def evaluate_gate(
 ) -> Verdict:
     """The ship gate on out-of-sample results; the verdict lists every condition that failed.
 
-    ``oos`` holds the trade-level ``n``, ``expectancy_r`` and ``profit_factor``. Both drawdowns
-    are NEGATIVE fractions, and "worse" means deeper: ``portfolio_max_dd < spy_max_dd``. A NaN
-    drawdown on either side fails as "drawdown unknown". A ``coverage`` below
-    ``t.coverage_floor`` (or NaN, unmeasured) raises the profit-factor floor.
+    ``oos`` holds the trade-level ``n_distinct``, ``expectancy_r`` and ``profit_factor``: the
+    trade floor counts distinct trades, while expectancy and profit factor cover every triggered
+    idea. Both drawdowns are NEGATIVE fractions, and "worse" means deeper: ``portfolio_max_dd <
+    spy_max_dd``. A NaN drawdown on either side fails as "drawdown unknown". A ``coverage``
+    below ``t.coverage_floor`` (or NaN, unmeasured) raises the profit-factor floor.
     """
-    x, pf, n = float(oos["expectancy_r"]), float(oos["profit_factor"]), int(oos["n"])
+    x, pf, n = float(oos["expectancy_r"]), float(oos["profit_factor"]), int(oos["n_distinct"])
     floor = (
         t.min_profit_factor if coverage >= t.coverage_floor else t.min_profit_factor_low_coverage
     )
@@ -101,7 +143,7 @@ def evaluate_gate(
     if not pf >= floor:
         failures.append(f"profit factor {pf:.2f} < {floor:.2f}")
     if n < t.min_trades:
-        failures.append(f"only {n} trades (need {t.min_trades})")
+        failures.append(f"only {n} distinct trades (need {t.min_trades})")
     if not x > baseline_median:
         failures.append(f"expectancy {x:.2f}R not above random entry {baseline_median:.2f}R")
     if math.isnan(portfolio_max_dd) or math.isnan(spy_max_dd):

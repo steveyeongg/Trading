@@ -10,6 +10,11 @@ running the validation reviews it and commits it, and only then will ``run_oos``
   keys, no whitespace), so a change that did not re-seal the file shows;
 * a revision (any version but ``<family>-v1``) without a written hypothesis.
 
+``protocol`` seals the rules outside the setup's parameters
+(:func:`~swing_engine.validation.protocol.protocol_block`). A file written before it existed has
+no ``protocol`` key: it still loads, its seal still verifies (a missing protocol is left out of
+the digest), and :mod:`~swing_engine.validation.run` treats its rules as unverified.
+
 git runs as a subprocess with an argument list, never through a shell.
 """
 
@@ -32,8 +37,9 @@ class PreregError(RuntimeError):
 @dataclass(frozen=True)
 class Prereg:
     """One pre-registered out-of-sample run. ``params`` and ``gate`` are ``asdict`` of the
-    setup parameters and :class:`~swing_engine.validation.protocol.GateThresholds`; dates are
-    ISO strings and ``created_at`` is an ISO UTC timestamp."""
+    setup parameters and :class:`~swing_engine.validation.protocol.GateThresholds`, and
+    ``protocol`` is :func:`~swing_engine.validation.protocol.protocol_block` (None in a file
+    written before it existed); dates are ISO strings and ``created_at`` is an ISO UTC timestamp."""
 
     family: str
     version: str
@@ -44,6 +50,7 @@ class Prereg:
     hypothesis: str
     created_at: str
     sha256: str
+    protocol: dict[str, Any] | None = None
 
     @classmethod
     def create(
@@ -57,6 +64,7 @@ class Prereg:
         oos_start: str,
         hypothesis: str,
         created_at: str,
+        protocol: dict[str, Any] | None,
     ) -> Prereg:
         """A sealed pre-registration: ``sha256`` computed from the other fields."""
         fields: dict[str, Any] = {
@@ -68,6 +76,7 @@ class Prereg:
             "oos_start": oos_start,
             "hypothesis": hypothesis,
             "created_at": created_at,
+            "protocol": protocol,
         }
         return cls(**fields, sha256=_digest(fields))
 
@@ -80,8 +89,13 @@ class Prereg:
 
 
 def _digest(fields: Mapping[str, Any]) -> str:
-    """Hex sha256 of the canonical JSON of ``fields`` without ``sha256`` (sorted, compact)."""
-    body = {k: v for k, v in fields.items() if k != "sha256"}
+    """Hex sha256 of the canonical JSON of ``fields`` without ``sha256`` (sorted, compact).
+
+    A ``protocol`` of None is left out too, so a file from before the protocol block verifies.
+    """
+    body = {
+        k: v for k, v in fields.items() if k != "sha256" and not (k == "protocol" and v is None)
+    }
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(canonical.encode()).hexdigest()
 
@@ -113,6 +127,20 @@ def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
         )
     except FileNotFoundError:
         raise PreregError("git is required to verify pre-registration") from None
+
+
+def code_state(repo: Path) -> dict[str, Any]:
+    """``code_commit`` (``git rev-parse HEAD``) and ``code_dirty`` (tracked files differ from it).
+
+    Either is None when git cannot tell (no repository, no commit yet). Untracked files are not
+    counted: a report's own new files would otherwise mark every run dirty.
+    """
+    head = _git(repo, "rev-parse", "--verify", "HEAD")
+    status = _git(repo, "status", "--porcelain", "--untracked-files=no")
+    return {
+        "code_commit": head.stdout.strip() if head.returncode == 0 else None,
+        "code_dirty": bool(status.stdout.strip()) if status.returncode == 0 else None,
+    }
 
 
 def check_committed(path: Path, repo: Path) -> Prereg:

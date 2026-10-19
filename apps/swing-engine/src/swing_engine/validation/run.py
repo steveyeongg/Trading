@@ -21,21 +21,29 @@ freeze (the last SPY session in the data) and dates its candidates from the out-
 No context depends on a setup's parameters, so each window's context is built once.
 
 **What the out-of-sample run checks first.** The budget, the run index, the committed and sealed
-pre-registration, and that its parameters are exactly the in-sample choice on the same data (the
-grid is recomputed), so the variant that runs is the one the trial count accounts for.
+pre-registration, that its protocol block is the rules the code has now, that a revision does
+not repeat an earlier version's rules, that the last session is fully loaded (the freeze), and
+that its parameters are exactly the in-sample choice on the same data (the grid is recomputed),
+so the variant that runs is the one the trial count accounts for.
 
 **What it reports** (spec §7.8). Trade-level stats use every triggered idea in a non-downtrend
-regime, uncapped (``oos_trades``), and are what the gate reads, together with the random-entry
-baseline on the same candidates, the setup-alone portfolio's drawdown against SPY's buy-and-hold,
-and the delisted-data coverage. The regime filter and the RS ranking are judged as well (see
-:func:`regime_filter_helps` and :func:`rs_ranking`). The deflated Sharpe uses the setup-alone
-portfolio's daily (not annualised) Sharpe, and counts every grid variant plus every
-out-of-sample run so far as a trial.
+regime, uncapped (``oos_trades``), and are what the gate reads: expectancy and profit factor on
+all of them, the trade floor on the distinct ones (``n_distinct``; ``oos_trades_distinct`` has
+the stats of those alone), together with the random-entry baseline on the same candidates, the
+setup-alone portfolio's drawdown against SPY's buy-and-hold, and the delisted-data coverage. The
+regime filter and the RS ranking are judged as well (see :func:`regime_filter_helps` and
+:func:`rs_ranking`). The combined portfolio takes the other family only once it has had its own
+out-of-sample run, with that run's parameters (:func:`other_family_params`), so one family's
+report never looks at the other's window first. The deflated Sharpe uses the setup-alone
+portfolio's daily (not annualised) Sharpe with the sample skew and kurtosis of its daily
+returns, and counts every grid variant plus every out-of-sample run so far as a trial. The
+report records the code it ran on (``code_commit``, ``code_dirty``).
 
 **Reading verdicts back.** :func:`load_verdicts`, :func:`params_for` and :func:`ranking_choice`
 serve the nightly scan; they never run anything and never raise on a bad file. A family is Live
-only when its latest report passed and its pre-registration is still the sealed file that run
-used (same sha256). An unreadable report makes the family Research only.
+only when its latest report passed, its pre-registration is still the sealed file that run used
+(same sha256), and the rules that file sealed are the code's rules now. An unreadable report
+makes the family Research only.
 """
 
 from __future__ import annotations
@@ -57,11 +65,12 @@ import numpy.typing as npt
 import pandas as pd
 from atlas_shared.logging import get_logger
 from backtest_service.metrics import deflated_sharpe, sharpe
+from scipy import stats as sps
 
 from swing_engine import store
 from swing_engine.backtest.baseline import random_entry_baseline
 from swing_engine.backtest.portfolio import PortfolioResult, buy_and_hold, simulate_portfolio
-from swing_engine.backtest.stats import by_year, regime_on, trade_stats
+from swing_engine.backtest.stats import by_year, distinct_trades, regime_on, trade_stats
 from swing_engine.backtest.trades import context_candidates, simulate_candidates
 from swing_engine.config import ExecutionParams, RiskSettings, SetupParams
 from swing_engine.data.assets import AssetKind
@@ -71,21 +80,26 @@ from swing_engine.validation.prereg import (
     Prereg,
     PreregError,
     check_committed,
+    code_state,
     load_prereg,
     write_draft,
 )
 from swing_engine.validation.protocol import (
     DEFAULT_PARAMS,
     FAMILIES,
+    FREEZE_COVERAGE,
     IS_END,
     IS_START,
     MAX_OOS_RUNS,
+    MIN_REGIME_OFF_TRADES,
     OOS_START,
     REFRESH_MONTHS,
     GateThresholds,
+    Verdict,
     check_family,
     evaluate_gate,
     grid_variants,
+    protocol_block,
     select_variant,
 )
 
@@ -94,7 +108,11 @@ log = get_logger("swing.validation")
 VALIDATION_DIR = Path("ml") / "validation"
 BASELINE_SEEDS = 100
 PREREG_CHANGED = "pre-registration missing or changed since its run"
+RULES_CHANGED = "rules changed since its run"
+RULES_UNSEALED = f"{RULES_CHANGED}: its pre-registration has no protocol block"
 REPORT_UNREADABLE = "report unreadable"
+OTHER_NOT_VALIDATED = "other family not yet validated"
+OTHER_PREREG_CHANGED = "other family's pre-registration missing or changed since its run"
 _EX = ExecutionParams()
 
 
@@ -275,9 +293,11 @@ def _sealed_prereg(repo: Path, family: str, version: str) -> Prereg | None:
 def load_verdicts(repo: Path) -> dict[str, dict[str, Any]]:
     """Per family, in scan order: the latest report's version, Live or not, and its failures.
 
-    Live needs the latest report to have passed AND its pre-registration to be the sealed file
-    that run recorded (``prereg_sha256``); otherwise the failures say why. A family with an
-    unreadable report is not Live. Never raises on a bad file.
+    Live needs the latest report to have passed, its pre-registration to be the sealed file
+    that run recorded (``prereg_sha256``), AND that file's protocol block to be the rules the
+    code has now (:func:`~swing_engine.validation.protocol.protocol_block`); otherwise the
+    failures say why (a file with no protocol block cannot vouch for the rules). A family with
+    an unreadable report is not Live. Never raises on a bad file.
     """
     verdicts: dict[str, dict[str, Any]] = {}
     for family in FAMILIES:
@@ -306,6 +326,10 @@ def load_verdicts(repo: Path) -> dict[str, dict[str, Any]]:
             prereg = _sealed_prereg(repo, family, report["version"])
             if prereg is None or prereg.sha256 != report.get("prereg_sha256"):
                 live, failures = False, [PREREG_CHANGED]
+            elif prereg.protocol is None:
+                live, failures = False, [RULES_UNSEALED]
+            elif prereg.protocol != protocol_block(family):
+                live, failures = False, [RULES_CHANGED]
         verdicts[family] = {
             "version": report["version"],
             "live": live,
@@ -396,23 +420,32 @@ def _in_sample(data: ValidationData) -> ScanContext:
     return build_context(data.panel, data.kinds, _last_spy_session(data.panel, IS_END))
 
 
-def _is_stats(ctx: ScanContext, params: SetupParams) -> dict[str, Any]:
-    """Trade stats of ``params`` in sample: non-downtrend trades closed by the cut."""
+def _is_trades(ctx: ScanContext, params: SetupParams) -> pd.DataFrame:
+    """The in-sample trades of ``params`` in a non-downtrend regime (open ones stay open)."""
     candidates = context_candidates(ctx, params, IS_START)
     # No delisted flags in sample: see the module docstring.
     trades = simulate_candidates(ctx.panel, ctx.ind, candidates, params, _EX, frozenset())
-    return trade_stats(regime_on(trades))
+    return regime_on(trades)
 
 
-def _grid(ctx: ScanContext, family: str) -> list[dict[str, Any]]:
-    """One row per grid variant, in grid order: ``{"params": <the combo>, **trade stats}``."""
-    rows = []
+def _grid(ctx: ScanContext, family: str) -> tuple[list[dict[str, Any]], list[pd.DataFrame]]:
+    """One row per grid variant, in grid order: ``{"params": <the combo>, **trade stats}``, and
+    each variant's in-sample trades in the same order."""
+    rows: list[dict[str, Any]] = []
+    trades: list[pd.DataFrame] = []
     for combo in grid_variants(family):
         overrides: dict[str, Any] = dict(combo)
         params = dataclasses.replace(DEFAULT_PARAMS[family], **overrides)
-        rows.append({"params": combo, **_is_stats(ctx, params)})
-        log.info("validation.variant", family=family, params=combo, n=rows[-1]["n"])
-    return rows
+        trades.append(_is_trades(ctx, params))
+        rows.append({"params": combo, **trade_stats(trades[-1])})
+        log.info(
+            "validation.variant",
+            family=family,
+            params=combo,
+            n=rows[-1]["n"],
+            n_distinct=rows[-1]["n_distinct"],
+        )
+    return rows, trades
 
 
 def _chosen_params(family: str, chosen: Mapping[str, Any], version: str) -> SetupParams:
@@ -421,16 +454,55 @@ def _chosen_params(family: str, chosen: Mapping[str, Any], version: str) -> Setu
     return dataclasses.replace(DEFAULT_PARAMS[family], **overrides, version=version)
 
 
+def _universe_size(ctx: ScanContext) -> dict[str, Any]:
+    """The median number of eligible stocks per in-sample session, over how many sessions."""
+    sizes = ctx.eligible.loc[pd.Timestamp(IS_START) :].sum(axis=1)
+    median = float(sizes.median()) if len(sizes) else math.nan
+    return {"median_eligible": median, "sessions": len(sizes)}
+
+
+def _rules(params: object) -> object:
+    """A pre-registration's parameters without the version label (what a revision must change)."""
+    if isinstance(params, Mapping):
+        return {k: v for k, v in params.items() if k != "version"}
+    return params
+
+
+def _refuse_identical_revision(
+    repo: Path, family: str, version: str, params: Mapping[str, Any], protocol: object
+) -> None:
+    """:class:`PreregError` when an earlier version's pre-registration has these parameters (the
+    version label aside) and this protocol block: a revision must change the rules, or it is
+    just another look at an overlapping out-of-sample window. Earlier versions with no readable
+    pre-registration on file have nothing to compare with and are skipped."""
+    run = int(version.rsplit("-v", 1)[1])
+    for index in range(1, run):
+        earlier = f"{family}-v{index}"
+        try:
+            prereg = load_prereg(_validation_file(repo, family, earlier, "prereg"))
+        except PreregError:
+            continue
+        if prereg.protocol == protocol and _rules(prereg.params) == _rules(params):
+            raise PreregError(
+                f"{version} is identical to {earlier}; a revision must change the rules"
+            )
+
+
 def run_insample(
     family: str, repo: Path, data: ValidationData | None = None, hypothesis: str = ""
 ) -> dict[str, Any]:
     """Run the in-sample grid, choose a variant, and write its draft pre-registration.
 
-    Writes ``<version>.insample.json`` (every grid row and the chosen one) and a draft
-    ``<version>.prereg.json`` holding the chosen parameters, the gate, the windows and
-    ``hypothesis`` (required for a revision). Returns a summary with both paths. ``data`` is
-    loaded from the store when not given. Raises ``ValueError`` when no variant has enough trades
-    or a report already on file cannot be read.
+    Writes ``<version>.insample.json`` and a draft ``<version>.prereg.json``. The record holds
+    every grid row (with its distinct-trade count), the chosen one and its trades' results by
+    year, the median eligible universe over the in-sample window, the delisted coverage and the
+    data fingerprint: what the checkpoint reviews before any out-of-sample run. The draft holds
+    the chosen parameters, the protocol block, the gate, the windows and ``hypothesis``
+    (required for a revision). Returns the record with ``params`` and both paths. ``data`` is
+    loaded from the store when not given. Raises ``ValueError`` when no variant has enough
+    trades or a report already on file cannot be read, and
+    :class:`~swing_engine.validation.prereg.PreregError` when the chosen parameters and protocol
+    are identical to an earlier version's; nothing is written then.
     """
     check_family(family)
     reports = _reports(repo, family)
@@ -438,9 +510,13 @@ def run_insample(
     if data is None:
         data = asyncio.run(load_validation_data())
 
-    rows = _grid(_in_sample(data), family)
+    ctx = _in_sample(data)
+    rows, trades = _grid(ctx, family)
     chosen = select_variant(rows)
+    chosen_trades = next(t for row, t in zip(rows, trades, strict=True) if row is chosen)
     params = _chosen_params(family, chosen, version)
+    protocol = protocol_block(family)
+    _refuse_identical_revision(repo, family, version, dataclasses.asdict(params), protocol)
     created_at = datetime.now(UTC).isoformat(timespec="seconds")
     is_window = [IS_START.isoformat(), IS_END.isoformat()]
 
@@ -452,6 +528,10 @@ def run_insample(
         "n_variants": len(rows),
         "grid": _jsonable(rows),
         "chosen": _jsonable(chosen),
+        "chosen_by_year": _jsonable(by_year(chosen_trades)),
+        "universe": _jsonable(_universe_size(ctx)),
+        "coverage": _jsonable(data.coverage),
+        "fingerprint": data_fingerprint(data.meta),
         "created_at": created_at,
     }
     _write_json(insample_path, record)
@@ -465,6 +545,7 @@ def run_insample(
         oos_start=_next_oos_start(reports).isoformat(),
         hypothesis=hypothesis,
         created_at=created_at,
+        protocol=protocol,
     )
     write_draft(prereg_path, prereg)
     return {
@@ -479,7 +560,7 @@ def run_insample(
 
 
 def _check_prereg_matches_run(prereg: Prereg, family: str, version: str, oos_start: date) -> None:
-    """The pre-registration is this run's and declares the protocol's gate and windows."""
+    """The pre-registration is this run's and declares the protocol's gate, windows and rules."""
     where = f"{version}.prereg.json"
     if (prereg.family, prereg.version) != (family, version):
         raise PreregError(f"{where} is for {prereg.version} of {prereg.family}, not {version}")
@@ -492,6 +573,59 @@ def _check_prereg_matches_run(prereg: Prereg, family: str, version: str, oos_sta
             f"{where} declares an out-of-sample start of {prereg.oos_start}, but this run's "
             f"window starts on {oos_start}"
         )
+    if prereg.protocol is None:
+        raise PreregError(
+            f"{where} has no protocol block (it was written before the rules outside the setup "
+            "parameters were sealed): re-run insample to draft a new pre-registration"
+        )
+    if prereg.protocol != protocol_block(family):
+        raise PreregError(
+            f"{where} was registered under other rules (leader gate, universe, execution, risk, "
+            "regime factor or grid) than the code has now: re-run insample"
+        )
+
+
+def freeze_session(panel: Panel) -> date:
+    """The last SPY session, once its data looks fully loaded.
+
+    Raises ``ValueError`` (saying what to run) when fewer than ``FREEZE_COVERAGE`` of the symbols
+    that had a bar on the SPY session before have one on it: an update that stopped half way
+    would otherwise freeze the window on a session most stocks seem to have skipped.
+    """
+    last = _last_spy_session(panel)
+    sessions = panel.close[BENCHMARK].dropna().index
+    if len(sessions) < 2:
+        return last
+    before = pd.Timestamp(sessions[-2])
+    counts = panel.close.loc[[before, pd.Timestamp(last)]].notna().sum(axis=1).to_numpy()
+    if counts[1] < FREEZE_COVERAGE * counts[0]:
+        raise ValueError(
+            f"the data looks incomplete on {last}: {counts[1]} symbols have a bar, against "
+            f"{counts[0]} on {before.date()}; run `python -m swing_engine backfill "
+            "--refresh-assets && python -m swing_engine update`, then retry"
+        )
+    return last
+
+
+def other_family_params(repo: Path, family: str) -> tuple[SetupParams | None, str]:
+    """The other family's parameters for the combined portfolio, and a note saying why.
+
+    Only a family that has had its own out-of-sample run takes part, with the sealed parameters
+    that run used: ``(None, reason)`` before that run (its window must not be looked at first)
+    and when its pre-registration is missing or no longer the file its run recorded.
+    """
+    other = next(f for f in FAMILIES if f != check_family(family))
+    report = latest_report(repo, other)
+    if report is None:
+        return None, OTHER_NOT_VALIDATED
+    prereg = _sealed_prereg(repo, other, report["version"])
+    if prereg is None or prereg.sha256 != report.get("prereg_sha256"):
+        return None, OTHER_PREREG_CHANGED
+    try:
+        params = _setup_params(other, prereg.params)
+    except TypeError:
+        return None, OTHER_PREREG_CHANGED
+    return params, f"with {report['version']} (its pre-registered parameters)"
 
 
 def _concat(frames: list[pd.DataFrame]) -> pd.DataFrame:
@@ -513,6 +647,19 @@ def _portfolio(result: PortfolioResult) -> dict[str, Any]:
     }
 
 
+def _daily_returns(result: PortfolioResult) -> npt.NDArray[np.float64]:
+    equity = result.equity.to_numpy(dtype="float64")
+    returns: npt.NDArray[np.float64] = equity[1:] / equity[:-1] - 1.0
+    return returns
+
+
+def _moments(returns: npt.NDArray[np.float64]) -> tuple[float, float]:
+    """Sample skew and (non-excess) kurtosis of ``returns``; NaN when they are flat or too few."""
+    if returns.size < 3 or not np.std(returns) > 0.0:
+        return math.nan, math.nan
+    return float(sps.skew(returns)), float(sps.kurtosis(returns, fisher=False))
+
+
 def _baseline(seeds: npt.NDArray[np.float64]) -> dict[str, float]:
     finite = seeds[~np.isnan(seeds)]
     if not finite.size:
@@ -522,19 +669,21 @@ def _baseline(seeds: npt.NDArray[np.float64]) -> dict[str, float]:
 
 
 def regime_filter_helps(
-    expectancy_on: float, expectancy_off: float, max_dd_on: float, max_dd_off: float
+    downtrend_trades: int, sharpe_gated: float, sharpe_ungated: float, ungated_gate: Verdict
 ) -> bool:
-    """Whether the regime filter earned its place out of sample.
+    """Whether the regime filter keeps its place as a gate (spec §7.3).
 
-    False when trading every regime had the higher expectancy (``expectancy_off >
-    expectancy_on``) or the setup-alone portfolio with the filter had the deeper drawdown
-    (``max_dd_on < max_dd_off``, both NEGATIVE). An expectancy that cannot be measured (NaN)
-    keeps the filter, as far as expectancy goes.
+    It becomes a warning (False) only on strong out-of-sample evidence that it hurt: at least
+    ``MIN_REGIME_OFF_TRADES`` closed trades taken in a downtrend, the ungated setup-alone
+    portfolio's daily Sharpe above the gated one's, AND the ungated configuration passing the
+    full ship gate on its own numbers. Anything short of that, a NaN included, keeps the gate.
     """
-    expectancy_ok = (
-        math.isnan(expectancy_on) or math.isnan(expectancy_off) or expectancy_on >= expectancy_off
+    drop = (
+        downtrend_trades >= MIN_REGIME_OFF_TRADES
+        and sharpe_ungated > sharpe_gated
+        and ungated_gate.passed
     )
-    return bool(expectancy_ok and max_dd_on >= max_dd_off)
+    return not drop
 
 
 def rs_ranking(trades: pd.DataFrame) -> dict[str, Any]:
@@ -568,10 +717,11 @@ def run_oos(
     report or the family's budget is spent, with ``ValueError`` when ``version`` is not the
     next run (``<family>-v<run_index>``) or a report on file is unreadable, and with
     :class:`~swing_engine.validation.prereg.PreregError` when the pre-registration is not
-    committed, unchanged and sealed, or does not match this run. Once the in-sample grid is
-    recomputed it also refuses a pre-registration whose parameters are not the in-sample choice.
-    The report (``<version>.report.json``) is written whatever the verdict, and returned as
-    written.
+    committed, unchanged and sealed, does not match this run, has no protocol block or one that
+    is not the code's rules now, or repeats an earlier version's rules. Once the data is loaded
+    it refuses (``ValueError``) a last session that looks half loaded, and once the in-sample
+    grid is recomputed a pre-registration whose parameters are not the in-sample choice. The
+    report (``<version>.report.json``) is written whatever the verdict, and returned as written.
     """
     check_family(family)
     report_path = _validation_file(repo, family, version, "report")
@@ -587,19 +737,20 @@ def run_oos(
         )
     prereg = check_committed(_validation_file(repo, family, version, "prereg"), repo)
     _check_prereg_matches_run(prereg, family, version, oos_start)
+    _refuse_identical_revision(repo, family, version, prereg.params, prereg.protocol)
     if data is None:
         data = asyncio.run(load_validation_data())
 
-    grid = _grid(_in_sample(data), family)
+    freeze = freeze_session(data.panel)
+    if freeze < oos_start:
+        raise ValueError(f"no out-of-sample data: the last {BENCHMARK} session is {freeze}")
+    grid, _ = _grid(_in_sample(data), family)
     chosen = select_variant(grid)
     params = _chosen_params(family, chosen, version)
     if prereg.params != dataclasses.asdict(params):
         raise PreregError(f"{version} is not the in-sample choice; re-run insample")
     is_stats = {k: v for k, v in chosen.items() if k != "params"}
 
-    freeze = _last_spy_session(data.panel)
-    if freeze < oos_start:
-        raise ValueError(f"no out-of-sample data: the last {BENCHMARK} session is {freeze}")
     ctx = build_context(data.panel, data.kinds, freeze)  # cut at the freeze before any work
 
     def oos_trades(p: SetupParams) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -609,19 +760,22 @@ def run_oos(
         )
 
     candidates, trades = oos_trades(params)
-    other = next(f for f in FAMILIES if f != family)
-    _, other_trades = oos_trades(params_for(other, load_verdicts(repo)[other]["version"], repo))
     on = regime_on(trades)
     on_stats, off_stats = trade_stats(on), trade_stats(trades)
+    downtrend_trades = off_stats["n"] - on_stats["n"]
 
     settings, close = RiskSettings(), ctx.panel.close
     alone = simulate_portfolio(trades, close, settings, oos_start, freeze)
     ungated = simulate_portfolio(
         trades.assign(regime="uptrend"), close, settings, oos_start, freeze
     )
-    combined = simulate_portfolio(
-        _concat([trades, other_trades]), close, settings, oos_start, freeze
-    )
+    other_params, combined_note = other_family_params(repo, family)
+    combined = None
+    if other_params is not None:
+        _, other_trades = oos_trades(other_params)
+        combined = simulate_portfolio(
+            _concat([trades, other_trades]), close, settings, oos_start, freeze
+        )
     spy = buy_and_hold(close[BENCHMARK], oos_start, freeze)
     baseline = _baseline(
         random_entry_baseline(
@@ -636,17 +790,17 @@ def run_oos(
         )
     )
 
-    equity = alone.equity.to_numpy(dtype="float64")
-    returns = equity[1:] / equity[:-1] - 1.0
+    returns = _daily_returns(alone)
     daily_sharpe = sharpe(returns, periods_per_year=1)
+    ungated_sharpe = sharpe(_daily_returns(ungated), periods_per_year=1)
+    skew, kurtosis = _moments(returns)
     n_trials = len(grid) + run_index
+    gate = GateThresholds(**prereg.gate)
     verdict = evaluate_gate(
-        on_stats,
-        baseline["median"],
-        alone.max_dd,
-        spy.max_dd,
-        data.coverage,
-        GateThresholds(**prereg.gate),
+        on_stats, baseline["median"], alone.max_dd, spy.max_dd, data.coverage, gate
+    )
+    ungated_verdict = evaluate_gate(
+        off_stats, baseline["median"], ungated.max_dd, spy.max_dd, data.coverage, gate
     )
 
     report = _jsonable(
@@ -658,34 +812,44 @@ def run_oos(
             "n_trials": n_trials,
             "freeze_date": freeze,
             "oos_window": [oos_start, freeze],
+            **code_state(repo),
             "is_stats": is_stats,
             "grid": grid,
             "oos_trades": on_stats,
+            "oos_trades_distinct": trade_stats(distinct_trades(on)),
             "oos_trades_regime_off": off_stats,
             "by_year": by_year(on),
             "baseline": baseline,
             "portfolio_alone": _portfolio(alone),
-            "portfolio_combined": _portfolio(combined),
+            "portfolio_combined": None if combined is None else _portfolio(combined),
+            "portfolio_combined_note": combined_note,
             "spy": _portfolio(spy),
             "regime_filter": {
                 "helps": regime_filter_helps(
-                    on_stats["expectancy_r"],
-                    off_stats["expectancy_r"],
-                    alone.max_dd,
-                    ungated.max_dd,
+                    downtrend_trades, daily_sharpe, ungated_sharpe, ungated_verdict
                 ),
                 "on": on_stats,
                 "off": off_stats,
                 "max_dd": {"on": alone.max_dd, "off": ungated.max_dd},
+                "sharpe": {"on": daily_sharpe, "off": ungated_sharpe},
+                "downtrend_trades": downtrend_trades,
+                "ungated_gate": {
+                    "passed": ungated_verdict.passed,
+                    "failures": ungated_verdict.failures,
+                },
             },
             "ranking": rs_ranking(on),
             "coverage": data.coverage,
             "fingerprint": data_fingerprint(data.meta),
             "deflated_sharpe": {
-                "value": deflated_sharpe(daily_sharpe, n_trials, int(returns.size)),
+                "value": deflated_sharpe(
+                    daily_sharpe, n_trials, int(returns.size), skew=skew, kurtosis=kurtosis
+                ),
                 "observed_sharpe": daily_sharpe,
                 "n_obs": int(returns.size),
                 "n_trials": n_trials,
+                "skew": skew,
+                "kurtosis": kurtosis,
             },
             "verdict": {"passed": verdict.passed, "failures": verdict.failures},
         }
