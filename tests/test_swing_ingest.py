@@ -574,6 +574,64 @@ async def test_backfill_uses_the_stored_asset_list_without_calling_alpaca_for_it
     assert sorted(client.requested_symbols) == ["AAA", "SPY"]
 
 
+async def test_backfill_reuses_the_stored_asset_list_so_a_new_listing_is_not_discovered():
+    """Without ``refresh_assets`` a re-run never calls Alpaca for assets, so an IPO is missed."""
+    store_ = FakeStore(assets=[common("AAA", status="active")], last={"AAA": FRIDAY})
+    client = FakeClient(
+        bars={"AAA": week(), "NEWCO": week()},
+        active=[common("AAA"), common("NEWCO")],
+    )
+
+    await backfill(client, store_, start=START, now=FRI_EVENING)
+
+    assert client.asset_calls == []
+    assert "NEWCO" not in client.requested_symbols
+    assert [a["symbol"] for a in store_.assets] == ["AAA"]
+
+
+async def test_backfill_refresh_assets_picks_up_a_new_listing():
+    store_ = FakeStore(assets=[common("AAA", status="active")], last={"AAA": FRIDAY})
+    client = FakeClient(
+        bars={"AAA": week(), "NEWCO": week()},
+        active=[common("AAA"), common("NEWCO")],
+    )
+
+    res = await backfill(client, store_, start=START, now=FRI_EVENING, refresh_assets=True)
+
+    assert client.asset_calls == ["active", "inactive"]  # both lists, before the universe
+    assert "NEWCO" in client.requested_symbols and "NEWCO" in store_.written_symbols
+    assert res.failed == [] and res.rows == 5  # NEWCO's whole week; AAA was current
+    assert {a["symbol"] for a in store_.assets} == {"AAA", "NEWCO"}
+
+
+async def test_backfill_refresh_assets_notices_a_delisting():
+    """Stored as active and a session behind; Alpaca now lists it inactive, so it is skipped."""
+    behind = {"AAA": date(2026, 10, 15)}
+    client = FakeClient(bars={"AAA": week()}, inactive=[common("AAA")])
+
+    stale = FakeStore(assets=[common("AAA", status="active")], last=behind)
+    await backfill(FakeClient(bars={"AAA": week()}), stale, start=START, now=FRI_EVENING)
+    refreshed = FakeStore(assets=[common("AAA", status="active")], last=behind)
+    await backfill(client, refreshed, start=START, now=FRI_EVENING, refresh_assets=True)
+
+    assert stale.written_symbols == ["AAA"]  # the stored (stale) status still catches it up
+    assert refreshed.written_symbols == []  # inactive with bars: its history is complete
+    assert {a["symbol"]: a["status"] for a in refreshed.assets} == {"AAA": "inactive"}
+
+
+async def test_backfill_refresh_assets_with_explicit_symbols_refreshes_but_keeps_the_list():
+    store_ = FakeStore()
+    client = FakeClient(bars={"AAA": week(), "BBB": week()}, active=[common("AAA"), common("BBB")])
+
+    await backfill(
+        client, store_, start=START, now=FRI_EVENING, symbols=["AAA"], refresh_assets=True
+    )
+
+    assert client.asset_calls == ["active", "inactive"]
+    assert client.requested_symbols == ["AAA"]  # the caller's list still wins
+    assert {a["symbol"] for a in store_.assets} == {"AAA", "BBB"}
+
+
 # --- incremental update ----------------------------------------------------------------
 
 
@@ -827,6 +885,16 @@ def test_backfill_arguments_default_and_parse():
     assert given.start == date(2018, 2, 3) and given.symbols == ["AAPL", "MSFT"]
 
 
+def test_backfill_refresh_assets_flag_defaults_off_and_is_in_the_help(capsys):
+    parser = cli.build_parser()
+
+    assert parser.parse_args(["backfill"]).refresh_assets is False
+    assert parser.parse_args(["backfill", "--refresh-assets"]).refresh_assets is True
+    with pytest.raises(SystemExit):
+        cli.main(["backfill", "--help"])
+    assert "--refresh-assets" in capsys.readouterr().out
+
+
 def test_a_malformed_start_date_is_a_usage_error(capsys):
     with pytest.raises(SystemExit) as exit_:
         cli.main(["backfill", "--start", "yesterday"])
@@ -886,8 +954,17 @@ def test_backfill_command_wires_env_logging_client_and_the_real_store(monkeypatc
     assert rec.events == ["load_env", "setup_logging", "client", "backfill", "client_closed"]
     assert rec.kwargs["store"] is store
     assert rec.kwargs["start"] == date(2020, 1, 2) and rec.kwargs["symbols"] == ["AAA", "BBB"]
-    assert rec.kwargs["now"].tzinfo is not None
+    assert rec.kwargs["now"].tzinfo is not None and rec.kwargs["refresh_assets"] is False
     assert "3/3" in out.getvalue() and "42" in out.getvalue()
+
+
+def test_backfill_command_passes_refresh_assets_through(monkeypatch):
+    rec = _Recorder(monkeypatch, IngestResult(3, 3, 42, []))
+
+    with redirect_stdout(io.StringIO()):
+        cli.main(["backfill", "--refresh-assets"])
+
+    assert rec.kwargs["refresh_assets"] is True
 
 
 def test_update_command_wires_env_logging_client_and_the_real_store(monkeypatch):

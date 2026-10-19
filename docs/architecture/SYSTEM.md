@@ -10,8 +10,10 @@ with the actual delivered shape.
 > 1-minute signal path are **legacy**: the code is kept and still serves the
 > dashboard, but it is no longer the default recommendation path
 > ([ADR-0003](../adr/0003-rules-based-swing-engine.md)). All 30 GAP_AUDIT items
-> closed, all 10 §22 non-negotiables satisfied. 1,109 backend tests passing
-> (9 skipped: they need a local Postgres, a DeepSeek key or seeded data),
+> for the BLUEPRINT v2 alignment are closed. The swing engine is built to the
+> §22 non-negotiables; the legacy composite is known to fall short of "no fake
+> confidence" (see the §22 table below). 1,115 backend tests passing (9
+> skipped: they need a local Postgres, a DeepSeek key or seeded data),
 > dashboard typecheck clean.
 
 ## Swing engine (rules-based daily)
@@ -26,7 +28,7 @@ test before it is shown as Live (spec
    (timeframe=1Day, feed=sip, 15-min delay; every request ends >= 16 min ago)
                        │
                        ▼
-   swing_engine backfill (resumable)  /  update (nightly, split-aware)
+   swing_engine backfill (resumable; --refresh-assets re-fetches /v2/assets)  /  update (nightly, split-aware)
       · ends at TradingCalendar.last_completed_session (no partial bars)
       · adjustment=all  ─► bars(resolution='1d')      split/dividend adjusted
       · adjustment=raw  ─► bars(resolution='1d_raw')  as printed; price floor only
@@ -41,7 +43,9 @@ test before it is shown as Live (spec
       indicators      SMA/EMA/Wilder ATR/RSI per contiguous segment (gap > 10 sessions restarts)
       universe        point-in-time: bar today · raw close >= $10 · 50-bar median $ volume
                       >= $20M · >= 252 sessions in segment · operating-company stock
-      regime          SPY: uptrend / mixed / downtrend (SMA50 vs SMA200) + breadth
+      regime          SPY uptrend (close > SMA200 and SMA50 > SMA200) / downtrend
+                      (close < SMA200 and SMA50 < SMA200) / mixed (anything else)
+                      + breadth
       leaders / RS    close > SMA50 > SMA200, SMA200 rising, RS percentile >= 70,
                       within 25% of the 52-week high
       setups          breakout-v1 (leader within 2% of its 50-session closing high,
@@ -176,7 +180,7 @@ Background loops in the `signal-service` lifespan:
 | `apps/backtest-service` | event-driven simulator · walk-forward · cost sensitivity · bootstrap-CI Sharpe · deflated Sharpe |
 | `apps/execution-service` | paper + Alpaca brokers · `ExecutionEngine` · ladder `plan_exit` + chandelier trail · `run_monitor_once` (**opt-in**) |
 | `apps/signal-service` | FastAPI surface — routes / WS / lifespan loops / middleware · `/metrics` · `screener.py` · `providers.py` |
-| `apps/swing-engine` | **Primary path.** Rules-based daily swing engine (US common stocks, long-only, no order placement). **Data:** Alpaca SIP daily bars (`adjustment=all`, stored as `1d`) plus unadjusted raw bars (`1d_raw`, price floor only), resumable `backfill` and split-aware `update` (overlap check, full refetch when the adjustment moved) · **Assets:** active and delisted Alpaca assets classified into operating-company stock vs ETF / fund / SPAC / warrant / unit / right / preferred / OTC · **Calendar:** `/v2/calendar` sessions, half days, 16-minute SIP delay · **Panel + indicators:** wide `Panel`, strict per-segment SMA / EMA / Wilder ATR / RSI (a gap of more than 10 sessions restarts a symbol) · **Universe:** point-in-time price / dollar-volume / history / asset-kind screen · **Regime:** SPY uptrend / mixed / downtrend, plus breadth · **Leaders / RS:** weighted 63/126/189/252-session return percentile and the leader gate · **Setups:** `breakout-v1`, `pullback-v1` (versioned frozen params) · **Fill / exit model:** one `simulate_trade` used by scan, backtest and baseline (next-session buy-stop, no chase, gap-through stops, chandelier trail, time stop, `delisted` exit) · **Sizing:** fixed-fractional with position / count / open-risk caps and correlation overlap flags · **Scan:** look-ahead-free nightly scan, ranked ideas, watch-only in a downtrend · **Backtest:** trade list, stats, 100-seed random-entry baseline, capacity-limited portfolio sim vs SPY buy-and-hold · **Validation:** pre-registered in-sample grid, one-shot out-of-sample run, ship gate, Live / Research-only verdicts in `ml/validation/` · CLI `python -m swing_engine backfill\|update\|scan\|insample\|oos` · synthetic test helpers |
+| `apps/swing-engine` | **Primary path.** Rules-based daily swing engine (US common stocks, long-only, no order placement). **Data:** Alpaca SIP daily bars (`adjustment=all`, stored as `1d`) plus unadjusted raw bars (`1d_raw`, price floor only), resumable `backfill` (`--refresh-assets` picks up new listings and delistings; a stored asset list is otherwise reused) and split-aware `update` (overlap check, full refetch when the adjustment moved) · **Assets:** active and delisted Alpaca assets classified into operating-company stock vs ETF / fund / SPAC / warrant / unit / right / preferred / OTC · **Calendar:** `/v2/calendar` sessions, half days, 16-minute SIP delay · **Panel + indicators:** wide `Panel`, strict per-segment SMA / EMA / Wilder ATR / RSI (a gap of more than 10 sessions restarts a symbol) · **Universe:** point-in-time price / dollar-volume / history / asset-kind screen · **Regime:** SPY uptrend / mixed / downtrend, plus breadth · **Leaders / RS:** weighted 63/126/189/252-session return percentile and the leader gate · **Setups:** `breakout-v1`, `pullback-v1` (versioned frozen params) · **Fill / exit model:** one `simulate_trade` used by scan, backtest and baseline (next-session buy-stop, no chase, gap-through stops, chandelier trail, time stop, `delisted` exit) · **Sizing:** fixed-fractional with position / count / open-risk caps and correlation overlap flags · **Scan:** look-ahead-free nightly scan, ranked ideas, watch-only in a downtrend · **Backtest:** trade list, stats, 100-seed random-entry baseline, capacity-limited portfolio sim vs SPY buy-and-hold · **Validation:** pre-registered in-sample grid, one-shot out-of-sample run, ship gate, Live / Research-only verdicts in `ml/validation/` · CLI `python -m swing_engine backfill\|update\|scan\|insample\|oos` · synthetic test helpers |
 | `apps/web` | Next.js 14 dashboard — **8 pages**, WS-driven cache, lightweight-charts, full §11 surface |
 
 ## HTTP surface
@@ -198,7 +202,7 @@ GET    /v1/alerts              POST  DELETE   — rules CRUD
 GET    /v1/alerts/deliveries                  — delivery audit
 POST   /v1/execute                            — open/close (tier-gated)
 GET    /v1/orders                             — order history (per user)
-WS     /v1/stream                             — regime + signals push
+WS     /v1/stream                             — regime push (signals only with ATLAS_ENABLE_LEGACY_SIGNAL_STREAM=1)
 
 # Phase 2 — Screener (BLUEPRINT §13.2)
 GET    /v1/screener/universes                 — built-in universes + metadata
@@ -255,6 +259,10 @@ swing engine has no HTTP routes or dashboard pages yet (Phase 2).
 
 ## §22 non-negotiables status
 
+The rows describe the legacy composite as aligned to BLUEPRINT v2, with the
+swing engine noted where it differs. The audit behind ADR-0003 showed the
+composite does **not** meet "no fake confidence".
+
 | Rule | Status |
 |---|---|
 | No LLM-only trading signals | ✅ Tech + quant dominate the §8.2 composite |
@@ -264,7 +272,7 @@ swing engine has no HTTP routes or dashboard pages yet (Phase 2).
 | No alert without invalidation | ✅ §12.3 format includes invalidation |
 | No auto-execution by default | ✅ Monitor loop opt-in via `ATLAS_ENABLE_AUTO_EXECUTION=1` |
 | No enterprise architecture until real usage | ✅ docker-compose + single process |
-| No fake confidence | ✅ Swing engine: no probability or confidence figure anywhere, only measured per-setup statistics. Legacy composite: its `p_up` came from a leaky-label model (now refused, ADR-0003) |
+| No fake confidence | Swing engine: met. It shows no probability or confidence figure, only measured per-setup statistics. Legacy composite: **not met**. Its `p_up` and "confidence" came from a model trained on leaked labels (ADR-0003); that model is now refused and `s_quant` is null without a retrained one. |
 | No stale data pretending to be live | ✅ Stale-data veto + `/v1/data/freshness` |
 | No promise of profit | ✅ §10.4 `safety_repair` rewrites forbidden phrases |
 

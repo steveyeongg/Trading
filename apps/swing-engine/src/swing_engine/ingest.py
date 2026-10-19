@@ -171,22 +171,27 @@ def _tickers(symbols: Sequence[str]) -> list[str]:
 
 
 async def _universe(
-    client: BarSource, store: BarStore, symbols: Sequence[str] | None
+    client: BarSource, store: BarStore, symbols: Sequence[str] | None, *, refresh: bool = False
 ) -> tuple[list[str], dict[str, str]]:
     """The symbols to backfill, and the Alpaca status of each one the asset table knows.
 
-    The caller's list wins; otherwise the candidates come from the asset table, which is
-    refreshed from Alpaca first when it is empty. A symbol the table does not know has no
-    status and is treated as active.
+    The caller's list wins; otherwise the candidates come from the asset table. The table is
+    refreshed from Alpaca first when it is empty (and no explicit list was given) or when
+    ``refresh`` is true, which is how new listings and delistings are picked up: a stored
+    table is otherwise reused as it is. A symbol the table does not know has no status and
+    is treated as active.
     """
     if isinstance(symbols, str):
         raise TypeError("symbols must be a sequence of tickers, not a single string")
     stored = await store.load_assets()
-    if stored.empty:
+    if stored.empty and not refresh:
         if symbols is not None:
             return _tickers(symbols), {}
         rows = await refresh_assets(client, store)
         return candidate_symbols(rows), {r["symbol"]: r["status"] for r in rows}
+    if refresh:
+        await refresh_assets(client, store)
+        stored = await store.load_assets()
     status = {str(a): str(b) for a, b in zip(stored["symbol"], stored["status"], strict=True)}
     if symbols is not None:
         return _tickers(symbols), status
@@ -420,12 +425,16 @@ async def backfill(
     now: datetime,
     symbols: Sequence[str] | None = None,
     progress: Callable[[int, int], None] | None = None,
+    refresh_assets: bool = False,
 ) -> IngestResult:
     """Load daily bars from ``start`` through the last completed session; safe to re-run.
 
     ``symbols`` defaults to every candidate in the stored asset table (listed common stock,
     active and delisted, plus the reference ETF), refreshing that table first when it is
-    empty. Each symbol is handled by what is already stored for it:
+    empty. A re-run otherwise reuses the stored table, so it neither discovers new listings
+    nor notices delistings: ``refresh_assets=True`` re-fetches Alpaca's active and inactive
+    lists first (also when ``symbols`` is given, so their status is current). Each symbol
+    is handled by what is already stored for it:
 
     * no bars: fetched whole from ``start``;
     * bars, but the asset is inactive (delisted): skipped, its history is complete;
@@ -443,7 +452,7 @@ async def backfill(
     """
     cal = await _calendar(client, now, CALENDAR_LOOKBACK_DAYS)
     target = cal.last_completed_session(now)
-    wanted, status = await _universe(client, store, symbols)
+    wanted, status = await _universe(client, store, symbols, refresh=refresh_assets)
     last = await store.last_bar_dates()
 
     new: list[str] = []
@@ -519,7 +528,8 @@ async def incremental_update(
 
     Dividends adjust history by their yield, so a difference under the tolerance is accepted
     as the stored scale and the older rows drift from Alpaca's current figures by less than
-    that. New listings are not discovered here; they enter through :func:`backfill`.
+    that. New listings are not discovered here; they enter through :func:`backfill` with
+    ``refresh_assets=True`` (CLI: ``backfill --refresh-assets``).
 
     The symbols maintained here also get :func:`sync_raw` (from :data:`HISTORY_START` for a
     symbol with no raw bars yet), and its failures are merged into ``failed``.

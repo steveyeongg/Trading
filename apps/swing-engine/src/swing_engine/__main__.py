@@ -1,6 +1,7 @@
 """``python -m swing_engine <command>``: the swing engine's command line.
 
     uv run python -m swing_engine backfill [--start 2016-01-01] [--symbols AAPL,MSFT]
+    uv run python -m swing_engine backfill --refresh-assets
     uv run python -m swing_engine update
     uv run python -m swing_engine scan [--as-of 2026-10-16]
     uv run python -m swing_engine insample --family breakout [--hypothesis "..."]
@@ -10,10 +11,14 @@
 completed session. It is safe to interrupt and re-run, even a session later: a symbol with
 no bars is loaded in full, a symbol that is behind is caught up from its last stored bar, a
 delisted symbol that already has bars and a symbol already at the target are skipped, and
-failed chunks are retried. ``update`` appends the newest sessions to everything stored.
-Both replace the history of any symbol whose split/dividend adjustment moved. Both need
-``ALPACA_API_KEY`` and ``ALPACA_API_SECRET`` (a ``.env`` is loaded) and a migrated database,
-and both exit with status 1 when some symbols failed, so a re-run is needed.
+failed chunks are retried. The asset list is fetched from Alpaca once, on the first run; a
+re-run reuses the stored list, so new listings and delistings are picked up only with
+``--refresh-assets``, which re-fetches the active and inactive lists first (run it
+periodically, for example weekly). ``update`` appends the newest sessions to everything
+stored; it never discovers new listings. Both replace the history of any symbol whose
+split/dividend adjustment moved. Both need ``ALPACA_API_KEY`` and ``ALPACA_API_SECRET`` (a
+``.env`` is loaded) and a migrated database, and both exit with status 1 when some symbols
+failed, so a re-run is needed.
 
 ``scan`` reads the stored bars only (no Alpaca keys) and prints tonight's regime and the top
 ranked swing ideas for the latest SPY session, or for ``--as-of``. It exits with status 1 and a
@@ -103,7 +108,8 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Load SIP daily bars for every candidate stock, active and delisted, plus SPY. "
             "Only missing or outdated symbols are fetched, so an interrupted run can be "
-            "repeated, even on a later day."
+            "repeated, even on a later day. The asset list is fetched on the first run only; "
+            "pass --refresh-assets to pick up new listings and delistings."
         ),
     )
     bf.add_argument(
@@ -119,6 +125,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="A,B",
         help="only these tickers instead of the whole candidate universe",
+    )
+    bf.add_argument(
+        "--refresh-assets",
+        dest="refresh_assets",
+        action="store_true",
+        help=(
+            "re-fetch Alpaca's active and inactive asset lists first, so new listings and "
+            "delistings are picked up (otherwise the stored list is reused after the first run)"
+        ),
     )
 
     commands.add_parser(
@@ -196,6 +211,7 @@ async def _run_backfill(args: argparse.Namespace) -> IngestResult:
             now=datetime.now(UTC),
             symbols=args.symbols,
             progress=_log_progress,
+            refresh_assets=args.refresh_assets,
         )
 
 

@@ -23,9 +23,11 @@ uv run python -m atlas_shared.migrate up   # applies migrations 0001–0009
 
 # 4. Swing engine (primary path). Needs ALPACA_API_KEY + ALPACA_API_SECRET in .env
 #    (the free plan is enough: SIP daily bars, 15-min delay).
-uv run python -m swing_engine backfill     # FIRST RUN ONLY: loads 2016-01-01 -> last completed
-                                           # session for every stock + SPY. Resumable: if it
-                                           # exits 1 or is interrupted, run the same command again.
+uv run python -m swing_engine backfill     # first run: loads 2016-01-01 -> last completed session
+                                           # for every stock + SPY. Resumable: if it exits 1 or is
+                                           # interrupted, run the same command again. Later runs
+                                           # reuse the stored asset list; add --refresh-assets to
+                                           # pick up new listings and delistings.
 uv run python -m swing_engine scan         # tonight's regime + ranked ideas (stored bars only)
 
 # 5. Legacy composite: seed market + signals data (offline-clean, no API keys needed)
@@ -77,7 +79,7 @@ Then open the dashboard at <http://localhost:3000>:
 |---|---|---|
 | **Swing first load** | once, before anything else | `uv run python -m swing_engine backfill` (resumable: re-run until it exits 0) |
 | **Swing daily update** | every trading day after the close (allow 16+ minutes for the SIP delay, e.g. 17:00 ET) | `uv run python -m swing_engine update` |
-| Swing new-listing catch-up | weekly, optional | `uv run python -m swing_engine backfill` (refreshes the asset list, loads new listings, catches up any symbol more than 30 sessions behind; `update` does not discover new listings) |
+| Swing asset refresh + catch-up | weekly | `uv run python -m swing_engine backfill --refresh-assets` (re-fetches the active and inactive asset lists, loads new listings, flags delistings, and catches up any symbol more than 30 sessions behind; a plain `backfill` reuses the stored list and `update` never discovers new listings) |
 | **Swing scan** | right after the update succeeds | `uv run python -m swing_engine scan` (stored bars only; capture stdout) |
 | Bar backfill (REST, legacy 1m) | 1× daily off-hours | `uv run python -m ingest_equities backfill --symbols … --days 1` |
 | Macro snapshot (legacy) | every 1h | `uv run python -m macro_engine.refresh` |

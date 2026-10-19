@@ -58,8 +58,11 @@ from the default path (code kept). Decision and evidence:
   latest report passed **and** the sealed pre-registration sha matches the one
   recorded in that report. No reports are committed yet, so every idea is
   UNPROVEN.
-- **CLI.** `uv run python -m swing_engine backfill | update | scan | insample
-  --family breakout | oos --family breakout --version breakout-v1`.
+- **CLI.** `uv run python -m swing_engine backfill [--refresh-assets] | update |
+  scan | insample --family breakout | oos --family breakout --version
+  breakout-v1`. The asset list is fetched on the first backfill and reused after
+  that; `backfill --refresh-assets` re-fetches the active and inactive lists to
+  pick up new listings and delistings (`update` never discovers listings).
 
 ### Legacy composite: guarded, not deleted
 
@@ -90,7 +93,7 @@ from the default path (code kept). Decision and evidence:
 
 ### Tests
 
-- Backend suite **1,109 passed, 9 skipped** (they need a local Postgres, a
+- Backend suite **1,115 passed, 9 skipped** (they need a local Postgres, a
   DeepSeek key or seeded data; the suite runs with no Postgres or Redis). Regression tests cover split-after-backfill
   splicing, delisting while a trade is open, a symbol missing the scan day,
   ticker reuse across a >10-session gap, gap-up and gap-down fills, scan

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-ATLAS: a stock screener and trading signal engine. It is a Python `uv` workspace (17 packages under `apps/` plus `packages/shared-py`, 18 workspace members) and a Next.js 14 dashboard in `apps/web`. **The primary path is the rules-based daily swing engine, `apps/swing-engine`** (ADR-0003). The 8-engine composite, the ML trend model and the 1-minute signal path are **legacy**: kept, still behind the dashboard, but not the default way to get a trade idea. `AGENTS.md` holds the original product brief, and `docs/architecture/BLUEPRINT.md` is the design target. The delivered system **deliberately deviates** from both, and `docs/adr/0001`, `0002` and `0003` explain why: pure Python, no Rust/Go, no Kafka/ClickHouse/Qdrant/K8s, no multi-agent LangGraph, and a validation-gated swing engine in place of the composite. Don't scaffold those pieces without the profiling evidence the ADRs require. `docs/architecture/SYSTEM.md` is the map of what actually exists, including a deferral ledger. The swing design is in `docs/superpowers/specs/2026-10-18-atlas-swing-rebuild-design.md` (plans beside it in `docs/superpowers/plans/`).
+ATLAS: a stock screener and trading signal engine. It is a Python `uv` workspace (17 packages under `apps/` plus `packages/shared-py`, 18 workspace members) and a Next.js 14 dashboard in `apps/web`. **The primary path is the rules-based daily swing engine, `apps/swing-engine`** (ADR-0003). The 8-engine composite, the ML trend model and the 1-minute signal path are **legacy**: kept, still behind the dashboard, but not the default way to get a trade idea. `AGENTS.md` (when present in your checkout) holds the original product brief, and `docs/architecture/BLUEPRINT.md` is the design target. The delivered system **deliberately deviates** from both, and `docs/adr/0001`, `0002` and `0003` explain why: pure Python, no Rust/Go, no Kafka/ClickHouse/Qdrant/K8s, no multi-agent LangGraph, and a validation-gated swing engine in place of the composite. Don't scaffold those pieces without the profiling evidence the ADRs require. `docs/architecture/SYSTEM.md` is the map of what actually exists, including a deferral ledger. The swing design is in `docs/superpowers/specs/2026-10-18-atlas-swing-rebuild-design.md` (plans beside it in `docs/superpowers/plans/`).
 
 Code comments and docs cite BLUEPRINT sections as `§N.N` (for example `§8.5` confirmation gate, `§10.3` explanation JSON, `§22` non-negotiables). Look the section up in BLUEPRINT.md when you need the intent behind a rule.
 
@@ -24,6 +24,7 @@ uv run python -m atlas_shared.migrate up                  # also: `status`
 
 # Swing engine (primary path). Run from the repo root; backfill/update need ALPACA_API_KEY + ALPACA_API_SECRET
 uv run python -m swing_engine backfill          # first run, resumable (SIP daily bars from 2016, active + delisted)
+uv run python -m swing_engine backfill --refresh-assets  # periodic: re-fetch /v2/assets for new listings + delistings
 uv run python -m swing_engine update            # nightly after the close; refetches a symbol whose adjustment moved
 uv run python -m swing_engine scan [--as-of D]  # stored bars only: regime + ranked ideas
 uv run python -m swing_engine insample --family breakout                       # grid on 2016-2022, drafts the prereg
@@ -79,14 +80,14 @@ bars → `feature_engine.compute_features` (50 indicators) → `quant_engine.Tre
 ## Conventions and invariants
 
 - **Fail-soft everywhere.** Every external provider key is optional. Each one has a documented fallback chain: bars go Polygon → Alpaca → yfinance → synthetic GBM, FRED falls back to synthetic on *any* error, and DeepSeek falls back to the template. New integrations must degrade instead of raising, and must register in `signal_service/providers.py` (`/v1/providers/status`). `test_pipeline_runs_with_no_provider_keys` pins this behaviour.
-- **`.env` loading is an entrypoint concern.** `atlas_shared.load_env()` copies `.env` into `os.environ` and is called only from the lifespan and the CLI `main`s, never at import time. A real `.env` sits at the repo root, and tests depend on a clean environment to exercise the "no key" paths. `tests/conftest.py` snapshots and restores `os.environ` around every test.
+- **`.env` loading is an entrypoint concern.** `atlas_shared.load_env()` copies `.env` into `os.environ` and is called only from the lifespan and the CLI `main`s, never at import time. A real `.env` sits at the repo root, and tests depend on a clean environment to exercise the "no key" paths, so keep tests from leaking `os.environ` changes (use `monkeypatch`).
 - **Some env vars are read at import time** (`pipeline._MAX_BAR_AGE_HOURS`, `main._AUTO_EXEC_ENABLED`, `state._DEFAULT_PATH`, `stream._LEGACY_SIGNAL_STREAM`). Setting the env var inside a test won't affect them, so patch the module attribute instead.
 - **LLM output never drives the signal.** The explanation engine only narrates. All LLM text goes through `safety_repair` (§10.4), which rewrites promises of profit, and the alert format must always include invalidation and a disclaimer.
 - Postgres `NUMERIC` columns come back as `Decimal`. Pass route responses through `atlas_shared.to_jsonable`, or the dashboard receives strings and breaks.
 - Alert-channel error messages must go through `alert_service.channels.base.redact_secrets` before they're logged or persisted. The Telegram bot token appears in httpx error URLs.
 - Each `python -m <pkg>` needs a `__main__.py`. `tests/test_cli_entrypoints.py` checks every command referenced in README.md and OPERATIONS.md.
 - **Docs drift tests** (`tests/test_docs.py`): SYSTEM.md must have an `` `apps/<name>` `` row for every app package, and relative links in README.md, SYSTEM.md and docs/README.md must resolve. Update these docs when you add a package or move a file. CHANGELOG.md is newest-first with `## X.Y.Z` headings.
-- Bug fixes come with a regression test that explains the incident in its module docstring (see `tests/test_rule_symbol_wildcard.py`, `tests/test_alpaca_ingest.py`).
+- Bug fixes come with a regression test that explains the incident in its module docstring (see `tests/test_quant_label_leak.py`, `tests/test_swing_ingest.py`).
 - Ruff: line length 100, py312. `N806` is allowed in the quant/macro engines (`X`/`Xtr` matrices) and `B008` in signal-service (FastAPI `Depends`/`Query` defaults).
 
 ## Gitignore gotchas

@@ -1,6 +1,6 @@
 # ATLAS
 
-**Adaptive Trading Logic & Allocation System** — a low-cost, multi-asset, AI-augmented stock screener + trading signal engine. Built to the spec in [`docs/architecture/BLUEPRINT.md`](docs/architecture/BLUEPRINT.md).
+**Adaptive Trading Logic & Allocation System** — a rules-based daily swing-trading engine for US stocks: after each close it lists next-session buy-stop ideas (trigger, stop, share count) and says plainly which setups have passed out-of-sample testing ([ADR-0003](docs/adr/0003-rules-based-swing-engine.md)). The original multi-asset, AI-augmented composite signal engine, built to the spec in [`docs/architecture/BLUEPRINT.md`](docs/architecture/BLUEPRINT.md), is kept as a **legacy** path behind the dashboard.
 
 **Docs map:** [docs/](docs/README.md) — start with [`architecture/SYSTEM.md`](docs/architecture/SYSTEM.md) for the delivered shape, [`architecture/BLUEPRINT.md`](docs/architecture/BLUEPRINT.md) for the design target, [`architecture/GAP_AUDIT.md`](docs/architecture/GAP_AUDIT.md) for the closed punch list, [`runbooks/OPERATIONS.md`](docs/runbooks/OPERATIONS.md) to run it, and [`CHANGELOG.md`](CHANGELOG.md) for the build log. ADRs in [`docs/adr/`](docs/adr/), most recently [ADR-0003: the rules-based swing engine](docs/adr/0003-rules-based-swing-engine.md). Design specs and implementation plans: [`docs/superpowers/specs/`](docs/superpowers/specs/) and [`docs/superpowers/plans/`](docs/superpowers/plans/).
 
@@ -30,11 +30,14 @@ monitor → journal → portfolio + VaR → Prometheus / Grafana. Its ML trend m
 was trained on leaked labels and is refused unless retrained; its 1-minute
 signal recompute is off by default (see [Legacy switches](#legacy-composite-switches)).
 
-**1,109 backend tests passing** (9 skipped: they need a local Postgres, a DeepSeek key or seeded data), dashboard
-typecheck clean. **All 30 GAP_AUDIT items closed; all 10 §22 non-negotiables
-satisfied.** See [`docs/architecture/SYSTEM.md`](docs/architecture/SYSTEM.md)
-for the full map and the **deferral ledger** (what's deliberately *not* built
-and when to revisit each).
+**1,115 backend tests passing** (9 skipped: they need a local Postgres, a DeepSeek
+key or seeded data), dashboard typecheck clean. All 30 GAP_AUDIT items for the
+BLUEPRINT v2 alignment are closed. The swing engine is built to the BLUEPRINT
+§22 non-negotiables; the legacy composite is known to fall short of "no fake
+confidence" (its `p_up` came from a leaky-label model, see ADR-0003). See
+[`docs/architecture/SYSTEM.md`](docs/architecture/SYSTEM.md) for the full map
+and the **deferral ledger** (what's deliberately *not* built and when to
+revisit each).
 
 ## Swing engine (rules-based daily)
 
@@ -43,7 +46,7 @@ step 5, which includes `0009_swing_assets`) and, for the two data jobs,
 `ALPACA_API_KEY` and `ALPACA_API_SECRET` in `.env`.
 
 ```bash
-uv run python -m swing_engine backfill                       # first run: load history
+uv run python -m swing_engine backfill                       # first run: load history (later: add --refresh-assets for new listings)
 uv run python -m swing_engine update                         # then nightly after the close
 uv run python -m swing_engine scan                           # tonight's regime + ranked ideas
 uv run python -m swing_engine insample --family breakout     # tune in-sample, draft the pre-registration
@@ -52,9 +55,9 @@ uv run python -m swing_engine oos --family breakout --version breakout-v1   # th
 
 | Command | What it does |
 |---|---|
-| `backfill` | Loads SIP daily bars from 2016-01-01 (`--start`, or `--symbols A,B` for a few tickers) for every active **and delisted** common stock plus SPY, up to the last completed session. Resumable: re-run it after an interruption, even a day later, and it fetches only what is missing. Exits 1 if some symbols failed. |
-| `update` | Appends the newest sessions to everything stored. If a split or dividend rewrote a symbol's adjusted history, it detects that on the overlap day and refetches that symbol in full instead of splicing two price scales. New listings and symbols more than 30 sessions behind are picked up by re-running `backfill`. Exits 1 if some symbols failed. |
-| `scan` | Reads the stored bars (no Alpaca keys needed) and prints the SPY regime, breadth, the position and risk budget, and the top 20 ideas for the next session: buy-above price, stop, shares, dollars at risk, relative-strength rank and flags. Shares are sized on the default account (`RiskSettings`: $25,000, 1% risk per trade, 20% max position, 8 positions, 6% open risk); there are no position records or settings UI until Phase 2, so the book shown is empty. `--as-of YYYY-MM-DD` replays an earlier session. In a downtrend, ideas are listed as watch-only at zero shares. |
+| `backfill` | Loads SIP daily bars from 2016-01-01 (`--start`, or `--symbols A,B` for a few tickers) for every active **and delisted** common stock plus SPY, up to the last completed session. The asset list is fetched from Alpaca on the first run only, and later runs reuse the stored list, so add `--refresh-assets` (for example weekly) to re-fetch the active and inactive lists first and pick up new listings and delistings. Resumable: re-run it after an interruption, even a day later, and it fetches only what is missing. Exits 1 if some symbols failed. |
+| `update` | Appends the newest sessions to everything stored. If a split or dividend rewrote a symbol's adjusted history, it detects that on the overlap day and refetches that symbol in full instead of splicing two price scales. It never discovers new listings (`backfill --refresh-assets` does), and symbols more than 30 sessions behind are left to `backfill`. Exits 1 if some symbols failed. |
+| `scan` | Reads the stored bars (no Alpaca keys needed) and prints the SPY regime, breadth, the position and risk budget, and the top 20 ideas for the next session: buy-above price, stop, shares, dollars at risk, relative-strength percentile (RS, 0-100) and flags. Shares are sized on the default account (`RiskSettings`: $25,000, 1% risk per trade, 20% max position, 8 positions, 6% open risk); there are no position records or settings UI until Phase 2, so the book shown is empty. `--as-of YYYY-MM-DD` replays an earlier session. In a downtrend, ideas are listed as watch-only at zero shares. |
 | `insample --family breakout` | Runs the setup family's declared parameter grid on 2016-2022 only, picks the variant with the highest expectancy among those with 100+ trades, and writes a **draft** pre-registration to `ml/validation/breakout/breakout-v1.prereg.json`. Review it and commit it. A revision (v2, v3) needs `--hypothesis "..."`. `--family pullback` works the same way. |
 | `oos --family breakout --version breakout-v1` | Runs that version's out-of-sample test (2023 onward) once. It refuses to start unless the pre-registration is committed and unchanged and the family's budget of 3 runs is not spent. It writes `ml/validation/breakout/breakout-v1.report.json` and prints **PASSED, now Live** or **FAILED, stays Research only**. Commit the report. |
 
@@ -115,14 +118,17 @@ uv run python -m news_ingest.refresh --source newsapi --hours 48
 
 # 8. (legacy composite only) Train the trend model, else `s_quant` is null.
 #    Labels are per-symbol now; the old v0/v1 files were trained on leaked labels
-#    and are refused. To use this one, set ATLAS_TREND_MODEL=ml/registry/trend/v2.joblib.
+#    and are refused. Optional: step 10 loads this one if you prefix it with
+#    ATLAS_TREND_MODEL=ml/registry/trend/v2.joblib.
 uv run python -m quant_engine.train --symbols AAPL,MSFT,NVDA,TSLA,SPY,QQQ,IONQ,QBTS,NOW,TSM,MRVL --version v2
 
 # 9. Seed portfolio + journal so the dashboard pages aren't empty
 uv run python -m portfolio_service.seed
 uv run python -m journal_service.seed --n-bars 4000
 
-# 10. Run the API (Terminal 1)
+# 10. Run the API (Terminal 1). ATLAS_TREND_MODEL is optional: without a retrained model
+#     (step 8) the legacy `s_quant` stays null. To load it, prefix the command with
+#     ATLAS_TREND_MODEL=ml/registry/trend/v2.joblib
 uv run --package signal-service uvicorn signal_service.main:app --reload     # :8000
 
 # 11. Run the dashboard (Terminal 2)
@@ -250,7 +256,7 @@ atlas/  (named "Trading" on disk for historical reasons)
 │   └── observability/         # Prometheus + Grafana + dashboard JSON + alerts
 ├── ml/                        # registry (legacy models), validation (swing pre-registrations + reports), notebooks, experiments
 ├── docs/                      # SYSTEM.md, BLUEPRINT.md, GAP_AUDIT.md, ADRs, runbooks
-└── tests/                     # cross-package (1,109 passing, 9 skipped)
+└── tests/                     # cross-package (1,115 passing, 9 skipped)
 ```
 
 ## What's next
