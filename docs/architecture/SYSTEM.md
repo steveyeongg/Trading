@@ -37,7 +37,8 @@ test before it is shown as Live (spec
                        │
                        ▼
    swing_engine scan   (reads stored bars only; no Alpaca keys)
-      store.liquid_prefilter ─► build_panel (wide Panel, cut at the scan session)
+      store.liquid_prefilter (at the universe's $ volume floor)
+          ─► build_panel (wide Panel on SPY's sessions, cut at the scan session)
           │
           ▼  every step below is a pure function of that truncated Panel
       indicators      SMA/EMA/Wilder ATR/RSI per contiguous segment (gap > 10 sessions restarts)
@@ -65,13 +66,20 @@ test before it is shown as Live (spec
    from a setup with no passing out-of-sample report
 
    swing_engine insample / oos   (the gate between "hypothesis" and "Live")
+      load_validation_data ─► only the panel's columns, 500 symbols per batch
       backtest.trades ─► the SAME fill/exit model as the scan
-      backtest.stats / baseline (100-seed random entry) / portfolio (capacity-limited sim + SPY)
+      backtest.stats (n and n_distinct) / baseline (100-seed random entry)
+          / portfolio (capacity-limited sim + SPY)
       validation.protocol ─► IS 2016-2022 grid · OOS 2023+ once per version
                              · budget 3 OOS runs per family · ship gate
-      validation.prereg   ─► committed, sha256-sealed pre-registration
-      ml/validation/<family>/<version>.{insample,prereg,report}.json   (committed)
+                             (trade floor on distinct trades) · protocol block
+      validation.prereg   ─► committed, sha256-sealed pre-registration: params,
+                             gate, windows AND the protocol block (leader, universe,
+                             execution, risk, regime factor, grid); no identical revisions
+      ml/validation/<family>/<version>.{insample,prereg,report}.json   (committed;
+                             the report records code_commit / code_dirty)
       Live = latest report passed AND the sealed prereg sha matches the report's
+             AND its protocol block equals the current config
 ```
 
 Phase 1 (this release) ships the engine, the CLI and the validation harness.

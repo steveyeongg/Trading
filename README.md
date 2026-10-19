@@ -58,16 +58,29 @@ uv run python -m swing_engine oos --family breakout --version breakout-v1   # th
 | `backfill` | Loads SIP daily bars from 2016-01-01 (`--start`, or `--symbols A,B` for a few tickers) for every active **and delisted** common stock plus SPY, up to the last completed session. The asset list is fetched from Alpaca on the first run only, and later runs reuse the stored list, so add `--refresh-assets` (for example weekly) to re-fetch the active and inactive lists first and pick up new listings and delistings. Resumable: re-run it after an interruption, even a day later, and it fetches only what is missing. Exits 1 if some symbols failed. |
 | `update` | Appends the newest sessions to everything stored. If a split or dividend rewrote a symbol's adjusted history, it detects that on the overlap day and refetches that symbol in full instead of splicing two price scales. It never discovers new listings (`backfill --refresh-assets` does), and symbols more than 30 sessions behind are left to `backfill`. Exits 1 if some symbols failed. |
 | `scan` | Reads the stored bars (no Alpaca keys needed) and prints the SPY regime, breadth, the position and risk budget, and the top 20 ideas for the next session: buy-above price, stop, shares, dollars at risk, relative-strength percentile (RS, 0-100) and flags. Shares are sized on the default account (`RiskSettings`: $25,000, 1% risk per trade, 20% max position, 8 positions, 6% open risk); there are no position records or settings UI until Phase 2, so the book shown is empty. `--as-of YYYY-MM-DD` replays an earlier session. In a downtrend, ideas are listed as watch-only at zero shares. |
-| `insample --family breakout` | Runs the setup family's declared parameter grid on 2016-2022 only, picks the variant with the highest expectancy among those with 100+ trades, and writes a **draft** pre-registration to `ml/validation/breakout/breakout-v1.prereg.json`. Review it and commit it. A revision (v2, v3) needs `--hypothesis "..."`. `--family pullback` works the same way. |
-| `oos --family breakout --version breakout-v1` | Runs that version's out-of-sample test (2023 onward) once. It refuses to start unless the pre-registration is committed and unchanged and the family's budget of 3 runs is not spent. It writes `ml/validation/breakout/breakout-v1.report.json` and prints **PASSED, now Live** or **FAILED, stays Research only**. Commit the report. |
+| `insample --family breakout` | Runs the setup family's declared parameter grid on 2016-2022 only, picks the variant with the highest expectancy among those with 100+ trades, and writes a **draft** pre-registration to `ml/validation/breakout/breakout-v1.prereg.json`. The draft seals the chosen parameters **and the rules around them** (leader gate, universe filter, fill model, the gate portfolio's risk settings, regime size factors, the declared grid). The printout and `breakout-v1.insample.json` also show what to review first: the data fingerprint, delisted coverage, the median eligible universe, distinct trades per variant and the chosen variant's year-by-year results. Review the draft and commit it. A revision (v2, v3) needs `--hypothesis "..."` and must change the parameters or the rules: one identical to an earlier version is refused. `--family pullback` works the same way. |
+| `oos --family breakout --version breakout-v1` | Runs that version's out-of-sample test (2023 onward) once. It refuses to start unless the pre-registration is committed and unchanged, its sealed rules are the code's rules now, it is not a repeat of an earlier version, the last stored session is fully loaded, and the family's budget of 3 runs is not spent. It writes `ml/validation/breakout/breakout-v1.report.json` (with the code commit it ran on) and prints **PASSED, now Live** or **FAILED, stays Research only**. Commit the report. |
 
 **Live means validated.** A setup is Live only if its latest report passed the
 ship gate (out-of-sample expectancy above 0R, profit factor at least 1.2, 100+
-trades, better than random entries, drawdown no worse than SPY) **and** its
-pre-registration is still the sealed file that run used (the report records
-the file's sha256). Everything else is scanned too but every idea carries an
-`UNPROVEN` flag. With nothing under `ml/validation/` yet, all ideas are
-UNPROVEN. Scan output is a research list, not advice or a prediction.
+**distinct** trades, better than random entries, drawdown no worse than SPY),
+its pre-registration is still the sealed file that run used (the report records
+the file's sha256), **and** the rules that file sealed are still the code's
+rules (edit the leader gate, universe, fills, risk settings, regime factors or
+grid in `config.py` and the family drops to Research only: "rules changed since
+its run"). Everything else is scanned too but every idea carries an `UNPROVEN`
+flag. With nothing under `ml/validation/` yet, all ideas are UNPROVEN. Scan
+output is a research list, not advice or a prediction.
+
+How the gate counts: expectancy and profit factor use every triggered idea, the
+same basis as the forward record, but a stock that sits near its high triggers
+a breakout every day, so the 100-trade floor counts only **distinct** trades
+(entered while no earlier trade on that symbol was still open). The regime
+filter stays a gate unless the out-of-sample run shows strong evidence it hurt
+(30+ downtrend trades, a higher Sharpe without it, and the ungated version
+passing the full gate). The combined portfolio in a report includes the other
+family only after that family's own out-of-sample run, with its registered
+parameters.
 
 **Data notes**
 
@@ -81,6 +94,10 @@ UNPROVEN. Scan output is a research list, not advice or a prediction.
   universe is point-in-time across splits: an adjusted history would show a
   stock that later split as trading under $10 in years it did not. Everything
   else (dollar volume, indicators, fills) uses adjusted prices.
+- A stopped database, a schema without migration `0009`, or a dropped network
+  ends any command with the error and a one-line `hint:` saying what to run.
+  Network failures and timeouts are retried; a chunk Alpaca rejects because of
+  one bad symbol is split until only that symbol fails.
 - Phase 1 is CLI only. The nightly job, forward tracking, positions, dashboard
   pages and Telegram digest are Phase 2
   ([plan](docs/superpowers/plans/2026-10-18-swing-engine-phase2.md)); the

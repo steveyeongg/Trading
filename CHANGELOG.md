@@ -63,6 +63,29 @@ from the default path (code kept). Decision and evidence:
   breakout-v1`. The asset list is fetched on the first backfill and reused after
   that; `backfill --refresh-assets` re-fetches the active and inactive lists to
   pick up new listings and delistings (`update` never discovers listings).
+- **Final review fixes (validation).** The 100-trade floor counts **distinct**
+  trades (`n_distinct`: entered while no earlier trade on the symbol was open),
+  since a stock near its high re-triggers daily; expectancy and profit factor
+  still use every idea, and reports carry both. The pre-registration seals a
+  `protocol` block (leader gate, universe filter, fill model, gate-portfolio
+  risk settings, regime factors, grid); `oos` refuses a missing or different
+  block and Live also requires it to equal the current config ("rules changed
+  since its run"). Reports record `code_commit` / `code_dirty`. The regime
+  filter turns into a warning only on strong evidence (30+ downtrend trades, a
+  higher ungated Sharpe, and the ungated version passing the full gate). The
+  combined portfolio includes the other family only after its own report, with
+  its registered parameters. A revision identical to an earlier version is
+  refused. The in-sample record adds coverage, fingerprint, the median eligible
+  universe, distinct trades per variant and the chosen variant by year. The
+  deflated Sharpe uses the returns' sample skew and kurtosis. The freeze
+  refuses a half-loaded last session.
+- **Final review fixes (data and CLI).** The validation loader reads only the
+  panel's columns in batches of 500 symbols. Network errors and timeouts are
+  retried, and a chunk Alpaca rejects for one bad symbol is split until only
+  that symbol fails. `NYSEARCA` counts as a listed exchange and exchange test
+  issues (ZVZZT and friends) are excluded. Panels keep only SPY's sessions. The
+  prefilters use `UniverseFilter`'s dollar-volume floor. Database, migration and
+  network errors end with a one-line `hint:` instead of a traceback.
 
 ### Legacy composite: guarded, not deleted
 
@@ -93,11 +116,14 @@ from the default path (code kept). Decision and evidence:
 
 ### Tests
 
-- Backend suite **1,115 passed, 9 skipped** (they need a local Postgres, a
+- Backend suite **1,181 passed, 10 skipped** (they need a local Postgres, a
   DeepSeek key or seeded data; the suite runs with no Postgres or Redis). Regression tests cover split-after-backfill
   splicing, delisting while a trade is open, a symbol missing the scan day,
   ticker reuse across a >10-session gap, gap-up and gap-down fills, scan
-  look-ahead, the pre-registration seal and the out-of-sample budget.
+  look-ahead, the pre-registration seal and the out-of-sample budget, and, from
+  the final review, overlapping re-triggers, sealed rules, identical revisions,
+  the regime-filter verdict, the combined portfolio's window, a half-loaded
+  freeze, batched loading, rejected-chunk splitting and the CLI hints.
 
 ## 0.23.0 — Phase 5 + 6: provider status, data freshness, §12.2 events, §12.3 Telegram, exec opt-in, dashboard polish
 

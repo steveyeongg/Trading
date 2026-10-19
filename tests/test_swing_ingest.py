@@ -19,8 +19,10 @@ from contextlib import redirect_stdout
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 
+import httpx
 import pandas as pd
 import pytest
+import sqlalchemy.exc
 import swing_engine.__main__ as cli
 from swing_engine import ingest, store
 from swing_engine.calendar import Session
@@ -1046,6 +1048,94 @@ def test_a_run_with_failed_symbols_exits_nonzero_and_names_them(monkeypatch):
 
     assert exit_.value.code == 1
     assert "BBB" in out.getvalue() and "CCC" in out.getvalue()
+
+
+def _offline() -> AlpacaError:
+    exc = AlpacaError("network error on /v2/stocks/bars: ConnectError: nodename nor servname")
+    exc.__cause__ = httpx.ConnectError("nodename nor servname provided")
+    return exc
+
+
+DB_HINT = (
+    "is the database running? start it with "
+    "`docker compose -f infra/docker/docker-compose.yml up -d` and check POSTGRES_DSN"
+)
+MIGRATE_HINT = (
+    "the database schema is missing or behind: run `uv run python -m atlas_shared.migrate up`"
+)
+NETWORK_HINT = "could not reach Alpaca: check the network and re-run (the job resumes)"
+ENVIRONMENT_ERRORS = [
+    pytest.param(
+        OSError("Multiple exceptions: [Errno 61] Connect call failed ('127.0.0.1', 5432)"),
+        DB_HINT,
+        id="db-down",
+    ),
+    pytest.param(
+        sqlalchemy.exc.OperationalError("SELECT 1", {}, ConnectionRefusedError(61, "refused")),
+        DB_HINT,
+        id="db-refused",
+    ),
+    pytest.param(
+        sqlalchemy.exc.ProgrammingError(
+            "SELECT symbol FROM assets", {}, Exception('relation "assets" does not exist')
+        ),
+        MIGRATE_HINT,
+        id="not-migrated",
+    ),
+    pytest.param(_offline(), NETWORK_HINT, id="offline"),
+]
+COMMANDS = [
+    pytest.param(["backfill"], "_run_backfill", id="backfill"),
+    pytest.param(["update"], "_run_update", id="update"),
+    pytest.param(["scan"], "_load_scan_inputs", id="scan"),
+    pytest.param(["insample", "--family", "breakout"], "run_insample", id="insample"),
+    pytest.param(["oos", "--family", "breakout", "--version", "breakout-v1"], "run_oos", id="oos"),
+]
+
+
+def _failing(monkeypatch: pytest.MonkeyPatch, target: str, error: BaseException) -> None:
+    monkeypatch.setattr(cli, "load_env", lambda: None)
+    monkeypatch.setattr(cli, "setup_logging", lambda: None)
+
+    async def async_boom(*args: Any, **kwargs: Any) -> Any:
+        raise error
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise error
+
+    monkeypatch.setattr(cli, target, boom if target.startswith("run_") else async_boom)
+
+
+@pytest.mark.parametrize(("error", "hint"), ENVIRONMENT_ERRORS)
+@pytest.mark.parametrize(("argv", "target"), COMMANDS)
+def test_environment_errors_end_with_a_one_line_hint_instead_of_a_traceback(
+    monkeypatch, argv, target, error, hint
+):
+    """The incident: a stopped database, an unmigrated schema or a dropped network surfaced as a
+    long traceback from deep inside SQLAlchemy or httpx, with nothing saying what to do."""
+    _failing(monkeypatch, target, error)
+    with pytest.raises(SystemExit) as exit_:
+        cli.main(argv)
+    lines = str(exit_.value.code).splitlines()
+    assert len(lines) == 2 and lines[0].startswith("error: ") and lines[1] == f"hint: {hint}"
+    assert "[SQL:" not in lines[0]  # only the first line of a SQLAlchemy message
+
+
+@pytest.mark.parametrize(
+    "error",
+    [RuntimeError("a bug"), PermissionError(13, "Permission denied", "ml/validation/x.json")],
+)
+def test_other_errors_are_not_dressed_up_as_environment_problems(monkeypatch, error):
+    _failing(monkeypatch, "run_insample", error)
+    with pytest.raises(type(error)):
+        cli.main(["insample", "--family", "breakout"])
+
+
+def test_an_alpaca_error_without_a_network_cause_has_no_hint(monkeypatch):
+    _failing(monkeypatch, "_run_update", AlpacaError("alpaca 403 from /v2/stocks/bars: no"))
+    with pytest.raises(SystemExit) as exit_:
+        cli.main(["update"])
+    assert exit_.value.code == "error: alpaca 403 from /v2/stocks/bars: no"
 
 
 def test_missing_credentials_are_reported_without_a_traceback(monkeypatch):

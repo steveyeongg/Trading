@@ -20,6 +20,9 @@ split/dividend adjustment moved. Both need ``ALPACA_API_KEY`` and ``ALPACA_API_S
 ``.env`` is loaded) and a migrated database, and both exit with status 1 when some symbols
 failed, so a re-run is needed.
 
+A stopped database, an unmigrated schema or a dropped network ends any command with the error's
+first line and a one-line hint (``environment_hint``) instead of a traceback.
+
 ``scan`` reads the stored bars only (no Alpaca keys) and prints tonight's regime and the top
 ranked swing ideas for the latest SPY session, or for ``--as-of``. It exits with status 1 and a
 message when there is no data or SPY has no bar on that date. It ranks by relative strength
@@ -46,7 +49,9 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pandas as pd
+import sqlalchemy.exc
 from atlas_shared.config import load_env
 from atlas_shared.logging import get_logger, setup_logging
 
@@ -500,10 +505,51 @@ def _validation_report(args: argparse.Namespace) -> str:
         raise SystemExit(f"error: {exc}") from exc
 
 
-def main(argv: Sequence[str] | None = None) -> None:
-    args = build_parser().parse_args(argv)
-    load_env()  # so AlpacaData sees the keys from .env
-    setup_logging()
+_DB_HINT = (
+    "is the database running? start it with "
+    "`docker compose -f infra/docker/docker-compose.yml up -d` and check POSTGRES_DSN"
+)
+_MIGRATE_HINT = (
+    "the database schema is missing or behind: run `uv run python -m atlas_shared.migrate up`"
+)
+_NETWORK_HINT = "could not reach Alpaca: check the network and re-run (the job resumes)"
+
+
+def _from_database(exc: BaseException) -> bool:
+    module = type(exc).__module__.split(".", 1)[0]
+    return isinstance(exc, sqlalchemy.exc.DBAPIError) or module == "asyncpg"
+
+
+def environment_hint(exc: BaseException) -> str | None:
+    """What to do about an error that is the environment's, not the code's, or None.
+
+    The exception and its causes are checked in turn: a network failure (httpx, also when
+    wrapped by the Alpaca client), a missing table (the migrations were not applied), and a
+    database that cannot be reached (a driver error, or an ``OSError`` that names no file, which
+    is how a refused connection arrives). Anything else gets no hint.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        text = str(current)
+        if isinstance(current, httpx.TransportError):
+            return _NETWORK_HINT
+        if _from_database(current) and 'relation "' in text and "does not exist" in text:
+            return _MIGRATE_HINT
+        if _from_database(current) or (isinstance(current, OSError) and current.filename is None):
+            return _DB_HINT
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _failure(exc: BaseException, hint: str | None) -> str:
+    """``error: <the first line of exc>``, plus ``hint: ...`` on a second line when there is one."""
+    first = (str(exc).strip().splitlines() or [type(exc).__name__])[0][:300]
+    return f"error: {first}" if hint is None else f"error: {first}\nhint: {hint}"
+
+
+def _run(args: argparse.Namespace) -> None:
     if args.cmd == "scan":
         print(_scan_report(args.as_of))
         return
@@ -511,13 +557,25 @@ def main(argv: Sequence[str] | None = None) -> None:
         print(_validation_report(args))
         return
     job = _run_backfill(args) if args.cmd == "backfill" else _run_update()
-    try:
-        result = asyncio.run(job)
-    except AlpacaError as exc:
-        raise SystemExit(f"error: {exc}") from exc
+    result = asyncio.run(job)
     print(_report(args.cmd, result))
     if result.failed:
         raise SystemExit(1)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
+    load_env()  # so AlpacaData sees the keys from .env
+    setup_logging()
+    try:
+        _run(args)
+    except AlpacaError as exc:
+        raise SystemExit(_failure(exc, environment_hint(exc))) from exc
+    except Exception as exc:  # an environment problem gets a one-line hint, not a traceback
+        hint = environment_hint(exc)
+        if hint is None:
+            raise
+        raise SystemExit(_failure(exc, hint)) from exc
 
 
 if __name__ == "__main__":
