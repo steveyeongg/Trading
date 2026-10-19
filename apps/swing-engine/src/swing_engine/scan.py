@@ -40,14 +40,15 @@ from swing_engine.config import (
 from swing_engine.data.assets import AssetKind
 from swing_engine.indicators import Indicators, compute_indicators
 from swing_engine.leaders import leader_mask, rs_percentile, rs_score
-from swing_engine.panel import Panel, truncate
+from swing_engine.panel import REFERENCE, Panel, truncate
 from swing_engine.regime import Regime, breadth, market_regime
 from swing_engine.setups import candidates_for
 from swing_engine.sizing import Capacity, Sizing, overlap_flags, size_idea
 from swing_engine.universe import eligibility
 
-BENCHMARK = "SPY"
-"""The market-regime reference series. It must have a bar on the scan session."""
+BENCHMARK = REFERENCE
+"""The market-regime reference series (SPY). It must have a bar on the scan session, and its
+sessions are the panel's rows (:func:`~swing_engine.panel.build_panel`)."""
 
 RankBy = Literal["rs", "proximity"]
 

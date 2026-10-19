@@ -72,9 +72,9 @@ from swing_engine.backtest.baseline import random_entry_baseline
 from swing_engine.backtest.portfolio import PortfolioResult, buy_and_hold, simulate_portfolio
 from swing_engine.backtest.stats import by_year, distinct_trades, regime_on, trade_stats
 from swing_engine.backtest.trades import context_candidates, simulate_candidates
-from swing_engine.config import ExecutionParams, RiskSettings, SetupParams
+from swing_engine.config import ExecutionParams, RiskSettings, SetupParams, UniverseFilter
 from swing_engine.data.assets import AssetKind
-from swing_engine.panel import Panel, build_panel
+from swing_engine.panel import Panel, build_panel, concat_panels
 from swing_engine.scan import BENCHMARK, RankBy, ScanContext, build_context, json_safe
 from swing_engine.validation.prereg import (
     Prereg,
@@ -107,6 +107,8 @@ log = get_logger("swing.validation")
 
 VALIDATION_DIR = Path("ml") / "validation"
 BASELINE_SEEDS = 100
+LOAD_BATCH = 500
+"""Symbols read and pivoted at a time by :func:`load_validation_data`."""
 PREREG_CHANGED = "pre-registration missing or changed since its run"
 RULES_CHANGED = "rules changed since its run"
 RULES_UNSEALED = f"{RULES_CHANGED}: its pre-registration has no protocol block"
@@ -173,21 +175,53 @@ def data_fingerprint(meta: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-async def load_validation_data(min_dollar_volume: float = 20_000_000.0) -> ValidationData:
+async def _load_panel(symbols: list[str], start: date, end: date) -> tuple[Panel, int, int]:
+    """The panel of ``symbols`` from ``start`` to ``end``, read and pivoted ``LOAD_BATCH``
+    symbols at a time, with the adjusted and raw row counts.
+
+    Only the columns a panel uses are read (``ts, symbol, open, high, low, close, volume``
+    adjusted, ``ts, symbol, close`` raw), and each batch's long rows are pivoted to wide frames
+    and dropped before the next batch is read, so the peak is one batch of rows plus the panel.
+    """
+    batches: list[Panel] = []
+    rows = raw_rows = 0
+    for i in range(0, len(symbols), LOAD_BATCH):
+        batch = symbols[i : i + LOAD_BATCH]
+        bars = await store.load_ohlcv(batch, start, end)
+        raw = await store.load_raw_closes(batch, start, end)
+        rows, raw_rows = rows + len(bars), raw_rows + len(raw)
+        batches.append(build_panel(bars, raw_bars=raw))
+        del bars, raw
+    return concat_panels(batches), rows, raw_rows
+
+
+async def load_validation_data(universe: UniverseFilter | None = None) -> ValidationData:
     """The stored daily bars from ``IS_START`` to today for the liquid stocks plus SPY.
 
-    Adjusted and raw bars both load (raw only feeds the point-in-time price floor). Kinds and
-    delisted names come from the asset table. Raises ``ValueError`` when no bars are stored.
+    "Liquid" is :func:`~swing_engine.store.liquid_prefilter` at ``universe``'s dollar-volume
+    floor (the default :class:`~swing_engine.config.UniverseFilter`, the one the runs use): a
+    necessary condition for ever being eligible, so nothing tradable is dropped. Adjusted and
+    raw bars both load (raw only feeds the point-in-time price floor), in symbol batches (see
+    :func:`_load_panel`), and the counts are logged. Kinds and delisted names come from the
+    asset table. Raises ``ValueError`` when no bars are stored.
     """
-    symbols = sorted({*await store.liquid_prefilter(min_dollar_volume), BENCHMARK})
+    universe = UniverseFilter() if universe is None else universe
+    liquid = await store.liquid_prefilter(universe.min_median_dollar_volume)
+    symbols = sorted({*liquid, BENCHMARK})
     today = datetime.now(UTC).date()
-    bars = await store.load_daily_bars(symbols, IS_START, today)
-    if bars.empty:
+    panel, rows, raw_rows = await _load_panel(symbols, IS_START, today)
+    if not rows:
         raise ValueError(
             f"no daily bars stored since {IS_START}: run `python -m swing_engine backfill` first"
         )
-    raw = await store.load_daily_bars(symbols, IS_START, today, resolution=store.RAW_DAILY)
-    panel = build_panel(bars, raw_bars=raw)
+    log.info(
+        "validation.data_loaded",
+        symbols=len(symbols),
+        batches=-(-len(symbols) // LOAD_BATCH),
+        rows=rows,
+        raw_rows=raw_rows,
+        sessions=len(panel.dates()),
+    )
 
     assets = await store.load_assets()
     symbol = assets["symbol"].astype(str)

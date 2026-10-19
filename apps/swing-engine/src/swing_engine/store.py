@@ -139,6 +139,23 @@ _LOAD_ALL_BARS_SQL = text(
     WHERE resolution = '1d' AND ts >= :start AND ts <= :end
     """
 )
+# The validation loader reads a whole market of history, so it selects only what a panel uses.
+_OHLCV_COLUMNS = ["ts", "symbol", "open", "high", "low", "close", "volume"]
+_RAW_CLOSE_COLUMNS = ["ts", "symbol", "close"]
+_LOAD_OHLCV_SQL = text(
+    f"""
+    SELECT {", ".join(_OHLCV_COLUMNS)}
+    FROM bars
+    WHERE resolution = '1d' AND symbol = ANY(:symbols) AND ts >= :start AND ts <= :end
+    """
+)
+_LOAD_RAW_CLOSES_SQL = text(
+    f"""
+    SELECT {", ".join(_RAW_CLOSE_COLUMNS)}
+    FROM bars
+    WHERE resolution = '1d_raw' AND symbol = ANY(:symbols) AND ts >= :start AND ts <= :end
+    """
+)
 _LIQUID_SQL = text(
     """
     SELECT symbol
@@ -367,6 +384,43 @@ async def load_daily_bars(
     async with session_scope() as session:
         rows = (await session.execute(statement, params)).all()
     return _bars_frame(rows)
+
+
+async def _load_columns(
+    statement: TextClause, columns: list[str], symbols: Sequence[str], start: date, end: date
+) -> pd.DataFrame:
+    """Rows of ``statement`` for ``symbols`` from ``start`` to ``end`` as a frame of ``columns``:
+    ``ts`` timezone-aware UTC, the other non-symbol columns float64 (NULL is NaN), sorted by
+    symbol then time. No symbols reads nothing."""
+    if isinstance(symbols, str):
+        raise TypeError("symbols must be a sequence of tickers, not a single string")
+    rows: Sequence[Any] = []
+    if symbols:
+        params = {
+            "symbols": list(dict.fromkeys(symbols)),
+            "start": _utc_midnight(start),
+            "end": _utc_midnight(end),
+        }
+        async with session_scope() as session:
+            rows = (await session.execute(statement, params)).all()
+    df = pd.DataFrame(rows, columns=columns)
+    df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    df["symbol"] = df["symbol"].astype(object)
+    values = [c for c in columns if c not in ("ts", "symbol")]
+    df[values] = df[values].astype("float64")
+    return df.sort_values(["symbol", "ts"], kind="stable").reset_index(drop=True)
+
+
+async def load_ohlcv(symbols: Sequence[str], start: date, end: date) -> pd.DataFrame:
+    """Adjusted daily ``ts, symbol, open, high, low, close, volume`` for ``symbols`` from
+    ``start`` to ``end`` inclusive, and nothing else (the validation loader's read)."""
+    return await _load_columns(_LOAD_OHLCV_SQL, _OHLCV_COLUMNS, symbols, start, end)
+
+
+async def load_raw_closes(symbols: Sequence[str], start: date, end: date) -> pd.DataFrame:
+    """Unadjusted (``1d_raw``) daily ``ts, symbol, close`` for ``symbols`` from ``start`` to
+    ``end`` inclusive: the price floor's input, and nothing else."""
+    return await _load_columns(_LOAD_RAW_CLOSES_SQL, _RAW_CLOSE_COLUMNS, symbols, start, end)
 
 
 async def last_bar_dates(resolution: str = DAILY) -> dict[str, date]:

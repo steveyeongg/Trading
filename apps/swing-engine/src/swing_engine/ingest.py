@@ -24,6 +24,12 @@ succeeds none of the symbol's new bars are written, so a failed refetch leaves i
 its old scale, and it is retried on the next run. The incremental update runs this check on
 the last few sessions of every stored symbol.
 
+**A rejected chunk.** Alpaca refuses a whole multi-symbol request (400/404/422) when one symbol
+in it is bad, which would fail the same 100 symbols on every run. Such a chunk is split in half
+and each half retried, down to the bad symbols alone, which are the only ones that fail. An
+authorisation error (401/403) or anything else fails the chunk as it is: splitting would only
+repeat it.
+
 **Raw closes.** The universe's price floor has to see the price a stock traded at on the day,
 which ``adjustment=all`` rewrites after every split. So after the adjusted pass both jobs also
 run :func:`sync_raw`, which keeps ``adjustment=raw`` bars (``resolution='1d_raw'``) for the same
@@ -44,6 +50,7 @@ import pandas as pd
 from atlas_shared.logging import get_logger
 
 from swing_engine.calendar import ET, Session, TradingCalendar
+from swing_engine.data.alpaca import AlpacaRequestError
 from swing_engine.data.assets import candidate_symbols, classify_asset
 from swing_engine.store import RAW_DAILY
 
@@ -51,9 +58,11 @@ log = get_logger("swing.ingest")
 
 # The oldest session the engine keeps, and where a split-triggered refetch starts.
 HISTORY_START = date(2016, 1, 1)
-# Symbols per fetch-and-store round. The Alpaca client holds a whole call in memory and does
-# not retry transport errors, so a bounded chunk caps both the memory and the loss.
+# Symbols per fetch-and-store round. The Alpaca client holds a whole call in memory, so a
+# bounded chunk caps both the memory and what one failure costs.
 CHUNK_SIZE = 100
+# Statuses that mean "a symbol in this request is bad": the chunk is split to isolate it.
+SPLIT_STATUSES = frozenset({400, 404, 422})
 # The update only maintains symbols whose newest bar is at most this many sessions behind.
 MAX_STALE_SESSIONS = 30
 CALENDAR_LOOKBACK_DAYS = 10
@@ -214,6 +223,19 @@ def _log_chunk_failure(phase: str, chunk: Sequence[str], exc: Exception) -> None
     )
 
 
+def _splittable(exc: Exception, chunk: Sequence[str]) -> bool:
+    """True when ``exc`` is Alpaca rejecting a symbol in a chunk that can still be halved."""
+    return len(chunk) > 1 and isinstance(exc, AlpacaRequestError) and exc.status in SPLIT_STATUSES
+
+
+def _halves(chunk: Sequence[str], phase: str, exc: Exception) -> list[list[str]]:
+    log.info(
+        "ingest.chunk_split", phase=phase, first=chunk[0], symbols=len(chunk), error=_describe(exc)
+    )
+    mid = len(chunk) // 2
+    return [list(chunk[:mid]), list(chunk[mid:])]
+
+
 async def _fetch_history(
     client: BarSource,
     store: BarStore,
@@ -229,18 +251,27 @@ async def _fetch_history(
     """Fetch ``start`` through ``target`` for ``symbols``, storing each chunk before the next.
 
     A chunk that raises is logged and skipped. Its symbols land in ``failed`` and nothing of
-    them is stored, because a chunk is written in one transaction.
+    them is stored, because a chunk is written in one transaction. A chunk Alpaca rejects for a
+    bad symbol is split first (see the module docstring), so only the bad symbols fail.
     """
     out = _Pass()
-    for chunk in _chunks(symbols):
+
+    async def fetch(chunk: list[str]) -> None:
         try:
             bars = await client.daily_bars(chunk, start, target, now=now, adjustment=adjustment)
             if not bars.empty:
                 out.rows += await store.upsert_daily_bars(bars)
                 out.returned.update(str(sym) for sym in bars["symbol"].unique())
         except Exception as exc:  # one bad chunk must not sink the run; a re-run resumes it
+            if _splittable(exc, chunk):
+                for half in _halves(chunk, phase, exc):
+                    await fetch(half)
+                return
             out.failed.extend(chunk)
             _log_chunk_failure(phase, chunk, exc)
+
+    for chunk in _chunks(symbols):
+        await fetch(chunk)
         if on_chunk is not None:
             on_chunk(len(chunk))
     return out
@@ -296,10 +327,12 @@ async def _catch_up(
 
     Each job is a chunk of stored symbols and the date to fetch it from (an overlap with what
     is stored). A flagged symbol's fetched bars are withheld and it is returned in ``moved``
-    for :func:`_refetch_moved`, so nothing of it is written until its whole history is.
+    for :func:`_refetch_moved`, so nothing of it is written until its whole history is. A chunk
+    Alpaca rejects for a bad symbol is split, as in :func:`_fetch_history`.
     """
     out = _Pass()
-    for fetch_from, chunk in jobs:
+
+    async def fetch(fetch_from: date, chunk: list[str]) -> None:
         changed: set[str] = set()
         try:
             bars = await client.daily_bars(chunk, fetch_from, target, now=now)
@@ -308,10 +341,17 @@ async def _catch_up(
             if not keep.empty:
                 out.rows += await store.upsert_daily_bars(keep)
         except Exception as exc:
+            if _splittable(exc, chunk):
+                for half in _halves(chunk, "catch_up", exc):
+                    await fetch(fetch_from, half)
+                return
             out.failed.extend(chunk)
             changed = set()
             _log_chunk_failure("catch_up", chunk, exc)
         out.moved.extend(sorted(changed))
+
+    for fetch_from, chunk in jobs:
+        await fetch(fetch_from, chunk)
         if on_chunk is not None:
             on_chunk(len(chunk))
     return out

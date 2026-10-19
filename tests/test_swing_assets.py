@@ -236,6 +236,38 @@ def test_candidate_symbols_drops_everything_that_is_not_listed_common_stock():
     assert candidate_symbols(assets) == ["AAPL", "SPY"]
 
 
+@pytest.mark.parametrize("sym", ["ZVZZT", "ZWZZT", "ZXZZT", "ZJZZT", "ZBZZT"])
+def test_exchange_test_symbols_are_other_whatever_their_name(sym):
+    """Exchanges list dummy issues for testing their systems; they print bars like a stock."""
+    assert classify_asset(_asset(sym, f"{sym} Common Stock", "NASDAQ")) == AssetKind.OTHER
+
+
+@pytest.mark.parametrize("name", ["NASDAQ TEST STOCK", "NYSE Arca Test Symbol", "Test Issue"])
+def test_test_issues_by_name_are_other(name):
+    assert classify_asset(_asset("ZZQT", name, "NYSE")) == AssetKind.OTHER
+
+
+@pytest.mark.parametrize(
+    ("sym", "name"),
+    [
+        ("AEHR", "Aehr Test Systems Common Stock"),  # a real company with "Test" in its name
+        ("INTT", "inTEST Corporation Common Stock"),
+        ("TSTX", "Testmark Holdings, Inc."),
+    ],
+)
+def test_a_company_with_test_in_its_name_stays_common(sym, name):
+    assert classify_asset(_asset(sym, name, "NASDAQ")) == AssetKind.COMMON
+
+
+def test_nysearca_listings_are_candidates_and_test_issues_are_not():
+    assets = [
+        _asset("XYZ", "XYZ Holdings Inc. Common Stock", "NYSEARCA"),
+        _asset("ZVZZT", "NASDAQ TEST STOCK", "NASDAQ"),
+        _asset("ZZQT", "NYSE Arca Test Symbol", "NYSEARCA"),
+    ]
+    assert candidate_symbols(assets) == ["SPY", "XYZ"]
+
+
 def test_candidate_symbols_accepts_a_generator_and_an_empty_list():
     assert candidate_symbols(iter([])) == ["SPY"]
     gen = (a for a in [_asset("AAPL", "Apple Inc. Common Stock", "NASDAQ")])

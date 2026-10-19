@@ -16,6 +16,9 @@ heuristics lean on the shape of exchange-listed names, so the exemptions are del
 * "Common Units" and "Limited Partnership Units" are an MLP's common equity, not a SPAC unit.
 * An ADR whose underlying shares are preferred (Bradesco, Itau) is still an operating company,
   and "Preferred Bank Common Stock" is a bank, not a preferred share.
+* Exchange test issues (NASDAQ's ZVZZT family, names such as "NASDAQ TEST STOCK") print bars
+  like a stock and are OTHER. The word "Test" in an operating company's name ("Aehr Test
+  Systems Common Stock", "Testmark Holdings, Inc.") is exempt by the same entity markers.
 """
 
 from __future__ import annotations
@@ -44,8 +47,11 @@ class AssetKind(StrEnum):
 TRADEABLE_KINDS: Final = frozenset({AssetKind.COMMON})
 # Always backfilled as the market benchmark, even though SPY itself is an ETF.
 REFERENCE_SYMBOLS: Final = ("SPY",)
-# Exchanges whose common stock can enter the universe (OTC is excluded).
-LISTED_EXCHANGES: Final = frozenset({"NYSE", "NASDAQ", "AMEX", "ARCA", "BATS"})
+# Exchanges whose common stock can enter the universe (OTC is excluded). Alpaca names NYSE
+# Arca both "ARCA" and "NYSEARCA".
+LISTED_EXCHANGES: Final = frozenset({"NYSE", "NASDAQ", "AMEX", "ARCA", "NYSEARCA", "BATS"})
+# Symbols the exchanges list for testing their systems, not companies.
+TEST_SYMBOLS: Final = frozenset({"ZVZZT", "ZWZZT", "ZXZZT", "ZJZZT", "ZBZZT"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,12 +111,20 @@ _COMMON_EQUITY_NAME = _words(r"\bcommon (?:stock|shares?)\b|\bordinary shares\b"
 _DEPOSITARY_SHARES = _words(r"\bdepositary shares?\b")
 # "ADS"/"ADR" are matched case-sensitively so a word like "Ads" is not mistaken for one.
 _ADR_NAME = re.compile(r"(?i:\b(?:american|global)\s+depositary\b)|\bADRs?\b|\bADSs?\b")
+_TEST_NAME = _words(r"\btest\b")
 
 Predicate = Callable[[_Asset], bool]
 
 
 def _not_us_equity(a: _Asset) -> bool:
     return a.asset_class != "us_equity"
+
+
+def _is_test_issue(a: _Asset) -> bool:
+    if a.symbol in TEST_SYMBOLS:
+        return True
+    named = bool(_TEST_NAME.search(a.name))
+    return named and not (_OPERATING_ENTITY.search(a.name) or _COMMON_EQUITY_NAME.search(a.name))
 
 
 def _is_otc(a: _Asset) -> bool:
@@ -169,6 +183,7 @@ def _is_preferred_suffix(a: _Asset) -> bool:
 # First match wins. Order matters: see the module docstring for the exemptions.
 _RULES: Final[tuple[tuple[Predicate, AssetKind], ...]] = (
     (_not_us_equity, AssetKind.OTHER),
+    (_is_test_issue, AssetKind.OTHER),
     (_is_otc, AssetKind.OTC),
     (_is_etf_name, AssetKind.ETF),
     (_is_fund_name, AssetKind.FUND),

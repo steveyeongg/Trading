@@ -28,6 +28,8 @@ from swing_engine.store import (
     liquid_prefilter,
     load_assets,
     load_daily_bars,
+    load_ohlcv,
+    load_raw_closes,
     refresh_asset_bar_ranges,
     stored_close,
     upsert_assets,
@@ -114,6 +116,8 @@ def test_store_exposes_the_async_interface_backfill_and_scan_rely_on():
         "last_bar_dates",
         "stored_close",
         "load_daily_bars",
+        "load_ohlcv",
+        "load_raw_closes",
         "liquid_prefilter",
     ):
         assert inspect.iscoroutinefunction(getattr(store, name)), name
@@ -479,6 +483,50 @@ async def test_load_daily_bars_keeps_trade_count_integral_unless_null(monkeypatc
     ]
 
 
+def _flat(statement: Any) -> str:
+    return " ".join(statement.text.split())
+
+
+def test_the_validation_loads_select_only_the_columns_a_panel_needs():
+    """The incident: the validation loader pulled every column, adjusted and raw, for ~5,000
+    symbols over ten years through SQLAlchemy rows in one go (an estimated 7-10 GiB peak)."""
+    ohlcv, raw = _flat(store._LOAD_OHLCV_SQL), _flat(store._LOAD_RAW_CLOSES_SQL)
+    assert ohlcv.startswith("SELECT ts, symbol, open, high, low, close, volume FROM bars WHERE")
+    assert "resolution = '1d' AND symbol = ANY(:symbols) AND ts >= :start AND ts <= :end" in ohlcv
+    assert raw.startswith("SELECT ts, symbol, close FROM bars WHERE")
+    assert "resolution = '1d_raw' AND symbol = ANY(:symbols) AND ts >= :start AND ts <= :end" in raw
+
+
+async def test_load_ohlcv_and_raw_closes_shape_the_rows(monkeypatch):
+    day = datetime(2020, 1, 2, tzinfo=UTC)
+    db = _FakeDb([(day, "ZZB", 1, 2, 0.5, 1.5, 100), (day, "ZZA", 3, 4, 2.5, 3.5, None)])
+    monkeypatch.setattr(store, "session_scope", db.scope)
+    out = await load_ohlcv(["ZZA", "ZZB"], date(2020, 1, 1), date(2020, 2, 1))
+    assert list(out.columns) == ["ts", "symbol", "open", "high", "low", "close", "volume"]
+    assert list(out["symbol"]) == ["ZZA", "ZZB"] and str(out["ts"].dt.tz) == "UTC"
+    assert out["volume"].dtype == "float64" and np.isnan(out["volume"].iloc[0])
+    (_, statement, params) = next(c for c in db.calls if c[0] == "sql")
+    assert statement is store._LOAD_OHLCV_SQL
+    assert params == {
+        "symbols": ["ZZA", "ZZB"],
+        "start": datetime(2020, 1, 1, tzinfo=UTC),
+        "end": datetime(2020, 2, 1, tzinfo=UTC),
+    }
+
+    db = _FakeDb([(day, "ZZA", 7.0)])
+    monkeypatch.setattr(store, "session_scope", db.scope)
+    raw = await load_raw_closes(["ZZA"], date(2020, 1, 1), date(2020, 2, 1))
+    assert list(raw.columns) == ["ts", "symbol", "close"] and raw["close"].tolist() == [7.0]
+    assert next(c for c in db.calls if c[0] == "sql")[1] is store._LOAD_RAW_CLOSES_SQL
+
+
+async def test_column_loads_of_no_symbols_never_query(fake_db):
+    for load in (load_ohlcv, load_raw_closes):
+        out = await load([], date(2020, 1, 1), date(2020, 2, 1))
+        assert out.empty and "symbol" in out.columns
+    assert fake_db.sessions == 0
+
+
 async def test_last_bar_dates_maps_symbol_to_session_date(monkeypatch):
     rows = [("AAA", date(2026, 10, 16)), ("BBB", date(2026, 10, 15))]
     monkeypatch.setattr(store, "session_scope", _FakeDb(rows).scope)
@@ -574,6 +622,16 @@ async def test_load_daily_bars_filters_by_symbol_and_inclusive_dates(clean_db):
     assert list(both["symbol"]) == ["ZZLIQ"] * 3 + ["ZZTEST"] * 3
     everything = await load_daily_bars(None, date(2020, 1, 1), date(2020, 1, 4))
     assert {"ZZTEST", "ZZLIQ"} <= set(everything["symbol"])
+
+
+@needs_db
+async def test_column_loads_read_only_their_resolution(clean_db):
+    raw = _bars("ZZTEST", closes=(20, 22, 24)).assign(resolution="1d_raw")
+    await upsert_daily_bars(pd.concat([_bars("ZZTEST"), raw]))
+    ohlcv = await load_ohlcv(["ZZTEST"], date(2020, 1, 1), date(2020, 2, 1))
+    assert list(ohlcv["close"]) == [10, 11, 12] and "vwap" not in ohlcv.columns
+    closes = await load_raw_closes(["ZZTEST"], date(2020, 1, 3), date(2020, 1, 3))
+    assert list(closes["close"]) == [22] and list(closes.columns) == ["ts", "symbol", "close"]
 
 
 @needs_db

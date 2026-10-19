@@ -644,6 +644,16 @@ def test_scan_command_ranks_by_proximity_when_a_live_setup_found_rs_did_not_help
     assert [(r[1], r[2]) for r in rows] == by_proximity
 
 
+def test_scan_prefilter_threshold_is_the_universe_filter_s(monkeypatch):
+    """The prefilter is only a cheap necessary condition for the universe's dollar-volume floor,
+    so it must use that floor: a hard-coded copy would silently drop names if the floor fell."""
+    fake = _FakeStore(monkeypatch)
+    loose = UniverseFilter(min_median_dollar_volume=5_000_000.0)
+    monkeypatch.setattr(cli, "UniverseFilter", lambda: loose)
+    _run_cli("--as-of", AS_OF.isoformat())
+    assert fake.prefilter_calls == [5_000_000.0]
+
+
 def test_scan_command_shows_only_the_top_20_and_says_how_many_more(monkeypatch):
     _FakeStore(monkeypatch)
     # Four versions of each family: every candidate shows up four times, 24 ideas in all.

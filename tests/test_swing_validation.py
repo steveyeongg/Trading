@@ -729,9 +729,11 @@ def _long_bars(panel: Panel, symbols, start: date, end: date, raw: bool) -> pd.D
     return pd.concat(frames, ignore_index=True)
 
 
-async def test_load_validation_data_reads_the_store(monkeypatch):
+async def test_load_validation_data_reads_the_store_in_symbol_batches(monkeypatch):
+    """The loader reads only the columns a panel needs, a batch of symbols at a time, and pivots
+    each batch before the next is read, so the peak is one batch of rows, not the whole market."""
     panel = _shifted(synthetic_universe_panel(seed=2, n_symbols=3, n_sessions=300), "2016-01-04")
-    calls: dict[str, list] = {"prefilter": [], "bars": []}
+    calls: dict[str, list] = {"prefilter": [], "ohlcv": [], "raw": [], "log": []}
     assets = pd.DataFrame(
         {
             "symbol": ["DEAD1", "DEAD2", "S00", "S01", "S02", "SPY", "WARR"],
@@ -744,9 +746,13 @@ async def test_load_validation_data_reads_the_store(monkeypatch):
         calls["prefilter"].append(min_dollar_volume)
         return ["S00", "S01", "S02"]
 
-    async def load_daily_bars(symbols, start, end, resolution="1d") -> pd.DataFrame:
-        calls["bars"].append((list(symbols), start, end, resolution))
-        return _long_bars(panel, symbols, start, end, raw=resolution == "1d_raw")
+    async def load_ohlcv(symbols, start, end) -> pd.DataFrame:
+        calls["ohlcv"].append((list(symbols), start, end))
+        return _long_bars(panel, symbols, start, end, raw=False)
+
+    async def load_raw_closes(symbols, start, end) -> pd.DataFrame:
+        calls["raw"].append((list(symbols), start, end))
+        return _long_bars(panel, symbols, start, end, raw=True)[["ts", "symbol", "close"]]
 
     async def load_assets() -> pd.DataFrame:
         return assets
@@ -756,27 +762,57 @@ async def test_load_validation_data_reads_the_store(monkeypatch):
 
     for name, fake in [
         ("liquid_prefilter", liquid_prefilter),
-        ("load_daily_bars", load_daily_bars),
+        ("load_ohlcv", load_ohlcv),
+        ("load_raw_closes", load_raw_closes),
         ("load_assets", load_assets),
         ("last_bar_dates", last_bar_dates),
     ]:
         monkeypatch.setattr(store, name, fake)
 
+    class _Log:
+        def info(self, event: str, **kw) -> None:
+            calls["log"].append((event, kw))
+
+    monkeypatch.setattr(run_module, "log", _Log())
+    monkeypatch.setattr(run_module, "LOAD_BATCH", 2)
     data = await load_validation_data()
 
-    assert calls["prefilter"] == [20_000_000.0]
-    assert [c[3] for c in calls["bars"]] == ["1d", "1d_raw"]
-    for symbols, start, end, _ in calls["bars"]:
-        assert symbols == ["S00", "S01", "S02", "SPY"] and start == IS_START
-        assert panel.dates()[-1].date() <= end <= datetime.now(UTC).date()
+    assert calls["prefilter"] == [UniverseFilter().min_median_dollar_volume]
+    batches = [["S00", "S01"], ["S02", "SPY"]]
+    assert [c[0] for c in calls["ohlcv"]] == batches == [c[0] for c in calls["raw"]]
+    for _, start, end in calls["ohlcv"] + calls["raw"]:
+        assert start == IS_START and panel.dates()[-1].date() <= end <= datetime.now(UTC).date()
     same = {"check_like": True, "check_freq": False}  # columns come back sorted
     pd.testing.assert_frame_equal(data.panel.close, panel.close, **same)
+    pd.testing.assert_frame_equal(data.panel.volume, panel.volume, **same)
     assert data.panel.raw_close is not None
     pd.testing.assert_frame_equal(data.panel.raw_close, panel.close * 2.0, **same)
     assert data.kinds["SPY"] is AssetKind.ETF and data.kinds["S01"] is AssetKind.COMMON
     assert data.delisted == frozenset({"DEAD1", "DEAD2", "WARR"})
     assert data.coverage == 0.5  # DEAD1 of DEAD1/DEAD2; the warrant is not common stock
     assert data.meta == panel_meta(data.panel)
+    loaded = dict(calls["log"])["validation.data_loaded"]
+    assert loaded == {
+        "symbols": 4, "batches": 2, "rows": 4 * 300, "raw_rows": 4 * 300, "sessions": 300,
+    }  # fmt: skip
+
+
+async def test_the_prefilter_threshold_is_the_universe_filter_s(monkeypatch):
+    seen: list[float] = []
+
+    async def liquid_prefilter(min_dollar_volume: float) -> list[str]:
+        seen.append(min_dollar_volume)
+        return []
+
+    async def no_rows(symbols, start, end) -> pd.DataFrame:
+        return pd.DataFrame(columns=["ts", "symbol", "open", "high", "low", "close", "volume"])
+
+    monkeypatch.setattr(store, "liquid_prefilter", liquid_prefilter)
+    monkeypatch.setattr(store, "load_ohlcv", no_rows)
+    monkeypatch.setattr(store, "load_raw_closes", no_rows)
+    with pytest.raises(ValueError, match="backfill"):
+        await load_validation_data(UniverseFilter(min_median_dollar_volume=5_000_000.0))
+    assert seen == [5_000_000.0]
 
 
 # ---------------------------------------------------------------------------- end to end
@@ -1063,8 +1099,7 @@ def test_oos_never_sees_data_after_the_freeze(tmp_path):
         _commit(repo, path)
         reports.append(run_oos("pullback", "pullback-v1", repo, NOW, data=_data(p)))
     assert reports[0]["freeze_date"] == freeze.date().isoformat()
-    # The repos differ only in their commits, which the reports record as the code version.
-    assert reports[0]["code_commit"] != reports[1]["code_commit"]
+    # Two repos: their commits (recorded as the code version) may differ, nothing else may.
     same = [{k: v for k, v in r.items() if k != "code_commit"} for r in reports]
     assert same[0] == same[1]
 

@@ -15,7 +15,7 @@ import httpx
 import pandas as pd
 import pytest
 from swing_engine.calendar import Session
-from swing_engine.data.alpaca import AlpacaData, AlpacaError
+from swing_engine.data.alpaca import AlpacaData, AlpacaError, AlpacaRequestError
 from tenacity import wait_none
 
 NOW = datetime(2026, 10, 16, 21, 0, tzinfo=UTC)
@@ -263,6 +263,45 @@ async def test_other_4xx_is_not_retried_and_names_the_status():
         with pytest.raises(AlpacaError, match="403"):
             await c.daily_bars(["AAPL"], date(2026, 10, 15), date(2026, 10, 16), now=NOW)
     assert len(captured) == 1
+
+
+async def test_a_dropped_connection_is_retried():
+    """The incident: one TCP reset or read timeout during a multi-hour backfill raised straight
+    out of the client and failed its whole chunk; only 429 and 5xx answers were retried."""
+    answers: list[Exception | httpx.Response] = [
+        httpx.ConnectError("connection reset"),
+        httpx.Response(200, json={"bars": {}}),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    c, captured = _client(handler)
+    async with c:
+        df = await c.daily_bars(["AAPL"], date(2026, 10, 15), date(2026, 10, 16), now=NOW)
+    assert len(captured) == 2 and df.empty
+
+
+async def test_timeouts_are_retried_and_end_as_an_alpaca_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    c, captured = _client(handler)
+    async with c:
+        with pytest.raises(AlpacaError, match="ReadTimeout"):
+            await c.daily_bars(["AAPL"], date(2026, 10, 15), date(2026, 10, 16), now=NOW)
+    assert len(captured) == 6
+
+
+async def test_a_4xx_carries_its_status_so_a_caller_can_tell_a_bad_symbol_from_bad_keys():
+    c, _ = _client(lambda _: httpx.Response(422, text="invalid symbol: BAD!"))
+    async with c:
+        with pytest.raises(AlpacaRequestError) as err:
+            await c.daily_bars(["BAD!"], date(2026, 10, 15), date(2026, 10, 16), now=NOW)
+    assert err.value.status == 422 and isinstance(err.value, AlpacaError)
 
 
 async def test_requests_start_at_least_min_interval_apart():

@@ -9,7 +9,10 @@ Free-plan rules baked in here (Alpaca Market Data v2):
   returns what Alpaca says today. ``adjustment=raw`` never changes: it is what printed on
   the day, which is what a price floor has to look at (stored as ``resolution='1d_raw'``).
 * About 200 requests/minute, so requests are spaced ``min_interval_s`` apart (default
-  0.3 s) and 429/5xx responses are retried with exponential backoff.
+  0.3 s) and 429/5xx responses are retried with exponential backoff, as are network failures
+  (a dropped connection, a timeout): a multi-hour backfill meets a few of those. Any other 4xx
+  is final and raises :class:`AlpacaRequestError` with its status, so a caller can tell one
+  rejected symbol (400/404/422) from bad keys (401/403).
 
 Bars endpoint: ``GET /v2/stocks/bars?symbols=A,B&timeframe=1Day&feed=sip&adjustment=all``
 answering ``{"bars": {SYM: [{t,o,h,l,c,v,vw,n}]}, "next_page_token": ...}``.
@@ -82,8 +85,16 @@ class AlpacaError(RuntimeError):
     """A non-retryable Alpaca failure, or a retryable one that ran out of attempts."""
 
 
+class AlpacaRequestError(AlpacaError):
+    """A 4xx other than 429: Alpaca refused the request itself. ``status`` is the HTTP status."""
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+
 class _RetryableError(AlpacaError):
-    """429 or 5xx: worth another attempt."""
+    """429, 5xx or a network failure: worth another attempt."""
 
 
 def _log_retry(state: RetryCallState) -> None:
@@ -179,12 +190,16 @@ class AlpacaData:
 
     async def _get_once(self, url: str, params: dict[str, str | int]) -> Any:
         await self._throttle()
-        r = await self._client.get(url, params=params)
+        try:
+            r = await self._client.get(url, params=params)
+        except httpx.TransportError as exc:  # connect, read, write, pool and timeout errors
+            path = httpx.URL(url).path
+            raise _RetryableError(f"network error on {path}: {type(exc).__name__}: {exc}") from exc
         status = r.status_code
         if status == 429 or status >= 500:
             raise _RetryableError(f"alpaca {status} from {r.url.path}: {r.text[:200]}")
         if status >= 400:
-            raise AlpacaError(f"alpaca {status} from {r.url.path}: {r.text[:200]}")
+            raise AlpacaRequestError(status, f"alpaca {status} from {r.url.path}: {r.text[:200]}")
         return r.json()
 
     async def _get(self, url: str, params: dict[str, str | int]) -> Any:

@@ -1,4 +1,10 @@
-"""Wide daily-bar panel: one tz-naive session-date index, one column per symbol."""
+"""Wide daily-bar panel: one tz-naive session-date index, one column per symbol.
+
+When the reference series (SPY) is in the bars, the panel's rows are SPY's sessions and nothing
+else: a stray bar dated off its calendar (a weekend or holiday print, or a stock updated before
+SPY) would otherwise add a row on which every other symbol is missing, which reads as a missed
+session for all of them and shifts every rolling window by a row.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +16,8 @@ import numpy as np
 import pandas as pd
 
 _FIELDS = ("open", "high", "low", "close", "volume")
+REFERENCE = "SPY"
+"""The series whose sessions are the panel's rows when it is present (the market benchmark)."""
 
 
 @dataclass(frozen=True)
@@ -43,15 +51,29 @@ def _session_dates(ts: pd.Series) -> pd.Series:
     return pd.to_datetime(ts, utc=True).dt.tz_convert(None).dt.normalize()
 
 
+def _on_reference_sessions(frames: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+    """``frames`` cut to the rows where :data:`REFERENCE` has a close, when it is a column."""
+    close = frames["close"]
+    if REFERENCE not in close.columns:
+        return frames
+    keep = close[REFERENCE].notna().to_numpy()
+    if keep.all():
+        return frames
+    return {f: frame.loc[keep] for f, frame in frames.items()}
+
+
 def build_panel(bars: pd.DataFrame, raw_bars: pd.DataFrame | None = None) -> Panel:
     """Pivot a long frame (``ts, symbol, open, high, low, close, volume``) into a Panel.
 
     ``ts`` is the session date at 00:00 UTC (the storage convention); the panel index
-    is that session date, tz-naive. A repeated ``(ts, symbol)`` keeps the last row.
+    is that session date, tz-naive. A repeated ``(ts, symbol)`` keeps the last row. When
+    :data:`REFERENCE` is among the symbols, only the sessions on which it has a bar are kept
+    (see the module docstring).
 
-    ``raw_bars`` (same shape, from the ``1d_raw`` resolution) fills ``Panel.raw_close``,
-    reindexed onto the adjusted panel's index and columns: a raw bar for a session or symbol
-    the adjusted bars lack is dropped, and a missing raw bar is NaN, never filled.
+    ``raw_bars`` (``ts, symbol, close`` at least, from the ``1d_raw`` resolution) fills
+    ``Panel.raw_close``, reindexed onto the adjusted panel's index and columns: a raw bar for a
+    session or symbol the adjusted bars lack is dropped, and a missing raw bar is NaN, never
+    filled.
     """
     df = bars.loc[:, ["ts", "symbol", *_FIELDS]].copy()
     df["ts"] = _session_dates(df["ts"])
@@ -63,6 +85,7 @@ def build_panel(bars: pd.DataFrame, raw_bars: pd.DataFrame | None = None) -> Pan
     for frame in frames.values():
         frame.index.name = None
         frame.columns.name = None
+    frames = _on_reference_sessions(frames)
     raw_close = None
     if raw_bars is not None:
         raw = raw_bars.loc[:, ["ts", "symbol", "close"]].copy()
@@ -73,6 +96,33 @@ def build_panel(bars: pd.DataFrame, raw_bars: pd.DataFrame | None = None) -> Pan
             .astype("float64")
             .reindex(index=frames["close"].index, columns=frames["close"].columns)
         )
+    return Panel(**frames, raw_close=raw_close)
+
+
+def concat_panels(panels: Sequence[Panel]) -> Panel:
+    """Panels over disjoint symbol sets side by side, as one :func:`build_panel` would give.
+
+    The rows are the union of their sessions (sorted), cut to :data:`REFERENCE`'s sessions when
+    one of them holds it, and the columns are sorted. A symbol in two panels raises
+    ``ValueError``. ``raw_close`` is kept where a panel has it and NaN where it has none.
+    """
+    if not panels:
+        raise ValueError("no panels to join")
+    symbols = [s for p in panels for s in p.symbols()]
+    repeated = sorted({s for s in symbols if symbols.count(s) > 1})
+    if repeated:
+        raise ValueError(f"symbols appear in more than one panel: {repeated}")
+
+    def joined(frames: list[pd.DataFrame]) -> pd.DataFrame:
+        out = pd.concat(frames, axis=1, sort=False).sort_index().sort_index(axis=1)
+        return out.astype("float64")
+
+    frames = _on_reference_sessions({f: joined([getattr(p, f) for p in panels]) for f in _FIELDS})
+    close = frames["close"]
+    raw_close = None
+    if any(p.raw_close is not None for p in panels):
+        raw = [p.close.iloc[:0] if p.raw_close is None else p.raw_close for p in panels]
+        raw_close = joined(raw).reindex(index=close.index, columns=close.columns)
     return Panel(**frames, raw_close=raw_close)
 
 

@@ -14,7 +14,7 @@ from swing_engine.config import (
     UniverseFilter,
 )
 from swing_engine.indicators import atr, compute_indicators, rsi, sma, true_range
-from swing_engine.panel import build_panel, segments, select, truncate
+from swing_engine.panel import build_panel, concat_panels, segments, select, truncate
 from swing_engine.testing import make_bars, make_panel, trend_series
 
 
@@ -87,6 +87,41 @@ def test_build_panel_index_is_tz_naive_session_dates():
     assert p.dates().equals(p.close.index.normalize())
     assert p.symbols() == ["AAA", "BBB"]
     assert p.close.index.equals(p.volume.index)
+
+
+def _off_calendar_bars() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """AAA on Thu 2 to Tue 7 Jan 2020 plus a stray Saturday bar; SPY on Thu 2 to Mon 6 only."""
+    aaa = make_bars("AAA", [10.0, 11.0, 12.0, 13.0], start="2020-01-02")
+    stray = aaa.iloc[[0]].assign(ts=pd.Timestamp("2020-01-04", tz="UTC"))
+    spy = make_bars("SPY", [300.0, 301.0, 302.0], start="2020-01-02")
+    return aaa, stray, spy
+
+
+def test_build_panel_keeps_only_the_sessions_spy_traded():
+    """The incident: a bar dated off SPY's calendar (a stray holiday or weekend print, or a stock
+    updated before SPY) added a panel row on which every other symbol was missing. That reads as
+    a missed session for all of them and shifts every rolling window by a row."""
+    aaa, stray, spy = _off_calendar_bars()
+    p = build_panel(pd.concat([aaa, stray, spy]), raw_bars=pd.concat([aaa, stray]))
+    assert list(p.dates()) == list(pd.bdate_range("2020-01-02", periods=3))
+    assert p.close["AAA"].tolist() == [10.0, 11.0, 12.0]
+    assert p.raw_close is not None and p.raw_close.index.equals(p.close.index)
+    assert len(build_panel(pd.concat([aaa, stray])).dates()) == 5  # no SPY: every date is kept
+
+
+def test_concat_panels_joins_symbol_batches_on_spy_sessions():
+    aaa, stray, spy = _off_calendar_bars()
+    bbb = make_bars("BBB", [50.0, 51.0], start="2020-01-03")
+    whole = build_panel(pd.concat([aaa, stray, bbb, spy]), raw_bars=pd.concat([aaa, spy]))
+    batches = [
+        build_panel(pd.concat([aaa, stray]), raw_bars=aaa),
+        build_panel(pd.concat([bbb, spy]), raw_bars=spy),
+    ]
+    joined = concat_panels(batches)
+    for field in ("open", "high", "low", "close", "volume", "raw_close"):
+        pd.testing.assert_frame_equal(getattr(joined, field), getattr(whole, field))
+    with pytest.raises(ValueError, match="AAA"):
+        concat_panels([batches[0], batches[0]])
 
 
 def test_select_keeps_only_requested_symbols():

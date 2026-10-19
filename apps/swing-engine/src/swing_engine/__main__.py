@@ -51,7 +51,7 @@ from atlas_shared.config import load_env
 from atlas_shared.logging import get_logger, setup_logging
 
 from swing_engine import store
-from swing_engine.config import TOP_N_DEFAULT, RiskSettings
+from swing_engine.config import TOP_N_DEFAULT, RiskSettings, UniverseFilter
 from swing_engine.data.alpaca import AlpacaData, AlpacaError
 from swing_engine.data.assets import AssetKind
 from swing_engine.ingest import HISTORY_START, IngestResult, backfill, incremental_update
@@ -77,7 +77,6 @@ from swing_engine.validation.run import (
 log = get_logger("swing.cli")
 
 _LISTED_LIMIT = 50
-_SCAN_MIN_DOLLAR_VOLUME = 20_000_000
 _SCAN_WINDOW_DAYS = 800  # calendar days of bars: about 550 sessions, enough for a 252-bar RS
 
 
@@ -243,8 +242,14 @@ def _kinds(assets: pd.DataFrame) -> dict[str, AssetKind]:
     return {str(s): AssetKind(k) for s, k in zip(assets["symbol"], assets["kind"], strict=True)}
 
 
-async def _load_scan_inputs(as_of: date | None) -> tuple[Panel, dict[str, AssetKind], date]:
-    """Stored bars for the liquid stocks plus SPY, adjusted and raw, ending on the scan session."""
+async def _load_scan_inputs(
+    as_of: date | None, universe: UniverseFilter
+) -> tuple[Panel, dict[str, AssetKind], date]:
+    """Stored bars for the liquid stocks plus SPY, adjusted and raw, ending on the scan session.
+
+    "Liquid" is the store's prefilter at ``universe``'s dollar-volume floor, a necessary
+    condition for being eligible under that same filter.
+    """
     assets = await store.load_assets()
     if assets.empty:
         raise ScanError("no assets stored: run `python -m swing_engine backfill` first")
@@ -253,7 +258,8 @@ async def _load_scan_inputs(as_of: date | None) -> tuple[Panel, dict[str, AssetK
         if BENCHMARK not in latest:
             raise ScanError(f"no {BENCHMARK} bars stored: run `python -m swing_engine backfill`")
         as_of = latest[BENCHMARK]
-    symbols = sorted({*await store.liquid_prefilter(_SCAN_MIN_DOLLAR_VOLUME), BENCHMARK})
+    liquid = await store.liquid_prefilter(universe.min_median_dollar_volume)
+    symbols = sorted({*liquid, BENCHMARK})
     start = as_of - timedelta(days=_SCAN_WINDOW_DAYS)
     bars = await store.load_daily_bars(symbols, start, as_of)
     if bars.empty:
@@ -340,14 +346,16 @@ def format_scan(r: ScanResult, top_n: int = TOP_N_DEFAULT) -> str:
 
 
 def _scan_report(as_of: date | None) -> str:
+    universe = UniverseFilter()
     try:
-        panel, kinds, session = asyncio.run(_load_scan_inputs(as_of))
+        panel, kinds, session = asyncio.run(_load_scan_inputs(as_of, universe))
         result = run_scan(
             panel,
             kinds,
             session,
             RiskSettings(),
             default_setups(Path.cwd()),
+            universe=universe,
             rank_by=ranking_choice(Path.cwd()),
         )
     except ScanError as exc:

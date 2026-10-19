@@ -24,7 +24,7 @@ import pytest
 import swing_engine.__main__ as cli
 from swing_engine import ingest, store
 from swing_engine.calendar import Session
-from swing_engine.data.alpaca import BAR_COLUMNS, AlpacaError
+from swing_engine.data.alpaca import BAR_COLUMNS, AlpacaError, AlpacaRequestError
 from swing_engine.ingest import (
     IngestResult,
     backfill,
@@ -841,6 +841,66 @@ async def test_incremental_rejects_a_non_positive_overlap():
 
 
 # --- real store satisfies the protocol -------------------------------------------------
+
+
+class RejectingClient(FakeClient):
+    """Alpaca refuses a whole request (``status``) when any symbol in it is one of ``bad``."""
+
+    def __init__(self, *args: Any, bad: set[str], status: int = 422, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.bad, self.status = bad, status
+        self.rejected: list[list[str]] = []
+
+    async def daily_bars(
+        self,
+        symbols: Sequence[str],
+        start: date,
+        end: date,
+        now: datetime | None = None,
+        adjustment: str = "all",
+    ) -> pd.DataFrame:
+        if self.bad & set(symbols):
+            self.rejected.append(list(symbols))
+            raise AlpacaRequestError(
+                self.status, f"alpaca {self.status} from /v2/stocks/bars: invalid symbol"
+            )
+        return await super().daily_bars(symbols, start, end, now=now, adjustment=adjustment)
+
+
+GOOD = [f"S{i}" for i in range(7)]
+
+
+async def test_a_rejected_chunk_is_split_until_the_bad_symbol_is_alone():
+    """The incident: one symbol Alpaca rejects (a 4xx for the whole request) failed its chunk of
+    100 on every run, so 99 good symbols never loaded."""
+    client = RejectingClient({s: week() for s in GOOD}, bad={"BAD"})
+    store_ = FakeStore()
+
+    res = await backfill(client, store_, start=START, now=FRI_EVENING, symbols=[*GOOD, "BAD"])
+
+    assert res.failed == ["BAD"] and store_.written_symbols == GOOD
+    assert ["BAD"] in client.rejected and len(client.rejected) <= 2 * 4  # log2(8) levels
+    assert res.symbols_done == len(GOOD)
+
+
+async def test_a_rejected_catch_up_chunk_is_split_too():
+    closes = {(s, date(2026, 10, 15)): 100.0 for s in [*GOOD, "BAD"]}
+    client = RejectingClient({s: week(100.0) for s in GOOD}, bad={"BAD"})
+    store_ = FakeStore(closes=closes)
+
+    res = await incremental_update(client, store_, now=FRI_EVENING)
+
+    assert res.failed == ["BAD"] and store_.written_symbols == GOOD
+
+
+async def test_an_auth_error_fails_the_chunk_without_splitting_it():
+    client = RejectingClient({s: week() for s in GOOD}, bad={"BAD"}, status=403)
+    store_ = FakeStore()
+
+    res = await backfill(client, store_, start=START, now=FRI_EVENING, symbols=[*GOOD, "BAD"])
+
+    assert res.failed == sorted([*GOOD, "BAD"]) and store_.written_symbols == []
+    assert len(client.rejected) == 2  # one request per pass (adjusted, raw), never split
 
 
 def test_the_store_module_has_every_function_the_protocol_names():
