@@ -129,13 +129,16 @@ def train_trend(
     embargo: int = 10,
     label_horizon: int = 20,
     xgb_params: dict[str, Any] | None = None,
+    label_scheme: str | None = None,
 ) -> TrendArtifact:
     """Walk-forward train, then refit on the full set and fit the calibrator
     on out-of-fold predictions (best-practice — avoids the calibrator seeing
     in-fold targets).
 
-    `labels` must be built per symbol (see `quant_engine.train.build_training_set`);
-    the artifact is stamped `label_scheme="per_symbol_v2"` on that understanding.
+    `label_scheme` records how `labels` were built and is stamped on the artifact
+    verbatim. This function cannot check it, so the caller asserts it: pass
+    `LABEL_SCHEME_PER_SYMBOL_V2` only for labels from `quant_engine.train.build_training_set`.
+    The default (None) marks the artifact as untrusted, and `load_trend_model` refuses it.
     """
     X, y = _xy(features, labels)
     if len(X) < 5 * test_size:
@@ -210,7 +213,7 @@ def train_trend(
         feature_cols=FEATURE_COLS,
         version=version,
         metrics=metrics,
-        label_scheme=LABEL_SCHEME_PER_SYMBOL_V2,
+        label_scheme=label_scheme,
     )
 
 

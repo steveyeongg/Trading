@@ -15,6 +15,7 @@ import pytest
 from feature_engine import compute_features, gbm_bars
 from quant_engine import binary_up_labels, train_trend, triple_barrier_labels
 from quant_engine.train import build_training_set
+from quant_engine.trend import LABEL_SCHEME_PER_SYMBOL_V2
 
 # Start prices span two orders of magnitude, like a real watchlist (penny stock to NVDA-ish).
 START_PRICES = [5, 40, 100, 230, 450, 900]
@@ -41,7 +42,7 @@ def test_random_walks_score_near_chance_with_per_symbol_labels(
     x, y, h = build_training_set(random_walk_features, horizon=HORIZON, pt_mult=2.0, sl_mult=1.0)
     assert h == HORIZON * len(START_PRICES)
 
-    art = train_trend(x, y, label_horizon=h)
+    art = train_trend(x, y, label_horizon=h, label_scheme=LABEL_SCHEME_PER_SYMBOL_V2)
 
     assert art.metrics["oof_auc"] < 0.65
     assert art.label_scheme == "per_symbol_v2"
@@ -58,6 +59,8 @@ def test_old_interleaved_labelling_scored_high_on_the_same_random_walks(
     old = train_trend(feats, old_labels, label_horizon=HORIZON)
 
     assert old.metrics["oof_auc"] > 0.80
+    # train_trend cannot tell leaky labels from clean ones, so it must not vouch for them.
+    assert old.label_scheme is None
 
 
 def _two_symbol_frame(n: int = 300) -> pd.DataFrame:

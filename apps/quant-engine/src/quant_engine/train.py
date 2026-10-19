@@ -21,7 +21,7 @@ from feature_engine import compute_features, gbm_bars
 
 from quant_engine.data import load_features_for_training
 from quant_engine.labels import binary_up_labels, triple_barrier_labels
-from quant_engine.trend import save, train_trend
+from quant_engine.trend import LABEL_SCHEME_PER_SYMBOL_V2, save, train_trend
 
 setup_logging()
 log = get_logger("quant.train")
@@ -111,7 +111,13 @@ def main() -> None:
         feats, horizon=args.horizon, pt_mult=args.pt_mult, sl_mult=args.sl_mult
     )
 
-    artifact = train_trend(feats, labels, version=args.version, label_horizon=label_horizon)
+    artifact = train_trend(
+        feats,
+        labels,
+        version=args.version,
+        label_horizon=label_horizon,
+        label_scheme=LABEL_SCHEME_PER_SYMBOL_V2,
+    )
     log.info("train.metrics", **artifact.metrics)
 
     out_path = Path(args.out) / f"{args.version}.joblib"

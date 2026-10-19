@@ -14,9 +14,18 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
+import pandas as pd
 import pytest
-from quant_engine import FEATURE_COLS, TrendArtifact
-from quant_engine.trend import save
+from feature_engine import compute_features, gbm_bars
+from quant_engine import (
+    FEATURE_COLS,
+    TrendArtifact,
+    binary_up_labels,
+    train_trend,
+    triple_barrier_labels,
+)
+from quant_engine import train as quant_train
+from quant_engine.trend import LABEL_SCHEME_PER_SYMBOL_V2, TrendModel, save
 from signal_service import state, stream
 from sklearn.isotonic import IsotonicRegression
 from xgboost import XGBClassifier
@@ -70,7 +79,7 @@ def test_pickle_from_before_the_field_existed_is_refused(tmp_path):
 
 
 def test_artifact_labelled_per_symbol_v2_loads(tmp_path):
-    path = save(_tiny_artifact("per_symbol_v2", version="new"), tmp_path / "new.joblib")
+    path = save(_tiny_artifact(LABEL_SCHEME_PER_SYMBOL_V2, version="new"), tmp_path / "new.joblib")
 
     model = state.load_trend_model(path)
 
@@ -106,7 +115,7 @@ def test_only_the_literal_1_allows_a_legacy_artifact(tmp_path, monkeypatch, valu
 
 
 def test_refusal_clears_a_previously_loaded_model(tmp_path):
-    good = save(_tiny_artifact("per_symbol_v2", version="new"), tmp_path / "new.joblib")
+    good = save(_tiny_artifact(LABEL_SCHEME_PER_SYMBOL_V2, version="new"), tmp_path / "new.joblib")
     bad = save(_tiny_artifact(None), tmp_path / "old.joblib")
     assert state.load_trend_model(good) is not None
 
@@ -120,12 +129,55 @@ def test_missing_model_file_behaviour_is_unchanged(tmp_path):
     assert events == ["trend_model.missing"]
 
 
-@pytest.mark.skipif(
-    not list((REPO_ROOT / "ml/registry/trend").glob("*.joblib")),
-    reason="no local legacy models in ml/registry/trend (gitignored)",
-)
-def test_every_model_in_the_local_registry_is_refused_by_default():
-    for path in sorted((REPO_ROOT / "ml/registry/trend").glob("*.joblib")):
+def test_train_trend_without_label_scheme_is_refused_by_the_loader(tmp_path):
+    """train_trend can't check how its labels were built, so by default it doesn't vouch for them."""
+    feats = compute_features(gbm_bars(n=2500, seed=3))
+    labels = binary_up_labels(triple_barrier_labels(feats["close"], feats["atr14"]))
+
+    art = train_trend(feats, labels, version="unstamped", n_splits=4, test_size=250)
+
+    assert art.label_scheme is None
+    assert state.load_trend_model(save(art, tmp_path / "unstamped.joblib")) is None
+
+
+def _stub_postgres_frame(n: int = 1000) -> pd.DataFrame:
+    frames = [
+        compute_features(gbm_bars(n=n, seed=21, s0=8.0, symbol="AAA")),
+        compute_features(gbm_bars(n=n, seed=22, s0=600.0, symbol="BBB")),
+    ]
+    return pd.concat(frames, ignore_index=True).sort_values(["ts", "symbol"]).reset_index(drop=True)
+
+
+@pytest.mark.parametrize("source", ["synthetic", "postgres"])
+def test_artifact_trained_by_the_cli_is_accepted_by_the_loader(tmp_path, monkeypatch, source):
+    """`python -m quant_engine.train` is the one path that vouches for per-symbol labels."""
+    if source == "synthetic":
+        args = ["--synthetic", "--n-bars", "2500"]
+    else:
+        monkeypatch.setattr(quant_train, "load_features_for_training", lambda *a, **k: _stub_postgres_frame())
+        args = ["--symbols", "AAA,BBB"]
+    monkeypatch.setattr(sys, "argv", ["train", *args, "--version", "cli", "--out", str(tmp_path)])
+
+    quant_train.main()
+
+    model = state.load_trend_model(tmp_path / "cli.joblib")
+    assert model is not None
+    assert model.artifact.label_scheme == LABEL_SCHEME_PER_SYMBOL_V2
+
+
+def test_every_legacy_model_in_the_local_registry_is_refused_by_default():
+    """ml/registry/trend is also train.py's default --out, so it can hold fresh per_symbol_v2
+    models next to the gitignored v0/v1 ones; only the non-per_symbol_v2 ones must be refused."""
+    registry = REPO_ROOT / "ml/registry/trend"
+    legacy = [
+        path
+        for path in sorted(registry.glob("*.joblib"))
+        if getattr(TrendModel.load(path).artifact, "label_scheme", None) != LABEL_SCHEME_PER_SYMBOL_V2
+    ]
+    if not legacy:
+        pytest.skip("no legacy (non per_symbol_v2) models in ml/registry/trend (gitignored)")
+
+    for path in legacy:
         assert state.load_trend_model(path) is None, f"{path.name} should be refused"
 
 
