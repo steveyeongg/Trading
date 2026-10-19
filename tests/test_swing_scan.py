@@ -15,6 +15,7 @@ synthetic universe of 40 trending stocks plus SPY (``synthetic_universe_panel``)
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 from contextlib import redirect_stdout
@@ -44,6 +45,7 @@ from swing_engine.scan import (
 from swing_engine.setups import candidates_for
 from swing_engine.sizing import Capacity, Sizing, size_idea
 from swing_engine.testing import scramble_after, synthetic_kinds, synthetic_universe_panel
+from swing_engine.validation.prereg import Prereg, write_draft
 
 # SPY + 40 stocks, 600 sessions. Seed 5 gives session 450 three breakout and three pullback
 # candidates whose RS order and proximity order differ, which the ranking tests need.
@@ -620,19 +622,18 @@ def test_scan_command_ranks_by_proximity_when_a_live_setup_found_rs_did_not_help
     monkeypatch, tmp_path
 ):
     _FakeStore(monkeypatch)
-    report = tmp_path / "ml" / "validation" / "breakout" / "breakout-v1.report.json"
-    report.parent.mkdir(parents=True)
-    report.write_text(
-        json.dumps(
-            {
-                "version": "breakout-v1",
-                "run_index": 1,
-                "verdict": {"passed": True, "failures": []},
-                "regime_filter": {"helps": True},
-                "ranking": {"rs_helps": False},
-            }
-        )
-    )
+    folder = tmp_path / "ml" / "validation" / "breakout"
+    prereg = Prereg.create(
+        family="breakout", version="breakout-v1", params=dataclasses.asdict(BreakoutParams()),
+        gate={}, is_window=[], oos_start="2023-01-01", hypothesis="", created_at="2026-10-19",
+    )  # fmt: skip
+    write_draft(folder / "breakout-v1.prereg.json", prereg)
+    report = {
+        "version": "breakout-v1", "run_index": 1, "freeze_date": "2026-09-30",
+        "prereg_sha256": prereg.sha256, "verdict": {"passed": True, "failures": []},
+        "regime_filter": {"helps": True}, "ranking": {"rs_helps": False},
+    }  # fmt: skip
+    (folder / "breakout-v1.report.json").write_text(json.dumps(report))
     out = _run_cli("--as-of", AS_OF.isoformat())
 
     rows = [w for w in map(str.split, out.splitlines()) if w and w[0].isdigit()]

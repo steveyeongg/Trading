@@ -71,6 +71,13 @@ class Prereg:
         }
         return cls(**fields, sha256=_digest(fields))
 
+    def is_sealed(self) -> bool:
+        """True when ``sha256`` is still the digest of the other fields (no hand edit since)."""
+        try:
+            return _digest(dataclasses.asdict(self)) == self.sha256
+        except (TypeError, ValueError):  # a field JSON cannot encode canonically (NaN, a set)
+            return False
+
 
 def _digest(fields: Mapping[str, Any]) -> str:
     """Hex sha256 of the canonical JSON of ``fields`` without ``sha256`` (sorted, compact)."""
@@ -100,9 +107,12 @@ def load_prereg(path: Path) -> Prereg:
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", "-C", str(repo), *args], capture_output=True, text=True, check=False
-    )
+    try:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args], capture_output=True, text=True, check=False
+        )
+    except FileNotFoundError:
+        raise PreregError("git is required to verify pre-registration") from None
 
 
 def check_committed(path: Path, repo: Path) -> Prereg:
@@ -130,7 +140,7 @@ def check_committed(path: Path, repo: Path) -> Prereg:
     if changed.returncode != 0:
         raise PreregError(f"cannot compare {rel} with HEAD: {changed.stderr.strip()}")
 
-    if _digest(dataclasses.asdict(prereg)) != prereg.sha256:
+    if not prereg.is_sealed():
         raise PreregError(
             f"{rel} was edited after it was written: its sha256 does not match its contents"
         )

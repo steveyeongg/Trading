@@ -12,6 +12,7 @@ comparison is written so that a NaN (no trades, no baseline) fails rather than p
 from __future__ import annotations
 
 import itertools
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
@@ -86,8 +87,9 @@ def evaluate_gate(
     """The ship gate on out-of-sample results; the verdict lists every condition that failed.
 
     ``oos`` holds the trade-level ``n``, ``expectancy_r`` and ``profit_factor``. Both drawdowns
-    are NEGATIVE fractions, and "worse" means deeper: ``portfolio_max_dd < spy_max_dd``. A
-    ``coverage`` below ``t.coverage_floor`` (or NaN, unmeasured) raises the profit-factor floor.
+    are NEGATIVE fractions, and "worse" means deeper: ``portfolio_max_dd < spy_max_dd``. A NaN
+    drawdown on either side fails as "drawdown unknown". A ``coverage`` below
+    ``t.coverage_floor`` (or NaN, unmeasured) raises the profit-factor floor.
     """
     x, pf, n = float(oos["expectancy_r"]), float(oos["profit_factor"]), int(oos["n"])
     floor = (
@@ -102,7 +104,9 @@ def evaluate_gate(
         failures.append(f"only {n} trades (need {t.min_trades})")
     if not x > baseline_median:
         failures.append(f"expectancy {x:.2f}R not above random entry {baseline_median:.2f}R")
-    if portfolio_max_dd < spy_max_dd:
+    if math.isnan(portfolio_max_dd) or math.isnan(spy_max_dd):
+        failures.append("drawdown unknown")
+    elif portfolio_max_dd < spy_max_dd:
         failures.append(
             f"drawdown {abs(portfolio_max_dd):.0%} worse than SPY {abs(spy_max_dd):.0%}"
         )

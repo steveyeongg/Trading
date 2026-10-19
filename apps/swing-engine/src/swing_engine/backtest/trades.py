@@ -31,7 +31,7 @@ from swing_engine.execution import ExitReason, TradeOutcome, simulate_trade
 from swing_engine.indicators import MAX_GAP, Indicators
 from swing_engine.panel import Panel
 from swing_engine.regime import Regime
-from swing_engine.scan import build_context
+from swing_engine.scan import ScanContext, build_context
 from swing_engine.setups import candidates_for
 
 
@@ -51,9 +51,18 @@ def candidate_history(
     each date's own truncation, because every component is causal. Raises
     :class:`~swing_engine.scan.ScanError` when SPY has no bar on ``end``, as a scan would.
     """
-    ctx = build_context(panel, kinds, end, universe)
+    return context_candidates(build_context(panel, kinds, end, universe), params, start)
+
+
+def context_candidates(ctx: ScanContext, params: SetupParams, start: date) -> pd.DataFrame:
+    """:func:`candidate_history` on a context already built: the sessions ``[start, ctx.session]``.
+
+    Nothing in a :class:`~swing_engine.scan.ScanContext` depends on the setup's parameters, so a
+    caller trying several parameter sets over one window builds the context once and passes it
+    to each. The result is the same as ``candidate_history`` with ``end=ctx.session``.
+    """
     found = candidates_for(ctx.panel, ctx.ind, ctx.leaders, ctx.rs_pct, params)
-    inside = (found["date"] >= pd.Timestamp(start)) & (found["date"] <= pd.Timestamp(end))
+    inside = (found["date"] >= pd.Timestamp(start)) & (found["date"] <= ctx.session)
     found = found.loc[inside].reset_index(drop=True)
     regime = ctx.regime.map(lambda r: Regime(r).value)
     found["regime"] = regime.reindex(pd.DatetimeIndex(found["date"])).to_numpy(dtype=object)

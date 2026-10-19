@@ -259,9 +259,11 @@ def default_setups(repo: Path | None = None) -> list[SetupSpec]:
     """Both setup families (breakout, then pullback) as their committed validation left them.
 
     Each family runs with the parameters pre-registered for its latest out-of-sample version
-    (its defaults before the first run), is Live only when that run passed the gate, and keeps
-    the regime gate unless that run found the regime filter did not help. ``repo`` is where
-    ``ml/validation/`` lives; None means the current directory. Nothing is re-run here.
+    (its defaults before the first run, or when that file is missing or edited), is Live only
+    when that run passed the gate and its pre-registration is unchanged since, and keeps the
+    regime gate unless that run found the regime filter did not help. ``repo`` is where
+    ``ml/validation/`` lives; None means the current directory. Nothing is re-run here, and a
+    bad file never raises: it makes its family Research only.
     """
     # Imported here: the validation harness itself builds on this module.
     from swing_engine.validation.run import latest_report, load_verdicts, params_for
@@ -280,10 +282,14 @@ def default_setups(repo: Path | None = None) -> list[SetupSpec]:
     return specs
 
 
-def json_safe(value: Any) -> Any:
-    """Plain JSON types: ISO dates, enum values, Python numbers, NaN and infinities as None."""
+def json_safe(value: Any, *, infinity_as_str: bool = False) -> Any:
+    """Plain JSON types: ISO dates, enum values, Python numbers, NaN and infinities as None.
+
+    With ``infinity_as_str`` an infinity is kept as the string ``"inf"`` or ``"-inf"`` (which
+    ``float()`` reads back) instead of None; NaN is None either way.
+    """
     if isinstance(value, Enum):
-        return json_safe(value.value)
+        return json_safe(value.value, infinity_as_str=infinity_as_str)
     if value is None or isinstance(value, (str, bool)):
         return value
     if isinstance(value, np.bool_):
@@ -291,13 +297,17 @@ def json_safe(value: Any) -> Any:
     if isinstance(value, (int, np.integer)):
         return int(value)
     if isinstance(value, (float, np.floating)):
-        return float(value) if math.isfinite(value) else None
+        if math.isfinite(value):
+            return float(value)
+        if infinity_as_str and math.isinf(value):
+            return "inf" if value > 0 else "-inf"
+        return None
     if isinstance(value, date):
         return value.isoformat()
     if isinstance(value, Mapping):
-        return {str(k): json_safe(v) for k, v in value.items()}
+        return {str(k): json_safe(v, infinity_as_str=infinity_as_str) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
-        return [json_safe(v) for v in value]
+        return [json_safe(v, infinity_as_str=infinity_as_str) for v in value]
     raise TypeError(f"not JSON-serialisable: {type(value).__name__}")
 
 

@@ -24,6 +24,7 @@ import dataclasses
 import hashlib
 import io
 import json
+import math
 import subprocess
 from contextlib import redirect_stdout
 from datetime import UTC, date, datetime
@@ -33,11 +34,16 @@ import numpy as np
 import pandas as pd
 import pytest
 import swing_engine.__main__ as cli
+import swing_engine.backtest.trades as trades_module
+import swing_engine.validation.run as run_module
 from swing_engine import store
-from swing_engine.config import BreakoutParams, PullbackParams
+from swing_engine.backtest.stats import regime_on, trade_stats
+from swing_engine.backtest.trades import candidate_history, simulate_candidates
+from swing_engine.config import BreakoutParams, ExecutionParams, PullbackParams
 from swing_engine.data.assets import AssetKind
-from swing_engine.panel import Panel
-from swing_engine.scan import default_setups
+from swing_engine.indicators import compute_indicators
+from swing_engine.panel import Panel, truncate
+from swing_engine.scan import default_setups, json_safe
 from swing_engine.testing import scramble_after, synthetic_kinds, synthetic_universe_panel
 from swing_engine.validation.prereg import (
     Prereg,
@@ -66,6 +72,8 @@ from swing_engine.validation.run import (
     panel_meta,
     params_for,
     ranking_choice,
+    regime_filter_helps,
+    rs_ranking,
     run_insample,
     run_oos,
 )
@@ -108,6 +116,14 @@ def test_gate_drawdown_equal_to_spy_is_not_worse():
     assert evaluate_gate(oos, 0.1, -0.26, -0.25, 1.0).failures == [
         "drawdown 26% worse than SPY 25%"
     ]
+
+
+def test_an_unknown_drawdown_fails_the_gate_and_an_infinite_profit_factor_passes():
+    nan = float("nan")
+    oos = {"expectancy_r": 0.3, "profit_factor": float("inf"), "n": 200}
+    assert evaluate_gate(oos, 0.1, -0.1, -0.2, 1.0).passed  # no losing trade at all
+    assert evaluate_gate(oos, 0.1, nan, -0.2, 1.0).failures == ["drawdown unknown"]
+    assert evaluate_gate(oos, 0.1, -0.1, nan, 1.0).failures == ["drawdown unknown"]
 
 
 def test_gate_with_no_trades_fails_every_trade_condition():
@@ -267,7 +283,28 @@ def test_revision_requires_hypothesis(tmp_git_repo):
     assert check_committed(path, tmp_git_repo) == revised
 
 
+def test_a_missing_git_is_a_prereg_error(tmp_git_repo, monkeypatch):
+    path = _prereg_path(tmp_git_repo, "breakout", "breakout-v1")
+    write_draft(path, _prereg())
+    _commit(tmp_git_repo, path)
+    monkeypatch.setenv("PATH", str(tmp_git_repo / "no-such-bin"))  # git can't be found
+    with pytest.raises(PreregError) as err:
+        check_committed(path, tmp_git_repo)
+    assert str(err.value) == "git is required to verify pre-registration"
+
+
 # ---------------------------------------------------------------------------- reports on disk
+
+
+def _register(repo: Path, family: str = "breakout", n: int = 1, **params) -> str:
+    """Write a sealed pre-registration for ``<family>-v<n>`` and return its sha256."""
+    version = f"{family}-v{n}"
+    defaults = {"breakout": BreakoutParams, "pullback": PullbackParams}[family]
+    prereg = _prereg(
+        family, version, params=dataclasses.asdict(defaults(version=version, **params))
+    )
+    write_draft(_prereg_path(repo, family, version), prereg)
+    return prereg.sha256
 
 
 def _write_report(
@@ -279,12 +316,14 @@ def _write_report(
     freeze: str = "2026-09-30",
     helps: bool = True,
     rs_helps: bool = True,
+    prereg_sha256: str | None = None,
 ) -> Path:
     path = repo / "ml" / "validation" / family / f"{family}-v{n}.report.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     report = {
         "family": family,
         "version": f"{family}-v{n}",
+        "prereg_sha256": prereg_sha256,
         "run_index": n,
         "freeze_date": freeze,
         "regime_filter": {"helps": helps},
@@ -293,6 +332,11 @@ def _write_report(
     }
     path.write_text(json.dumps(report))
     return path
+
+
+def _live(repo: Path, family: str = "breakout", **report) -> None:
+    """A passing v1 report whose pre-registration is on file and unchanged."""
+    _write_report(repo, family, 1, passed=True, prereg_sha256=_register(repo, family), **report)
 
 
 def test_budget_refuses_fourth_oos_run(tmp_path):
@@ -322,6 +366,14 @@ def test_a_version_runs_out_of_sample_only_once(tmp_path):
         run_oos("breakout", "breakout-v1", tmp_path, NOW)
 
 
+def test_the_version_must_be_the_next_run(tmp_path):
+    with pytest.raises(ValueError, match="is breakout-v1, not breakout-v2"):
+        run_oos("breakout", "breakout-v2", tmp_path, NOW)  # nothing has run: v1 is next
+    _write_report(tmp_path, "breakout", 1, passed=False)
+    with pytest.raises(ValueError, match="is breakout-v2, not breakout-v3"):
+        run_oos("breakout", "breakout-v3", tmp_path, NOW)
+
+
 def test_load_verdicts_defaults_to_not_yet_tested(tmp_path):
     untested = {"live": False, "version": None, "failures": ["not yet tested"], "report_path": None}
     assert load_verdicts(tmp_path)["breakout"] == untested
@@ -329,9 +381,9 @@ def test_load_verdicts_defaults_to_not_yet_tested(tmp_path):
 
 
 def test_load_verdicts_reads_the_latest_run_of_each_family(tmp_path):
-    _write_report(tmp_path, "breakout", 1, passed=True)
+    _write_report(tmp_path, "breakout", 1, passed=True, prereg_sha256=_register(tmp_path))
     _write_report(tmp_path, "breakout", 2, passed=False)
-    _write_report(tmp_path, "pullback", 1, passed=True)
+    _live(tmp_path, "pullback")
     verdicts = load_verdicts(tmp_path)
     assert verdicts["breakout"] == {
         "version": "breakout-v2",
@@ -342,20 +394,75 @@ def test_load_verdicts_reads_the_latest_run_of_each_family(tmp_path):
     assert verdicts["pullback"]["live"] is True and verdicts["pullback"]["failures"] == []
 
 
+def test_live_needs_the_sealed_prereg_that_the_passing_run_used(tmp_path):
+    changed = "pre-registration missing or changed since its run"
+    sha = _register(tmp_path, stop_atr=2.5)
+    _write_report(tmp_path, "breakout", 1, passed=True, prereg_sha256=sha)
+    assert load_verdicts(tmp_path)["breakout"]["live"] is True
+    assert default_setups(tmp_path)[0].live and default_setups(tmp_path)[0].params.stop_atr == 2.5
+
+    _register(tmp_path, stop_atr=1.5)  # re-sealed after the run: a valid file, not the tested one
+    verdict = load_verdicts(tmp_path)["breakout"]
+    assert (verdict["live"], verdict["failures"]) == (False, [changed])
+    assert verdict["version"] == "breakout-v1"
+    assert not default_setups(tmp_path)[0].live
+
+    path = _prereg_path(tmp_path, "breakout", "breakout-v1")
+    doc = json.loads(path.read_text())
+    doc["params"]["stop_atr"], doc["sha256"] = 2.5, sha  # hand-edited back, seal not redone
+    doc["created_at"] = "2026-10-20T00:00:00+00:00"
+    path.write_text(json.dumps(doc))
+    assert load_verdicts(tmp_path)["breakout"]["failures"] == [changed]
+    spec = default_setups(tmp_path)[0]
+    assert not spec.live and spec.params == BreakoutParams()  # an unsealed file is never used
+
+    path.unlink()  # e.g. a clone with the report but not the pre-registration
+    assert load_verdicts(tmp_path)["breakout"]["failures"] == [changed]
+    spec = default_setups(tmp_path)[0]
+    assert not spec.live and spec.params == BreakoutParams()  # research-only ideas keep flowing
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["{not json", json.dumps([1, 2]), json.dumps({"version": "breakout-v2", "run_index": "2"})],
+)
+def test_an_unreadable_report_makes_the_family_research_only_and_never_breaks_the_scan(
+    tmp_path, text
+):
+    _live(tmp_path)
+    (tmp_path / "ml/validation/breakout/breakout-v2.report.json").write_text(text)
+
+    assert load_verdicts(tmp_path)["breakout"] == {
+        "version": None,
+        "live": False,
+        "failures": ["report unreadable"],
+        "report_path": "ml/validation/breakout/breakout-v2.report.json",
+    }
+    assert load_verdicts(tmp_path)["pullback"]["failures"] == ["not yet tested"]
+    spec = default_setups(tmp_path)[0]
+    assert (spec.live, spec.params, spec.regime_gate) == (False, BreakoutParams(), True)
+    assert ranking_choice(tmp_path) == "rs"
+    # Counting the budget needs every report, so an out-of-sample or in-sample run stops.
+    with pytest.raises(ValueError, match=r"breakout-v2\.report\.json"):
+        run_oos("breakout", "breakout-v3", tmp_path, NOW)
+    with pytest.raises(ValueError, match=r"breakout-v2\.report\.json"):
+        run_insample("breakout", tmp_path)
+
+
 def test_params_for_reads_the_prereg_or_falls_back_to_defaults(tmp_path):
     assert params_for("breakout", None, tmp_path) == BreakoutParams()
     assert params_for("pullback", "pullback-v2", tmp_path) == PullbackParams()  # no file
-    p = _prereg(params=dataclasses.asdict(BreakoutParams(stop_atr=2.5, trail_atr=3.5)))
-    write_draft(_prereg_path(tmp_path, "breakout", "breakout-v1"), p)
+    _register(tmp_path, stop_atr=2.5, trail_atr=3.5)
     assert params_for("breakout", "breakout-v1", tmp_path) == BreakoutParams(
         stop_atr=2.5, trail_atr=3.5
     )
+    _prereg_path(tmp_path, "breakout", "breakout-v1").write_text("{broken")
+    assert params_for("breakout", "breakout-v1", tmp_path) == BreakoutParams()
 
 
 def test_default_setups_use_preregistered_params_and_verdict(tmp_path):
-    p = _prereg(params=dataclasses.asdict(BreakoutParams(stop_atr=2.5)))
-    write_draft(_prereg_path(tmp_path, "breakout", "breakout-v1"), p)
-    _write_report(tmp_path, "breakout", 1, passed=True)
+    sha = _register(tmp_path, stop_atr=2.5)
+    _write_report(tmp_path, "breakout", 1, passed=True, prereg_sha256=sha)
 
     specs = default_setups(tmp_path)
     spec = {s.params.version: s for s in specs}["breakout-v1"]
@@ -365,18 +472,48 @@ def test_default_setups_use_preregistered_params_and_verdict(tmp_path):
 
 
 def test_regime_filter_that_does_not_help_turns_into_warning(tmp_path):
-    write_draft(_prereg_path(tmp_path, "breakout", "breakout-v1"), _prereg())
-    _write_report(tmp_path, "breakout", 1, passed=True, helps=False)
+    _live(tmp_path, helps=False)
     spec = {s.params.version: s for s in default_setups(tmp_path)}["breakout-v1"]
-    assert spec.regime_gate is False
+    assert spec.live and spec.regime_gate is False
 
 
 def test_ranking_choice_falls_back_to_proximity_when_rs_does_not_help(tmp_path):
     assert ranking_choice(tmp_path) == "rs"  # nothing validated yet
     _write_report(tmp_path, "pullback", 1, passed=False, rs_helps=False)
     assert ranking_choice(tmp_path) == "rs"  # only a Live family's ranking counts
-    _write_report(tmp_path, "breakout", 1, passed=True, rs_helps=False)
+    _live(tmp_path, rs_helps=False)
     assert ranking_choice(tmp_path) == "proximity"
+
+
+def test_regime_filter_helps_only_when_neither_expectancy_nor_drawdown_is_worse():
+    nan = float("nan")
+    assert regime_filter_helps(0.30, 0.20, -0.10, -0.15)
+    assert not regime_filter_helps(0.10, 0.20, -0.10, -0.15)  # trading every regime earned more
+    assert not regime_filter_helps(0.30, 0.20, -0.20, -0.15)  # the gated book fell further
+    assert regime_filter_helps(0.20, 0.20, -0.15, -0.15)  # a tie keeps the filter
+    assert regime_filter_helps(nan, 0.20, -0.10, -0.10)  # no expectancy to compare
+    assert not regime_filter_helps(nan, 0.20, -0.20, -0.10)
+
+
+def _closed_trades(rs: np.ndarray, r: np.ndarray) -> pd.DataFrame:
+    return pd.DataFrame({"status": "closed", "rs_pct": rs, "r_multiple": r})
+
+
+def test_rs_ranking_compares_the_top_quintile_with_the_bottom_one():
+    rs = np.arange(70.0, 100.0)  # 30 distinct values: 6 trades per quintile
+    rising = rs_ranking(_closed_trades(rs, (rs - 85.0) / 10.0))
+    q = rising["quintile_expectancy"]
+    assert len(q) == 5 and q == sorted(q) and rising["rs_helps"] is True
+    assert q[0] == pytest.approx((np.arange(70.0, 76.0) - 85.0).mean() / 10.0)
+
+    assert rs_ranking(_closed_trades(rs, (85.0 - rs) / 10.0))["rs_helps"] is False
+    dip = np.where((rs >= 82) & (rs < 88), -5.0, (rs - 85.0) / 10.0)  # middle quintile is awful
+    assert rs_ranking(_closed_trades(rs, dip))["rs_helps"] is True  # only q5 vs q1 counts
+
+    still_open = _closed_trades(rs, (85.0 - rs) / 10.0).assign(status="open")
+    assert rs_ranking(still_open) == {"quintile_expectancy": [], "rs_helps": True}
+    one_group = rs_ranking(_closed_trades(np.full(10, 80.0), np.linspace(-1, 1, 10)))
+    assert one_group["rs_helps"] is True  # nothing to compare
 
 
 # ---------------------------------------------------------------------------- data
@@ -504,6 +641,25 @@ REPORT_KEYS = {
 }  # fmt: skip
 
 
+class _ContextCounter:
+    """Counts market-context builds, wherever the harness or the trade code makes them."""
+
+    def __init__(self, mp: pytest.MonkeyPatch) -> None:
+        self.n = 0
+        real = run_module.build_context
+
+        def counting(*args, **kwargs):
+            self.n += 1
+            return real(*args, **kwargs)
+
+        mp.setattr(run_module, "build_context", counting)
+        mp.setattr(trades_module, "build_context", counting)
+
+    def take(self) -> int:
+        n, self.n = self.n, 0
+        return n
+
+
 @pytest.fixture(scope="module")
 def validated(tmp_path_factory) -> dict:
     """``run_insample`` then ``run_oos`` for breakout in a fresh git repo, run once per module."""
@@ -511,13 +667,17 @@ def validated(tmp_path_factory) -> dict:
     panel = _validation_panel()
     data = _data(panel, delisted=frozenset({"S07"}))
 
-    summary = run_insample("breakout", repo, data=data)
-    prereg = Path(summary["prereg_path"])
-    with pytest.raises(PreregError, match="not committed"):
-        run_oos("breakout", summary["version"], repo, NOW, data=data)
-    _commit(repo, prereg)
-    report = run_oos("breakout", summary["version"], repo, NOW, data=data)
-    return {"repo": repo, "data": data, "summary": summary, "report": report}
+    with pytest.MonkeyPatch.context() as mp:
+        contexts = _ContextCounter(mp)
+        summary = run_insample("breakout", repo, data=data)
+        built = {"insample": contexts.take()}
+        prereg = Path(summary["prereg_path"])
+        with pytest.raises(PreregError, match="not committed"):
+            run_oos("breakout", summary["version"], repo, NOW, data=data)
+        _commit(repo, prereg)
+        report = run_oos("breakout", summary["version"], repo, NOW, data=data)
+        built["oos"] = contexts.take()
+    return {"repo": repo, "data": data, "summary": summary, "report": report, "built": built}
 
 
 def test_insample_writes_the_grid_and_a_draft_prereg(validated):
@@ -560,11 +720,22 @@ def test_oos_report_has_every_key_and_reports_the_verdict_either_way(validated):
     assert set(baseline) == {"median", "p5", "p95"}
     assert baseline["p5"] <= baseline["median"] <= baseline["p95"]
     assert report["deflated_sharpe"]["n_trials"] == 10
-    assert set(report["regime_filter"]) == {"helps", "on", "off"}
-    assert report["regime_filter"]["on"] == report["oos_trades"]
-    assert report["regime_filter"]["off"] == report["oos_trades_regime_off"]
-    assert isinstance(report["ranking"]["rs_helps"], bool)
-    assert 1 <= len(report["ranking"]["quintile_expectancy"]) <= 5
+    regime = report["regime_filter"]
+    assert set(regime) == {"helps", "on", "off", "max_dd"}
+    assert regime["on"] == report["oos_trades"]
+    assert regime["off"] == report["oos_trades_regime_off"]
+    assert regime["max_dd"]["on"] == report["portfolio_alone"]["max_dd"]
+    assert regime["helps"] == regime_filter_helps(
+        _stored(regime["on"]["expectancy_r"]),
+        _stored(regime["off"]["expectancy_r"]),
+        regime["max_dd"]["on"],
+        regime["max_dd"]["off"],
+    )
+    quintiles = report["ranking"]["quintile_expectancy"]
+    assert 1 <= len(quintiles) <= 5
+    assert report["ranking"]["rs_helps"] == (len(quintiles) < 2 or quintiles[-1] > quintiles[0])
+    chosen = select_variant(report["grid"])
+    assert report["is_stats"] == {k: v for k, v in chosen.items() if k != "params"}
     for year in report["by_year"]:
         assert int(year) >= OOS_START.year
 
@@ -576,19 +747,48 @@ def test_oos_report_has_every_key_and_reports_the_verdict_either_way(validated):
     assert report["portfolio_alone"]["max_dd"] <= 0.0
 
 
+def _stored(value) -> float:
+    """A number as the report stores it: null is NaN, "inf"/"-inf" are infinities."""
+    return math.nan if value is None else float(value)
+
+
+def _verdict_from_stored_numbers(report: dict) -> dict:
+    v = evaluate_gate(
+        {k: _stored(report["oos_trades"][k]) for k in ("n", "expectancy_r", "profit_factor")},
+        _stored(report["baseline"]["median"]),
+        _stored(report["portfolio_alone"]["max_dd"]),
+        _stored(report["spy"]["max_dd"]),
+        _stored(report["coverage"]),
+    )
+    return {"passed": v.passed, "failures": v.failures}
+
+
 def test_oos_verdict_is_what_the_gate_says_about_the_reported_numbers(validated):
     report = validated["report"]
-    nan = float("nan")
-    oos = {k: nan if v is None else v for k, v in report["oos_trades"].items()}
-    median = report["baseline"]["median"]
-    expected = evaluate_gate(
-        oos,
-        nan if median is None else median,
-        report["portfolio_alone"]["max_dd"],
-        report["spy"]["max_dd"],
-        report["coverage"],
-    )
-    assert report["verdict"] == {"passed": expected.passed, "failures": expected.failures}
+    assert report["verdict"] == _verdict_from_stored_numbers(report)
+
+
+def test_one_context_per_window_gives_the_numbers_rebuilding_it_per_call_gave(validated):
+    assert validated["built"] == {"insample": 1, "oos": 2}  # IS cut; IS cut + freeze
+    repo, data, report = validated["repo"], validated["data"], validated["report"]
+    panel, ex = data.panel, ExecutionParams()
+
+    cut = panel.dates()[panel.dates() <= pd.Timestamp(IS_END)][-1]
+    is_panel = truncate(panel, cut)
+    is_ind = compute_indicators(is_panel)
+    rows = []
+    for combo in grid_variants("breakout"):
+        params = dataclasses.replace(BreakoutParams(), **combo)
+        found = candidate_history(is_panel, data.kinds, params, IS_START, cut.date())
+        found = simulate_candidates(is_panel, is_ind, found, params, ex, frozenset())
+        rows.append({"params": combo, **trade_stats(regime_on(found))})
+    assert json_safe(rows, infinity_as_str=True) == report["grid"]
+
+    freeze = panel.dates()[-1]
+    params = params_for("breakout", "breakout-v1", repo)
+    found = candidate_history(panel, data.kinds, params, OOS_START, freeze.date())
+    found = simulate_candidates(panel, compute_indicators(panel), found, params, ex, data.delisted)
+    assert json_safe(trade_stats(regime_on(found)), infinity_as_str=True) == report["oos_trades"]
 
 
 def test_the_scan_reads_the_new_verdict(validated):
@@ -627,15 +827,50 @@ def test_oos_never_sees_data_after_the_freeze(tmp_path):
     panel.close.loc[panel.dates() > freeze, "SPY"] = np.nan  # SPY's last five sessions are missing
     scrambled = scramble_after(panel, freeze, seed=12)
     scrambled.close.loc[scrambled.dates() > freeze, "SPY"] = np.nan
+    plain_repo = _init_repo(tmp_path / "plain")
+    prereg = Path(run_insample("pullback", plain_repo, data=_data(panel))["prereg_path"])
     reports = []
     for name, p in (("plain", panel), ("scrambled", scrambled)):
         repo = _init_repo(tmp_path / name)
         path = _prereg_path(repo, "pullback", "pullback-v1")
-        write_draft(path, _prereg("pullback", "pullback-v1"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(prereg.read_text())  # one pre-registration, the same in both repos
         _commit(repo, path)
         reports.append(run_oos("pullback", "pullback-v1", repo, NOW, data=_data(p)))
     assert reports[0]["freeze_date"] == freeze.date().isoformat()
     assert reports[0] == reports[1]
+
+
+def test_oos_refuses_parameters_that_are_not_the_in_sample_choice(tmp_path):
+    repo = _init_repo(tmp_path / "repo")
+    path = _prereg_path(repo, "breakout", "breakout-v1")
+    write_draft(path, _prereg(params=dataclasses.asdict(BreakoutParams(stop_atr=3.7))))  # off-grid
+    _commit(repo, path)
+    with pytest.raises(PreregError) as err:
+        run_oos("breakout", "breakout-v1", repo, NOW, data=_data(_validation_panel()))
+    assert str(err.value) == "breakout-v1 is not the in-sample choice; re-run insample"
+    assert not (repo / "ml/validation/breakout/breakout-v1.report.json").exists()
+
+
+def test_an_infinite_profit_factor_is_stored_so_the_verdict_can_be_rechecked(tmp_path, monkeypatch):
+    real = run_module.trade_stats
+
+    def no_losers(trades: pd.DataFrame) -> dict:
+        stats = real(trades)
+        return {**stats, "profit_factor": math.inf} if stats["n"] else stats
+
+    monkeypatch.setattr(run_module, "trade_stats", no_losers)
+    repo = _init_repo(tmp_path / "repo")
+    data = _data(_validation_panel())
+    _commit(repo, Path(run_insample("pullback", repo, data=data)["prereg_path"]))
+    report = run_oos("pullback", "pullback-v1", repo, NOW, data=data)
+
+    stored = json.loads((repo / "ml/validation/pullback/pullback-v1.report.json").read_text())
+    assert stored["oos_trades"]["profit_factor"] == "inf"
+    assert stored["grid"][0]["profit_factor"] == "inf"
+    assert not any("profit factor" in f for f in stored["verdict"]["failures"])
+    assert stored["verdict"] == _verdict_from_stored_numbers(stored) == report["verdict"]
+    assert "profit factor inf" in cli.format_oos(stored)
 
 
 # ---------------------------------------------------------------------------- the CLI
@@ -703,6 +938,25 @@ def test_oos_command_prints_the_verdict_and_its_failures(monkeypatch):
     assert seen["now"].tzinfo is not None
     assert "FAILED" in out and "Research only" in out and "only 80 trades (need 100)" in out
     assert "pullback-v1.report.json" in out
+
+
+def test_the_printouts_survive_missing_and_infinite_numbers():
+    report = {
+        "family": "breakout", "version": "breakout-v1", "oos_window": ["2023-01-01", "2026-10-16"],
+        "oos_trades": {"n": 0, "expectancy_r": None, "profit_factor": "inf"},
+        "baseline": {"median": None}, "portfolio_alone": {"max_dd": None},
+        "spy": {"max_dd": -0.25}, "deflated_sharpe": {"value": None}, "coverage": None,
+        "verdict": {"passed": False, "failures": ["drawdown unknown"]},
+    }  # fmt: skip
+    out = cli.format_oos(report)
+    assert "expectancy n/a" in out and "profit factor inf" in out and "max drawdown n/a" in out
+    assert "SPY 25%" in out and "deflated Sharpe n/a" in out and "drawdown unknown" in out
+
+    row = {"n": 120, "win_rate": None, "expectancy_r": 0.2, "profit_factor": "inf", "avg_hold": 9.0}
+    grid = [{"params": {"stop_atr": 1.5, "trail_atr": 2.5}, **row}]
+    summary = {"family": "breakout", "version": "breakout-v1", "grid": grid, "chosen": grid[0],
+               "prereg_path": "x.prereg.json"}  # fmt: skip
+    assert "inf" in cli.format_insample(summary) and "n/a" in cli.format_insample(summary)
 
 
 @pytest.mark.parametrize(

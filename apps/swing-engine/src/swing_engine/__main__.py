@@ -339,11 +339,20 @@ def _scan_report(as_of: date | None) -> str:
     return format_scan(result)
 
 
-def _num(value: float | None, spec: str, suffix: str = "") -> str:
-    """``value`` formatted, or ``n/a`` for a missing value (NaN is stored as null)."""
-    if value is None or (isinstance(value, float) and math.isnan(value)):
-        return "n/a"
-    return f"{value:{spec}}{suffix}"
+def _float(value: object) -> float:
+    """A stored number as a float: null is NaN, and ``"inf"``/``"-inf"`` are infinities."""
+    if value is None:
+        return math.nan
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return math.nan
+
+
+def _num(value: object, spec: str, suffix: str = "") -> str:
+    """A stored number formatted, or ``n/a`` when it is missing (stored NaN is null)."""
+    x = _float(value)
+    return "n/a" if math.isnan(x) else f"{x:{spec}}{suffix}"
 
 
 def format_insample(summary: Mapping[str, Any]) -> str:
@@ -396,7 +405,7 @@ def format_oos(report: Mapping[str, Any]) -> str:
         f"  {oos['n']} trades, expectancy {_num(oos['expectancy_r'], '.2f', 'R')}, "
         f"profit factor {_num(oos['profit_factor'], '.2f')}, "
         f"random entry median {_num(report['baseline']['median'], '.2f', 'R')}",
-        f"  max drawdown {_num(abs(dd), '.0%')} (SPY {_num(abs(spy), '.0%')}), "
+        f"  max drawdown {_num(abs(_float(dd)), '.0%')} (SPY {_num(abs(_float(spy)), '.0%')}), "
         f"delisted coverage {_num(report['coverage'], '.0%')}, "
         f"deflated Sharpe {_num(report['deflated_sharpe']['value'], '.2f')}",
     ]
