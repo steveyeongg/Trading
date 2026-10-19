@@ -42,6 +42,10 @@ FEATURE_COLS: list[str] = [
     "divergence_bear",
 ]
 
+# How the training labels were built. Artifacts trained before per-symbol labelling
+# (v0, v1) pickled no such attribute, so they resolve to the class default (None).
+LABEL_SCHEME_PER_SYMBOL_V2 = "per_symbol_v2"
+
 
 @dataclass
 class TrendArtifact:
@@ -52,6 +56,8 @@ class TrendArtifact:
     feature_cols: list[str]
     version: str
     metrics: dict[str, float] = field(default_factory=dict)
+    # None = legacy: labelled on the (ts, symbol)-interleaved series, i.e. leaked.
+    label_scheme: str | None = None
 
 
 class TrendModel:
@@ -75,7 +81,7 @@ class TrendModel:
 
         `feature_health` is one of:
           - "ok"        — no required features are NaN
-          - "degraded"  — 1–3 NaN; predictions median-imputed
+          - "degraded"  — 1-3 NaN; predictions median-imputed
           - "missing"   — >3 NaN; prediction is still made but should be down-weighted
         """
         row = pd.DataFrame([features]) if isinstance(features, dict) else features.tail(1)
@@ -127,6 +133,9 @@ def train_trend(
     """Walk-forward train, then refit on the full set and fit the calibrator
     on out-of-fold predictions (best-practice — avoids the calibrator seeing
     in-fold targets).
+
+    `labels` must be built per symbol (see `quant_engine.train.build_training_set`);
+    the artifact is stamped `label_scheme="per_symbol_v2"` on that understanding.
     """
     X, y = _xy(features, labels)
     if len(X) < 5 * test_size:
@@ -201,6 +210,7 @@ def train_trend(
         feature_cols=FEATURE_COLS,
         version=version,
         metrics=metrics,
+        label_scheme=LABEL_SCHEME_PER_SYMBOL_V2,
     )
 
 

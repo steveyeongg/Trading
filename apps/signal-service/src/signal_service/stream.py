@@ -5,8 +5,9 @@ Clients connect to `/v1/stream` and send a subscribe frame:
 
 The server runs ONE broadcaster loop (not per-client polling) that:
   - every BROADCAST_INTERVAL pushes `regime.global` (cheap — reads Redis),
-  - every SIGNAL_EVERY_N ticks recomputes signals for symbols that have at
-    least one subscriber and pushes `signals.{symbol}`.
+  - only when ATLAS_ENABLE_LEGACY_SIGNAL_STREAM=1 (off by default), every
+    SIGNAL_EVERY_N ticks recomputes signals for symbols that have at least one
+    subscriber, pushes `signals.{symbol}` and evaluates alert rules on them.
 
 Subjects support a trailing `*` wildcard (`signals.*` matches `signals.AAPL`).
 This is "server-recomputes, client-receives" — it removes client polling and
@@ -17,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 from typing import Any
 
 from alert_service import AlertEngine, list_all_rules, record_delivery
@@ -34,6 +36,11 @@ router = APIRouter(prefix="/v1")
 
 BROADCAST_INTERVAL = 5.0     # seconds between regime pushes
 SIGNAL_EVERY_N = 3           # recompute signals every Nth tick (→ 15s)
+
+# The legacy 1-minute composite signal push (and the alert rules evaluated on it) is
+# off by default: recomputing it every few seconds produces noise, not signals. Set
+# ATLAS_ENABLE_LEGACY_SIGNAL_STREAM=1 to bring it back.
+_LEGACY_SIGNAL_STREAM = os.environ.get("ATLAS_ENABLE_LEGACY_SIGNAL_STREAM", "0") == "1"
 
 # One alert engine per process — holds the cooldown map across ticks.
 _alert_engine = AlertEngine()
@@ -184,9 +191,22 @@ async def _push_signals() -> None:
             log.warning("stream.signal_push_failed", symbol=sym, error=str(e))
 
 
+async def _tick(tick: int) -> None:
+    """One broadcast cycle: regime always; legacy signals every Nth tick, if enabled."""
+    with contextlib.suppress(Exception):
+        await _push_regime()
+    if _LEGACY_SIGNAL_STREAM and tick % SIGNAL_EVERY_N == 0:
+        with contextlib.suppress(Exception):
+            await _push_signals()
+
+
 async def broadcaster() -> None:
     """Single background loop. Started in the app lifespan."""
-    log.info("stream.broadcaster.start", interval=BROADCAST_INTERVAL)
+    log.info(
+        "stream.broadcaster.start",
+        interval=BROADCAST_INTERVAL,
+        legacy_signal_stream=_LEGACY_SIGNAL_STREAM,
+    )
     tick = 0
     try:
         while True:
@@ -194,11 +214,7 @@ async def broadcaster() -> None:
             if not manager.has_clients():
                 continue
             tick += 1
-            with contextlib.suppress(Exception):
-                await _push_regime()
-            if tick % SIGNAL_EVERY_N == 0:
-                with contextlib.suppress(Exception):
-                    await _push_signals()
+            await _tick(tick)
     except asyncio.CancelledError:
         log.info("stream.broadcaster.stop")
         raise
