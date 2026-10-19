@@ -2,6 +2,11 @@
 
 How to bring the system up, refresh data, and respond to the alert rules.
 
+The **swing engine** (`apps/swing-engine`, CLI only so far) is the primary
+path to a trade idea; everything under "Legacy composite" below (1-minute bars,
+the XGBoost model, the composite signal API and dashboard) is kept but is no
+longer the default path. See `docs/adr/0003-rules-based-swing-engine.md`.
+
 ## Bring-up (full local stack)
 
 ```bash
@@ -14,29 +19,42 @@ uv sync --dev
 
 # 3. App data plane (Postgres + Redis)
 docker compose -f infra/docker/docker-compose.yml up -d
-uv run python -m atlas_shared.migrate up   # applies migrations 0001–0008
+uv run python -m atlas_shared.migrate up   # applies migrations 0001–0009
 
-# 4. Seed market + signals data (offline-clean, no API keys needed)
+# 4. Swing engine (primary path). Needs ALPACA_API_KEY + ALPACA_API_SECRET in .env
+#    (the free plan is enough: SIP daily bars, 15-min delay).
+uv run python -m swing_engine backfill     # FIRST RUN ONLY: loads 2016-01-01 -> last completed
+                                           # session for every stock + SPY. Resumable: if it
+                                           # exits 1 or is interrupted, run the same command again.
+uv run python -m swing_engine scan         # tonight's regime + ranked ideas (stored bars only)
+
+# 5. Legacy composite: seed market + signals data (offline-clean, no API keys needed)
 #    BLUEPRINT §4.3 default watchlist is equities-only; the crypto pipeline
 #    is deferred. Crypto is available via the `crypto_majors` opt-in universe.
 uv run python -m ingest_equities synthetic --symbols AAPL,MSFT,NVDA,TSLA,SPY,QQQ --n-bars 1500
 uv run python -m macro_engine.refresh
 uv run python -m news_ingest.refresh --source file --path data/news_seed.jsonl
-uv run python -m quant_engine.train --symbols AAPL,MSFT,NVDA --version v1
+#    Optional: the trend model. Labels are per-symbol now. The old v0/v1 joblibs
+#    were trained on leaked labels and the API refuses them (s_quant stays null).
+uv run python -m quant_engine.train --symbols AAPL,MSFT,NVDA --version v2
 
-# 5. Seed portfolio + journal (so the dashboard is non-empty)
+# 6. Seed portfolio + journal (so the dashboard is non-empty)
 uv run python -m portfolio_service.seed
 uv run python -m journal_service.seed --n-bars 4000
 
-# 6. API + dashboard
-ATLAS_TREND_MODEL=ml/registry/trend/v1.joblib \
-  uv run --package signal-service uvicorn signal_service.main:app --reload   # :8000
+# 7. API + dashboard (add ATLAS_TREND_MODEL=ml/registry/trend/v2.joblib in front to load the retrained model)
+uv run --package signal-service uvicorn signal_service.main:app --reload     # :8000
 
 cd apps/web && pnpm install && pnpm dev                                       # :3000
 
-# 7. Observability (separate stack)
+# 8. Observability (separate stack)
 docker compose -f infra/observability/docker-compose.yml up -d                # :3001 Grafana, :9090 Prom
 ```
+
+The 1-minute signal recompute and its alert evaluation in the WebSocket
+broadcaster are **off by default**, so `/v1/stream` only pushes the regime
+unless you set `ATLAS_ENABLE_LEGACY_SIGNAL_STREAM=1` in the shell before
+starting the API (see "Legacy composite switches" below).
 
 Verify everything by hitting these endpoints once the API is up:
 
@@ -57,17 +75,30 @@ Then open the dashboard at <http://localhost:3000>:
 
 | Job | Cadence | Command |
 |---|---|---|
-| Bar backfill (REST) | 1× daily off-hours | `uv run python -m ingest_equities backfill --symbols … --days 1` |
-| Macro snapshot | every 1h | `uv run python -m macro_engine.refresh` |
-| News pull | every 5m | `uv run python -m news_ingest.refresh --source rss` |
-| Model retrain | weekly | `uv run python -m quant_engine.train --symbols … --version vN` |
+| **Swing first load** | once, before anything else | `uv run python -m swing_engine backfill` (resumable: re-run until it exits 0) |
+| **Swing daily update** | every trading day after the close (allow 16+ minutes for the SIP delay, e.g. 17:00 ET) | `uv run python -m swing_engine update` |
+| Swing new-listing catch-up | weekly, optional | `uv run python -m swing_engine backfill` (refreshes the asset list, loads new listings, catches up any symbol more than 30 sessions behind; `update` does not discover new listings) |
+| **Swing scan** | right after the update succeeds | `uv run python -m swing_engine scan` (stored bars only; capture stdout) |
+| Bar backfill (REST, legacy 1m) | 1× daily off-hours | `uv run python -m ingest_equities backfill --symbols … --days 1` |
+| Macro snapshot (legacy) | every 1h | `uv run python -m macro_engine.refresh` |
+| News pull (legacy) | every 5m | `uv run python -m news_ingest.refresh --source rss` |
+| Model retrain (legacy, optional) | weekly | `uv run python -m quant_engine.train --symbols … --version vN` (use a **new** `N`; point `ATLAS_TREND_MODEL` at it) |
+
+`update` and `scan` are safe to run on weekends and holidays: both work from
+the last completed session. `backfill` and `update` exit with status 1 when
+some symbols failed, so chain the scan on success (`update && scan`) and
+re-run `update` to resume. Run `update` before `scan`; the scan never fetches.
+
+Validation is **not** a cron job. `insample` and `oos` are run by hand, with a
+git commit of the pre-registration in between (see the README's Swing engine
+section). `oos` spends one of a family's 3 out-of-sample runs.
 
 ## Going live (real-data) toggles
 
 | Env | Effect |
 |---|---|
 | `POLYGON_API_KEY` | `ingest_equities backfill --source polygon` (or `--source auto`) pulls real bars from Polygon |
-| `ALPACA_API_KEY` + `ALPACA_API_SECRET` | (a) `ingest_equities backfill --source alpaca` pulls real bars from Alpaca Market Data v2 (free IEX feed; set `ALPACA_FEED=sip` on a paid plan); (b) `/v1/execute` routes to Alpaca paper instead of in-process paper |
+| `ALPACA_API_KEY` + `ALPACA_API_SECRET` | (a) **`swing_engine backfill` / `update` pull SIP daily bars** (free plan, 15-min delay, always `feed=sip`; `ALPACA_FEED` does not apply); (b) legacy: `ingest_equities backfill --source alpaca` pulls 1m bars from Alpaca Market Data v2 (free IEX feed; set `ALPACA_FEED=sip` on a paid plan); (c) `/v1/execute` routes to Alpaca paper instead of in-process paper |
 | `FRED_API_KEY` | `macro_engine.refresh` uses real FRED series. *Any* failure (missing key, HTTP error, rate limit, empty payload) silently degrades to deterministic synthetic series — never raises. |
 | `NEWSAPI_KEY` | `news_ingest.refresh --source newsapi` works |
 | `DEEPSEEK_API_KEY` | LLM rationales activate via DeepSeek; emit the strict §10.3 JSON contract with `response_format={"type":"json_object"}`. Missing key → templated payload with the same schema. Set `ATLAS_EXPLAIN_MODEL=deepseek-reasoner` to swap from `deepseek-chat` to R1. |
@@ -76,6 +107,15 @@ Then open the dashboard at <http://localhost:3000>:
 | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | Alerts can use the `telegram` channel — body rendered in BLUEPRINT §12.3 layout (🚨 header, trade plan, invalidation, disclaimer) |
 | `SMTP_HOST` / `SMTP_USER` / `SMTP_PASSWORD` / `ALERT_EMAIL_FROM` / `ALERT_EMAIL_TO` | Alerts can use the `email` channel |
 | **`ATLAS_ENABLE_AUTO_EXECUTION=1`** | **Starts the 10s position-monitor loop** that auto-closes positions on stop / target / time. **Off by default — BLUEPRINT §22 #6 non-negotiable.** The log line `monitor.disabled` at startup confirms it's off; `monitor.auto_execution_enabled` (warning) confirms it's on. |
+
+### Legacy composite switches
+
+Both are **off by default** (ADR-0003). Neither is needed for the swing engine.
+
+| Env | Effect |
+|---|---|
+| `ATLAS_ALLOW_LEGACY_MODEL=1` | Lets the API load a trend model trained before the per-symbol label fix (the old `v0` / `v1`). Their labels leaked across tickers, so `p_up` is not evidence of skill. **Not recommended**; retrain instead. Without it, the API logs `trend_model.legacy_refused` and runs with `s_quant` null. |
+| `ATLAS_ENABLE_LEGACY_SIGNAL_STREAM=1` | Re-enables the broadcaster's 1-minute signal recompute (every 3rd 5s tick) and the alert-rule evaluation on it. Read once at process start from the **real shell environment, not from `.env`**: `ATLAS_ENABLE_LEGACY_SIGNAL_STREAM=1 uv run --package signal-service uvicorn …`. Without it, only `regime.global` is pushed and alert rules do not fire from the stream. |
 
 ### Signal-quality knobs (BLUEPRINT §8.5 / §9.6)
 
@@ -180,4 +220,12 @@ conservative; sparse-data deployments may want to relax them.
 | `python -m <pkg>` says *"No module named __main__"* | The package needs a `__main__.py` shim. `tests/test_cli_entrypoints.py` guards every documented CLI. |
 | `ingest_equities` upsert errors with *"A value is required for bind parameter 'vwap'"* | The bar source omitted optional columns. Fixed in `upsert_bars` via `_BAR_FIELDS` normalisation. |
 | Journal / Orders page throws `e.<field>.toFixed is not a function` | A NUMERIC column came through as a JSON string. Apply `atlas_shared.to_jsonable` in the route. |
+| `swing_engine scan` exits with *"no assets stored"* or *"no SPY bars stored"* | Nothing loaded yet. Run `uv run python -m swing_engine backfill` (needs Alpaca keys and migration `0009`). |
+| `swing_engine scan` exits with *"no SPY bar on <date>"* | `--as-of` was a weekend, holiday or a day outside the stored history, so the market regime can't be read and nothing was scanned. Omit `--as-of` to use the latest stored SPY session, or run `update` first. |
+| `backfill` / `update` exit 1 with *"failed, re-run to resume"* | Some chunks hit rate limits or network errors. Re-run the same command: it only fetches what is missing, and stored chunks stay stored. |
+| `update` prints *"refetched full history (adjustment moved)"* | A split or dividend rewrote that symbol's adjusted prices. Expected: the whole history was refetched so two price scales are never spliced. |
+| `swing_engine oos` refuses to start | The pre-registration is missing, uncommitted, changed since commit or hand-edited, the version is not the in-sample choice, a revision has no `--hypothesis`, or the family's 3 out-of-sample runs are spent. Fix the cause it names (for example re-run `insample`, review and commit the draft) and try again. A spent budget cannot be retried until 12 months of new data accrue. |
+| Every scan idea is flagged `UNPROVEN` | Expected until a family's latest report under `ml/validation/` passed and its pre-registration still matches the one that run used. |
+| API log shows `trend_model.legacy_refused`, `s_quant` is null | The model on disk predates the per-symbol label fix. Retrain with a new version and point `ATLAS_TREND_MODEL` at it (see Bring-up), or accept the refusal. |
+| `/v1/stream` only ever pushes `regime.global` | By design: the 1-minute signal recompute is off. See "Legacy composite switches". |
 | Telegram message looks plain / no emoji | Pre-0.23 format. Confirm the alert-service is running 0.23+ — the §12.3 layout includes the 🚨 header, trade plan, invalidation, and disclaimer automatically via `channels/base.py format_alert`. |

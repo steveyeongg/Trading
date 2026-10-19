@@ -69,7 +69,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     load_env()
     settings = get_settings()
     log.info("signal-service.start", env=settings.env)
-    load_trend_model()  # warning-only if missing
+    # Warns if the model is missing; also refuses legacy (leaky-label) models unless
+    # ATLAS_ALLOW_LEGACY_MODEL=1. A missing or refused model never blocks startup.
+    load_trend_model()
 
     tasks = [asyncio.create_task(broadcaster())]
     if _AUTO_EXEC_ENABLED:

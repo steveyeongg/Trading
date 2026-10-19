@@ -4,6 +4,98 @@ Chronological record of what shipped across the build. Newest first.
 Every entry maps to a turn in the build log; phase numbers reference
 `docs/architecture/BLUEPRINT.md` §18.
 
+## 0.24.0 — Swing engine Phase 1: rules-based daily engine, validation gate, legacy guards
+
+The audit of 2026-10-18 found the composite pipeline unsound (1-minute IEX
+bars driving swing signals, a trend model trained on leaked labels, 96% shorts,
+every symbol vetoed over a weekend, a "confidence" that was not a probability)
+and a null result on daily-bar research. This release adds a separate
+rules-based daily swing engine as the primary path and retires the composite
+from the default path (code kept). Decision and evidence:
+[ADR-0003](docs/adr/0003-rules-based-swing-engine.md); design:
+[spec](docs/superpowers/specs/2026-10-18-atlas-swing-rebuild-design.md).
+
+### New: `apps/swing-engine` (CLI only; the product layer is Phase 2)
+
+- **Data path.** Alpaca SIP daily bars (`feed=sip`, `adjustment=all`, free
+  plan, requests end 16+ minutes in the past) stored as `resolution='1d'`, `ts`
+  = session date at 00:00 UTC. Resumable `backfill` (2016-01-01 onward,
+  active and delisted stocks plus SPY) and split-aware `update`: if the overlap
+  day moved, that symbol's full history is refetched instead of splicing two
+  price scales. Raw (unadjusted) bars are stored as `1d_raw` and used **only**
+  for the $10 price floor, so the universe is point-in-time across splits (a
+  split-adjusted floor wrongly excluded later-split winners such as NVDA over
+  2016-2020).
+- **Assets and calendar.** Migration `0009_swing_assets` (the `assets` table
+  and a `bars (resolution, ts)` index). Active and inactive Alpaca assets are
+  classified into operating-company stock vs ETF / fund / SPAC / warrant /
+  unit / right / preferred / OTC. The NYSE calendar comes from `/v2/calendar`
+  (holidays, half days, last completed session).
+- **Engine.** Wide `Panel` and strict per-segment indicators (a gap of more than
+  10 sessions restarts a symbol, so a reused ticker never blends companies);
+  point-in-time universe ($10 raw-close floor, $20M 50-bar median dollar volume,
+  252 sessions of history); SPY regime (uptrend / mixed / downtrend) and
+  breadth; relative-strength percentile and leader gate; `breakout-v1` and
+  `pullback-v1` setups; one fill/exit model (next-session buy-stop, no chase
+  above trigger + 1 ATR, gap-through stops fill at the open, chandelier trail,
+  30-session time stop, `delisted` exit) shared by the scan, the backtest and
+  the baseline; fixed-fractional sizing with position, count and open-risk caps
+  and correlation overlap flags.
+- **Scan.** `python -m swing_engine scan` is look-ahead-free (a pure function
+  of a panel truncated at the scan date), reads stored bars only, and prints the
+  regime, the book and the top ranked ideas, with watch-only ideas in a
+  downtrend and an `UNPROVEN` flag on any idea whose setup has not passed
+  validation.
+- **Backtest.** Trade-level stats, a 100-seed random-entry baseline, and a
+  capacity-limited portfolio simulation against SPY buy-and-hold.
+- **Validation (spec §7.8).** `insample` runs a grid declared in code on
+  2016-2022 and drafts a pre-registration; `oos` refuses to run unless that file
+  is committed, unchanged and sha256-sealed, runs the 2023+ test once, spends
+  one of 3 out-of-sample runs per family, and writes a committed report with a
+  Live or Research-only verdict. Ship gate: expectancy above 0R, profit factor
+  at least 1.2 (1.3 under 90% delisted coverage), 100+ trades, above the
+  random-entry median, drawdown no worse than SPY's. A family is Live only if its
+  latest report passed **and** the sealed pre-registration sha matches the one
+  recorded in that report. No reports are committed yet, so every idea is
+  UNPROVEN.
+- **CLI.** `uv run python -m swing_engine backfill | update | scan | insample
+  --family breakout | oos --family breakout --version breakout-v1`.
+
+### Legacy composite: guarded, not deleted
+
+- **Label leak fixed.** Triple-barrier labels are now computed per symbol
+  (`quant_engine.train.build_training_set`) instead of on the interleaved
+  multi-symbol series, and every artifact is stamped with its `label_scheme`.
+- **Legacy model guard.** `signal_service.state.load_trend_model` refuses any
+  artifact without the per-symbol scheme (the old `v0` / `v1`) and leaves
+  `s_quant` null, unless `ATLAS_ALLOW_LEGACY_MODEL=1` (not recommended).
+- **Legacy signal stream off by default.** The WebSocket broadcaster no longer
+  recomputes 1-minute signals or evaluates alert rules on them unless
+  `ATLAS_ENABLE_LEGACY_SIGNAL_STREAM=1` (read at process start from the real
+  shell environment, not `.env`). The regime push is unchanged.
+- **Deflated Sharpe fix** (`backtest_service.metrics`): the expected maximum
+  Sharpe under the null now scales with the spread of the trials' Sharpe ratios
+  and is 0 for a single trial, so a per-period Sharpe is no longer always
+  deflated to 0.
+
+### Docs
+
+- New [ADR-0003](docs/adr/0003-rules-based-swing-engine.md).
+- SYSTEM.md: swing-engine lifecycle block, updated `apps/swing-engine` row,
+  workspace count (18 Python members), migration `0009`, legacy notes, deferral
+  ledger rows. README: Swing engine section, legacy switches, quick start no
+  longer sets `ATLAS_TREND_MODEL` to the refused v1 file. OPERATIONS.md:
+  swing bring-up, cron rows and recoveries. `.env.example`, CLAUDE.md and the
+  observability README updated to match.
+
+### Tests
+
+- Backend suite **1,109 passed, 9 skipped** (they need a local Postgres, a
+  DeepSeek key or seeded data; the suite runs with no Postgres or Redis). Regression tests cover split-after-backfill
+  splicing, delisting while a trade is open, a symbol missing the scan day,
+  ticker reuse across a >10-session gap, gap-up and gap-down fills, scan
+  look-ahead, the pre-registration seal and the out-of-sample budget.
+
 ## 0.23.0 — Phase 5 + 6: provider status, data freshness, §12.2 events, §12.3 Telegram, exec opt-in, dashboard polish
 
 Closes the last five GAP_AUDIT items (#22–#30) and the remaining three §22
