@@ -6,13 +6,14 @@ a backtest inside a request:
 
 * ``GET /v1/today`` reads the latest stored scan (its ideas carry their narration, PR13), the
   latest job run, the settings and the open positions. It needs no ``ScanContext``.
-* ``GET /v1/stocks/{symbol}`` and the positions routes read the **context cache**: the job
-  hands its target session's context to :func:`set_context` (``JobDeps.on_context``), or
-  :func:`get_context` builds one lazily, once, off the event loop and under a lock, from the
-  stored bars of the latest scanned session. It is rebuilt only when the universe filters in
-  Settings change; a request never builds a context itself.
+* ``GET /v1/stocks/{symbol}`` and the positions routes read the **context cache**
+  (:mod:`signal_service.swing_context`): the job's target session's context, or one built
+  lazily, once, off the event loop, from the stored bars of the latest scanned session. It is
+  rebuilt only when the universe filters in Settings change, never goes back to an earlier
+  session, and a request never builds a context itself.
 * ``GET /v1/track-record`` reads ``ml/validation`` as Phase 1 writes it, plus the stored ideas'
-  forward tracking for the live record.
+  forward tracking for the live record (:mod:`signal_service.swing_track_record`).
+* An idea is Live only when its scan said so **and** its family's verdict is Live now.
 * ``POST /v1/scan/run`` starts the same job the scheduler runs, in the background.
 
 Every number on these pages is a rule's output or a measured historical frequency; nothing is
@@ -34,16 +35,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
-import json
 import math
 import os
-import re
 import time
 import uuid
 from collections.abc import Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -61,29 +59,36 @@ from sqlalchemy.exc import SQLAlchemyError
 from swing_engine import job, product_store
 from swing_engine import store as swing_bars
 from swing_engine.checklist import dollar_volume_rule, eligibility_checklist
-from swing_engine.config import BreakoutParams, PullbackParams, RiskSettings, UniverseFilter
+from swing_engine.config import BreakoutParams, PullbackParams, UniverseFilter
 from swing_engine.digest import DISCLAIMER, REGIME_LABEL, send_digest
 from swing_engine.indicators import compute_indicators
 from swing_engine.job import JobDeps, ProductStore, safe_reason
-from swing_engine.loader import SCAN_WINDOW_DAYS, load_scan_inputs
+from swing_engine.loader import SCAN_WINDOW_DAYS
 from swing_engine.narrate import SETUP_LABEL
 from swing_engine.panel import Panel, build_panel
 from swing_engine.positions import nightly_update, open_risk, rescaled, split_ratio, stored_action
 from swing_engine.regime import Regime
-from swing_engine.scan import ScanContext, build_context, default_setups
+from swing_engine.scan import ScanContext, default_setups
 from swing_engine.scheduler import scheduler_state
 from swing_engine.settings import SwingSettings
-from swing_engine.tracking import live_stats
-from swing_engine.validation.prereg import PreregError, load_prereg
 from swing_engine.validation.protocol import FAMILIES
-from swing_engine.validation.run import (
-    VALIDATION_DIR,
-    ReportError,
-    family_reports,
-    load_verdicts,
-)
 
 from signal_service import swing_deps
+from signal_service.swing_context import (
+    cached_context,
+    get_context,
+    invalidate_context,
+    last_failure,
+)
+from signal_service.swing_track_record import (
+    FamilyRecord,
+    Verdict,
+    as_float,
+    as_int,
+    family_out,
+    idea_record,
+    read_families,
+)
 
 log = get_logger("swing.api")
 
@@ -91,7 +96,6 @@ log = get_logger("swing.api")
 
 store: Any = product_store
 bars_store: Any = swing_bars
-loader = load_scan_inputs
 run_job = job.run_job
 make_swing_deps = swing_deps.make_swing_deps
 repo_root = swing_deps.repo_root
@@ -102,9 +106,6 @@ _AUTO_EXECUTION = os.environ.get("ATLAS_ENABLE_AUTO_EXECUTION", "0") == "1"
 
 BARS_SHOWN = 300
 """Daily bars on a stock page."""
-
-BUILD_RETRY_S = 60.0
-"""After a failed context build, how long requests go without one before the next try."""
 
 ASSET_NAMES_TTL_S = 600.0
 """How long the symbol-to-name map is kept (the asset list changes weekly)."""
@@ -119,9 +120,6 @@ TELEGRAM_TEST_TEXT = (
     "ATLAS test message: the nightly digest will arrive in this chat.\n" + DISCLAIMER
 )
 """The fixed text ``POST /v1/settings/telegram-test`` sends."""
-
-UNDERPERFORMING_AFTER = 30
-"""Closed live ideas before a negative live expectancy is called out on the track record."""
 
 _SECRET_DETAIL_CHARS = 300
 
@@ -190,29 +188,11 @@ def _json(payload: Mapping[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
-def _num(value: Any) -> float | None:
-    """A stored number as a float; None, NaN, infinities and the reports' ``"inf"`` as None."""
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float, Decimal, np.integer, np.floating)):
-        number = float(value)
-        return number if math.isfinite(number) else None
-    return None
-
-
-def _int(value: Any) -> int | None:
-    number = _num(value)
-    return None if number is None else int(number)
-
-
 # --- response models --------------------------------------------------------------------------
 
 
 class _Out(BaseModel):
     model_config = ConfigDict(extra="forbid")
-
-
-Verdict = Literal["live", "research", "not_tested"]
 
 
 class IdeaTrackRecord(_Out):
@@ -530,146 +510,6 @@ class SettingsIn(_In):
     telegram_digest: bool | None = None
 
 
-# --- the context cache ------------------------------------------------------------------------
-
-
-@dataclass
-class _Cache:
-    """The cached context and the universe filter it was built with.
-
-    ``universe`` None marks a context the job handed over (``JobDeps.on_context`` passes the
-    context alone); the job built it from the stored settings, so the first read takes the
-    settings' filter as its own. ``drop_job_context`` is set when the universe changed while a
-    job was running: that job's context was built with the old filters and is not kept.
-
-    The cache never goes back in time: ``newest`` is the latest session any context was offered
-    for (a dropped one included), and a context for an earlier session is never cached. Advice
-    computed on an older session would be written over newer advice the job stored.
-    ``failed`` is the filter, time and reason of the last failed build.
-    """
-
-    ctx: ScanContext | None = None
-    universe: UniverseFilter | None = None
-    failed: tuple[UniverseFilter, float, str] | None = None
-    drop_job_context: bool = False
-    newest: pd.Timestamp | None = None
-
-
-_CACHE = _Cache()
-_CACHE_LOCK = asyncio.Lock()
-
-
-def set_context(ctx: ScanContext, universe: UniverseFilter | None = None) -> None:
-    """Cache ``ctx`` (``JobDeps.on_context``); ``universe`` is the filter it was built with.
-
-    A context for a session earlier than one already offered is ignored (see :class:`_Cache`).
-    """
-    _offer(ctx, universe)
-
-
-def _offer(ctx: ScanContext, universe: UniverseFilter | None) -> bool:
-    """Cache ``ctx`` unless it is older than the newest session seen; True when it was cached."""
-    cache = _CACHE
-    session = pd.Timestamp(ctx.session)
-    if universe is None and cache.drop_job_context:
-        # The job read the old filters. Its session is still the newest there is, so an older
-        # cached context (a lazy build from the scan before) goes too: the next read rebuilds.
-        cache.drop_job_context = False
-        cache.newest = session if cache.newest is None else max(cache.newest, session)
-        if cache.ctx is not None and pd.Timestamp(cache.ctx.session) < session:
-            cache.ctx, cache.universe = None, None
-        log.info("swing.api.context_dropped", session=str(session.date()))
-        return False
-    if cache.newest is not None and session < cache.newest:
-        log.info(
-            "swing.api.older_context_ignored",
-            session=str(session.date()),
-            newest=str(cache.newest.date()),
-        )
-        return False
-    cache.ctx, cache.universe, cache.failed, cache.newest = ctx, universe, None, session
-    return True
-
-
-def last_failure() -> str | None:
-    """Why the last context build failed (no secrets in it), or None."""
-    return None if _CACHE.failed is None else _CACHE.failed[2]
-
-
-def invalidate_context(*, during_job: bool = False) -> None:
-    """Forget the cached context (the universe filters changed); the next read rebuilds it."""
-    _CACHE.ctx, _CACHE.universe, _CACHE.failed = None, None, None
-    _CACHE.drop_job_context = during_job
-
-
-def _hit(wanted: UniverseFilter) -> tuple[ScanContext, UniverseFilter] | None:
-    cache = _CACHE
-    if cache.ctx is None:
-        return None
-    if cache.universe is None:
-        cache.universe = wanted  # the job's context, built from these settings
-    return (cache.ctx, wanted) if cache.universe == wanted else None
-
-
-async def cached_context() -> tuple[ScanContext, UniverseFilter] | None:
-    """The context for the stored settings' universe and that filter, or None when there is none.
-
-    A cache miss builds it once: the stored bars of the latest scanned session (the newest SPY
-    session before any scan) with the open positions' symbols, built off the event loop and under
-    a lock, so concurrent first requests share one build. A failed build is logged and not tried
-    again for :data:`BUILD_RETRY_S`.
-    """
-    wanted = (await store.get_settings()).universe()
-    hit = _hit(wanted)
-    if hit is not None:
-        return hit
-    async with _CACHE_LOCK:
-        hit = _hit(wanted)
-        if hit is not None:
-            return hit
-        failed = _CACHE.failed
-        if (
-            failed is not None
-            and failed[0] == wanted
-            and time.monotonic() - failed[1] < BUILD_RETRY_S
-        ):
-            return None
-        try:
-            ctx = await _build_context(wanted)
-        except Exception as exc:
-            reason = safe_reason(exc)
-            log.warning("swing.api.context_unavailable", error=reason)
-            _CACHE.failed = (wanted, time.monotonic(), reason)
-            return None
-        if _offer(ctx, wanted):
-            return ctx, wanted
-        return _hit(wanted)  # a newer session arrived while this one was built
-
-
-async def get_context() -> ScanContext | None:
-    """The cached scan context (see :func:`cached_context`), or None."""
-    cached = await cached_context()
-    return None if cached is None else cached[0]
-
-
-async def _build_context(universe: UniverseFilter) -> ScanContext:
-    latest = await store.latest_scan()
-    held = sorted({str(p["symbol"]) for p in await store.list_positions("open")})
-    as_of = None if latest is None else latest["session"]
-    panel, kinds, session = await loader(as_of, universe, extra_symbols=held)
-    return await asyncio.to_thread(build_context, panel, kinds, session, universe)
-
-
-async def warm_context() -> None:
-    """Fill the cache in the background at startup (when the scheduler is on). Never raises."""
-    if job.is_running():
-        return  # the running job hands its context over when it is done
-    try:
-        await get_context()
-    except Exception as exc:
-        log.warning("swing.api.warm_up_failed", error=safe_reason(exc))
-
-
 # --- asset names ------------------------------------------------------------------------------
 
 
@@ -702,159 +542,6 @@ def _symbol(text: str) -> str:
     return text.strip().upper()
 
 
-# --- validation records -----------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class _Family:
-    """One setup family's validation state, read from ``ml/validation``."""
-
-    family: str
-    verdict: Verdict
-    verdict_text: str
-    reports: list[dict[str, Any]]
-    report: dict[str, Any] | None
-    insample: dict[str, Any] | None
-    insample_versions: list[str]
-    start_equity: float
-
-
-def _version_key(version: str) -> int:
-    match = re.search(r"-v(\d+)$", version)
-    return int(match.group(1)) if match else 0
-
-
-def _read_json(path: Path) -> dict[str, Any] | None:
-    try:
-        doc = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    return doc if isinstance(doc, dict) else None
-
-
-def _families(repo: Path) -> dict[str, _Family]:
-    """Per family: the verdict (``load_verdicts``), its reports and its in-sample stats."""
-    verdicts = load_verdicts(repo)
-    out: dict[str, _Family] = {}
-    for family in FAMILIES:
-        verdict = verdicts[family]
-        failures = [str(f) for f in verdict["failures"]]
-        if verdict["live"]:
-            kind: Verdict = "live"
-            text = "Live"
-        else:
-            kind = "not_tested" if failures == ["not yet tested"] else "research"
-            text = f"Research only: {failures[0]}" if failures else "Research only"
-        try:
-            reports = family_reports(repo, family)
-        except ReportError:
-            reports = []
-        report = reports[-1] if reports else None
-        folder = repo / VALIDATION_DIR / family
-        insample_files = sorted(
-            folder.glob(f"{family}-v*.insample.json"),
-            key=lambda p: _version_key(p.name.removesuffix(".insample.json")),
-        )
-        insample: dict[str, Any] | None = None
-        if report is not None and isinstance(report.get("is_stats"), dict):
-            insample = report["is_stats"]
-        elif insample_files:
-            doc = _read_json(insample_files[-1])
-            chosen = None if doc is None else doc.get("chosen")
-            if isinstance(chosen, dict):
-                insample = {k: v for k, v in chosen.items() if k != "params"}
-        out[family] = _Family(
-            family=family,
-            verdict=kind,
-            verdict_text=text,
-            reports=reports,
-            report=report,
-            insample=insample,
-            insample_versions=[p.name.removesuffix(".insample.json") for p in insample_files],
-            start_equity=_start_equity(repo, family, report),
-        )
-    return out
-
-
-def _start_equity(repo: Path, family: str, report: Mapping[str, Any] | None) -> float:
-    """The account the report's portfolio simulation started with: the risk settings sealed in
-    its pre-registration's protocol block, else the code default (what ``run_oos`` uses)."""
-    default = float(RiskSettings().equity)
-    if report is None or not isinstance(report.get("version"), str):
-        return default
-    path = repo / VALIDATION_DIR / family / f"{report['version']}.prereg.json"
-    try:
-        protocol = load_prereg(path).protocol
-    except PreregError:
-        return default
-    equity = _num(((protocol or {}).get("risk") or {}).get("equity"))
-    return default if equity is None or equity <= 0 else equity
-
-
-def _idea_record(fam: _Family | None) -> dict[str, Any]:
-    """The track-record cell of an idea: out-of-sample stats, else in-sample, else nothing."""
-    if fam is None:
-        return {
-            "verdict": "not_tested",
-            "verdict_text": "Research only: not yet tested",
-            "win_rate": None,
-            "expectancy_r": None,
-            "trades": None,
-            "trades_distinct": None,
-            "source": None,
-        }
-    oos = None if fam.report is None else fam.report.get("oos_trades")
-    stats: Any = oos if isinstance(oos, dict) else fam.insample
-    source: str | None = "oos" if isinstance(oos, dict) else "insample"
-    if not isinstance(stats, dict):
-        stats, source = {}, None
-    return {
-        "verdict": fam.verdict,
-        "verdict_text": fam.verdict_text,
-        "win_rate": _num(stats.get("win_rate")),
-        "expectancy_r": _num(stats.get("expectancy_r")),
-        "trades": _int(stats.get("n")),
-        "trades_distinct": _int(stats.get("n_distinct")),
-        "source": source,
-    }
-
-
-_STAT_FLOATS = ("win_rate", "avg_win_r", "avg_loss_r", "expectancy_r", "profit_factor", "avg_hold")
-
-
-def _stats(doc: Any) -> dict[str, Any] | None:
-    """A ``trade_stats`` dict as stored (``"inf"`` kept as a string) or computed, for the API."""
-    if not isinstance(doc, Mapping):
-        return None
-    out: dict[str, Any] = {"n": _int(doc.get("n")) or 0, "n_distinct": _int(doc.get("n_distinct"))}
-    out.update({k: _num(doc.get(k)) for k in _STAT_FLOATS})
-    out["open"] = _int(doc.get("open"))
-    return out
-
-
-def _series(rows: Any, scale: float = 1.0) -> list[dict[str, Any]]:
-    """``[[iso_date, value], ...]`` (a report's ``equity_weekly``) as chart points."""
-    points = []
-    for row in rows if isinstance(rows, list) else []:
-        if isinstance(row, (list, tuple)) and len(row) == 2:
-            value = _num(row[1])
-            if value is not None:
-                points.append({"time": row[0], "value": value * scale})
-    return points
-
-
-def _portfolio_stats(doc: Any) -> dict[str, Any] | None:
-    if not isinstance(doc, Mapping):
-        return None
-    return {
-        "cagr": _num(doc.get("cagr")),
-        "sharpe": _num(doc.get("sharpe")),
-        "max_dd": _num(doc.get("max_dd")),
-        "exposure": _num(doc.get("exposure")),
-        "trades": _int(doc.get("trades")),
-    }
-
-
 # --- ideas ------------------------------------------------------------------------------------
 
 
@@ -865,11 +552,11 @@ def _idea_out(
     names: Mapping[str, str | None],
     ids: Mapping[tuple[str, str], str],
     held: set[str],
-    families: Mapping[str, _Family],
+    families: Mapping[str, FamilyRecord],
 ) -> dict[str, Any]:
     """One stored idea (a scan payload row) as the dashboard shows it."""
     symbol, setup = str(row["symbol"]), str(row["setup"])
-    trigger, stop = _num(row.get("trigger")), _num(row.get("stop"))
+    trigger, stop = as_float(row.get("trigger")), as_float(row.get("stop"))
     sizing = row.get("sizing") or {}
     family = families.get(setup)
     # Live is the scan's flag and the family's verdict now: a setup whose verdict was withdrawn
@@ -885,11 +572,11 @@ def _idea_out(
         "buy_above": trigger,
         "stop": stop,
         "target_2r": None if trigger is None or stop is None else trigger + 2 * (trigger - stop),
-        "shares": _int(sizing.get("shares")) or 0,
-        "risk_dollars": _num(sizing.get("risk_dollars")),
-        "position_value": _num(sizing.get("position_value")),
-        "rs_pct": _num(row.get("rs_pct")),
-        "rank": _int(row.get("rank")) or 0,
+        "shares": as_int(sizing.get("shares")) or 0,
+        "risk_dollars": as_float(sizing.get("risk_dollars")),
+        "position_value": as_float(sizing.get("position_value")),
+        "rs_pct": as_float(row.get("rs_pct")),
+        "rank": as_int(row.get("rank")) or 0,
         "live": live,
         "watch_only": watch_only,
         "regime_warning": bool(row.get("regime_warning")),
@@ -897,7 +584,7 @@ def _idea_out(
         "already_held": symbol.upper() in held,
         "why": row.get("why"),
         "cancels": row.get("cancels"),
-        "track_record": _idea_record(family),
+        "track_record": idea_record(family),
     }
 
 
@@ -945,7 +632,7 @@ def _backfill(run: Mapping[str, Any] | None) -> dict[str, int] | None:
     bars = (run.get("steps") or {}).get("bars")
     if not isinstance(bars, Mapping):
         return None
-    done, total = _int(bars.get("done")), _int(bars.get("total"))
+    done, total = as_int(bars.get("done")), as_int(bars.get("total"))
     return None if done is None or total is None else {"done": done, "total": total}
 
 
@@ -961,7 +648,7 @@ async def today() -> dict[str, Any]:
     positions = await store.list_positions("open")
     names = await _asset_names()
     ids = {} if scan is None else await _idea_ids(scan["session"])
-    families = _families(repo_root())
+    families = read_families(repo_root())
     held = _held(positions)
     payload: Mapping[str, Any] = (scan or {}).get("payload") or {}
 
@@ -981,8 +668,8 @@ async def today() -> dict[str, Any]:
     if state in {r.value for r in Regime}:
         regime = {
             "state": state,
-            "factor": _num(payload.get("regime_factor")),
-            "breadth": _num(payload.get("breadth", scan.get("breadth") if scan else None)),
+            "factor": as_float(payload.get("regime_factor")),
+            "breadth": as_float(payload.get("breadth", scan.get("breadth") if scan else None)),
             "label": REGIME_LABEL[Regime(state)],
         }
 
@@ -1062,7 +749,9 @@ def _chart(panel: Panel, lines: Mapping[str, pd.DataFrame], symbol: str) -> dict
     close = panel.close[symbol].dropna()
     days = close.index[-BARS_SHOWN:]
     frames = {f: getattr(panel, f)[symbol].reindex(days) for f in _FIELDS}
-    bars = [{"time": day.date(), **{f: _num(frames[f].at[day]) for f in _FIELDS}} for day in days]
+    bars = [
+        {"time": day.date(), **{f: as_float(frames[f].at[day]) for f in _FIELDS}} for day in days
+    ]
     out: dict[str, list[dict[str, Any]]] = {}
     for name in _LINES:
         series = lines[name][symbol].reindex(days)
@@ -1102,7 +791,7 @@ def _levels(idea: Mapping[str, Any] | None, pos: Mapping[str, Any] | None) -> di
     """The chart's price lines: the idea's buy-above, stop and 2R; the trail of a held stock."""
     if idea is None and pos is None:
         return None
-    trail = None if pos is None else _num(pos.get("current_stop"))
+    trail = None if pos is None else as_float(pos.get("current_stop"))
     if idea is not None:
         return {
             "trigger": idea["buy_above"],
@@ -1143,14 +832,14 @@ async def stock(symbol: str) -> dict[str, Any]:
         rows += [(r, True) for r in payload.get("watch_only") or []]
         mine = [(r, parked) for r, parked in rows if str(r["symbol"]).upper() == sym]
         if mine:
-            row, parked = min(mine, key=lambda rp: (rp[1], _int(rp[0].get("rank")) or 0))
+            row, parked = min(mine, key=lambda rp: (rp[1], as_int(rp[0].get("rank")) or 0))
             idea = _idea_out(
                 row,
                 watch_only=parked,
                 names=names,
                 ids=await _idea_ids(scan["session"]),
                 held=_held(positions),
-                families=_families(repo_root()),
+                families=read_families(repo_root()),
             )
 
     if sym in ctx.panel.close.columns:
@@ -1300,7 +989,7 @@ async def create_position(body: PositionIn) -> dict[str, Any]:
         if str(idea["symbol"]).upper() != symbol:
             raise _invalid("idea_id", f"that idea is for {idea['symbol']}, not {symbol}")
         if stop is None:
-            stop = _num(idea.get("stop"))
+            stop = as_float(idea.get("stop"))
     if stop is None:
         raise _invalid("initial_stop", "give the stop, or the idea the trade came from")
     if stop >= body.entry_price:
@@ -1393,67 +1082,10 @@ async def track_record() -> dict[str, Any]:
     """Per setup family: the validation verdict, in-sample, out-of-sample and live stats, the
     random-entry baseline and the equity curve against SPY, all read from what is stored."""
     settings = await store.get_settings()
-    families = _families(repo_root())
-    out = []
-    for family in FAMILIES:
-        fam = families[family]
-        rows = await store.idea_rows(family)
-        live, rebuilt = live_stats(rows, reconstructed=False), live_stats(rows, reconstructed=True)
-        report = fam.report or {}
-        versions = [
-            {
-                "version": str(r.get("version")),
-                "run_index": _int(r.get("run_index")),
-                "freeze_date": r.get("freeze_date"),
-                "passed": bool((r.get("verdict") or {}).get("passed")),
-            }
-            for r in fam.reports
-        ]
-        tested = {v["version"] for v in versions}
-        versions += [
-            {"version": v, "run_index": None, "freeze_date": None, "passed": None}
-            for v in fam.insample_versions
-            if v not in tested
-        ]
-        warnings = []
-        expectancy = _num(live.get("expectancy_r"))
-        if expectancy is not None and expectancy < 0 and live["n"] >= UNDERPERFORMING_AFTER:
-            warnings.append(
-                f"live underperforming: expectancy {expectancy:.2f}R after {live['n']} live ideas"
-            )
-        if fam.report is not None and settings.differs_from_default_universe():
-            warnings.append("validated with default universe filters; yours differ")
-        baseline = report.get("baseline")
-        out.append(
-            {
-                "family": family,
-                "label": SETUP_LABEL.get(family, family.capitalize()),
-                "verdict": fam.verdict,
-                "verdict_text": fam.verdict_text,
-                "versions": versions,
-                "insample": _stats(fam.insample),
-                "oos": _stats(report.get("oos_trades")),
-                "oos_distinct": _stats(report.get("oos_trades_distinct")),
-                "live": _stats(live),
-                "reconstructed": _stats(rebuilt),
-                "baseline": None
-                if not isinstance(baseline, Mapping)
-                else {k: _num(baseline.get(k)) for k in ("median", "p5", "p95")},
-                "equity": {
-                    "strategy": _series((report.get("portfolio_alone") or {}).get("equity_weekly")),
-                    "spy": _series(
-                        (report.get("spy") or {}).get("equity_weekly"), scale=fam.start_equity
-                    ),
-                },
-                "portfolio": {
-                    "strategy": _portfolio_stats(report.get("portfolio_alone")),
-                    "spy": _portfolio_stats(report.get("spy")),
-                    "combined": _portfolio_stats(report.get("portfolio_combined")),
-                    "combined_note": report.get("portfolio_combined_note"),
-                },
-                "warnings": warnings,
-            }
-        )
+    families = read_families(repo_root())
+    out = [
+        family_out(families[family], await store.idea_rows(family), settings) for family in FAMILIES
+    ]
     return _json({"families": out})
 
 

@@ -45,7 +45,7 @@ from alert_service.channels.base import DeliveryResult
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from signal_service import main as service
-from signal_service import swing_deps, swing_routes
+from signal_service import swing_context, swing_deps, swing_routes
 from swing_engine import job, narrate, scheduler
 from swing_engine.config import BreakoutParams, PullbackParams, RiskSettings, UniverseFilter
 from swing_engine.indicators import compute_indicators
@@ -310,15 +310,16 @@ class Api:
         }
         self.loads: list[tuple[date | None, UniverseFilter, list[str]]] = []
         self.panel = PANEL
-        monkeypatch.setattr(swing_routes, "_CACHE", swing_routes._Cache())
-        monkeypatch.setattr(swing_routes, "_CACHE_LOCK", asyncio.Lock())
+        monkeypatch.setattr(swing_context, "_CACHE", swing_context._Cache())
+        monkeypatch.setattr(swing_context, "_CACHE_LOCK", asyncio.Lock())
         monkeypatch.setattr(swing_routes, "_CREATE_LOCK", asyncio.Lock())
         monkeypatch.setattr(swing_routes, "_ASSETS", swing_routes._AssetNames())
         monkeypatch.setattr(swing_routes, "store", _Forward(self, "store"))
+        monkeypatch.setattr(swing_context, "store", _Forward(self, "store"))
         monkeypatch.setattr(swing_routes, "bars_store", _Forward(self, "bars"))
         monkeypatch.setattr(swing_routes, "repo_root", lambda: self.repo)
         monkeypatch.setattr(swing_routes, "scheduler_state", lambda: dict(self.state))
-        monkeypatch.setattr(swing_routes, "loader", self.loader)
+        monkeypatch.setattr(swing_context, "loader", self.loader)
         self.app = FastAPI()
         self.app.include_router(swing_routes.router)
         self.client = TestClient(self.app)
@@ -560,7 +561,7 @@ def test_settings_put_rejects_zero_risk(api):
 
 
 def test_stock_unknown_symbol_404(api):
-    swing_routes.set_context(CTX, UniverseFilter())
+    swing_context.set_context(CTX, UniverseFilter())
     response = api.get("/v1/stocks/NOPE")
     assert response.status_code == 404
     assert "NOPE" in response.json()["detail"]
@@ -699,7 +700,7 @@ def test_the_context_is_built_once_lazily_off_the_loop_with_the_users_universe(a
                     "initial_stop": 45.0}],
     )  # fmt: skip
     on_loop: list[bool] = []
-    real = swing_routes.build_context
+    real = swing_context.build_context
 
     def watched(*args: Any, **kwargs: Any) -> ScanContext:
         try:
@@ -709,7 +710,7 @@ def test_the_context_is_built_once_lazily_off_the_loop_with_the_users_universe(a
             on_loop.append(False)
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(swing_routes, "build_context", watched)
+    monkeypatch.setattr(swing_context, "build_context", watched)
 
     for _ in range(3):
         assert api.get("/v1/positions").status_code == 200
@@ -728,9 +729,9 @@ async def test_concurrent_first_requests_build_the_context_once(api, monkeypatch
         await asyncio.sleep(0.05)
         return PANEL, KINDS, SESSION
 
-    monkeypatch.setattr(swing_routes, "loader", slow_loader)
+    monkeypatch.setattr(swing_context, "loader", slow_loader)
 
-    got = await asyncio.gather(*(swing_routes.get_context() for _ in range(5)))
+    got = await asyncio.gather(*(swing_context.get_context() for _ in range(5)))
 
     assert len(api.loads) == 1 and all(ctx is got[0] for ctx in got)
     assert got[0].session.date() == SESSION
@@ -738,27 +739,27 @@ async def test_concurrent_first_requests_build_the_context_once(api, monkeypatch
 
 async def test_the_job_context_is_used_and_a_universe_change_rebuilds(api):
     api.store = FakeStore(scan=_scan_row())
-    swing_routes.set_context(CTX)  # what JobDeps.on_context does after a scan
+    swing_context.set_context(CTX)  # what JobDeps.on_context does after a scan
 
-    assert await swing_routes.get_context() is CTX and api.loads == []
+    assert await swing_context.get_context() is CTX and api.loads == []
 
     api.store.settings = SwingSettings(min_dollar_volume=30_000_000.0)
-    rebuilt = await swing_routes.get_context()
+    rebuilt = await swing_context.get_context()
 
     assert rebuilt is not CTX and api.loads == [(SESSION, api.store.settings.universe(), [])]
-    assert await swing_routes.get_context() is rebuilt and len(api.loads) == 1
+    assert await swing_context.get_context() is rebuilt and len(api.loads) == 1
 
 
 def test_changing_the_universe_in_settings_drops_the_cached_context(api):
-    swing_routes.set_context(CTX, UniverseFilter())
+    swing_context.set_context(CTX, UniverseFilter())
     body = {**SwingSettings().model_dump(), "min_price": 15.0}
 
     assert api.client.put("/v1/settings", json=body).status_code == 200
 
-    assert swing_routes._CACHE.ctx is None
-    swing_routes.set_context(CTX, UniverseFilter())
+    assert swing_context._CACHE.ctx is None
+    swing_context.set_context(CTX, UniverseFilter())
     assert api.client.put("/v1/settings", json={**body, "equity": 30_000.0}).status_code == 200
-    assert swing_routes._CACHE.ctx is CTX  # sizing changes keep it
+    assert swing_context._CACHE.ctx is CTX  # sizing changes keep it
 
 
 def test_a_job_that_started_before_a_universe_change_does_not_refill_the_cache(api, monkeypatch):
@@ -766,10 +767,10 @@ def test_a_job_that_started_before_a_universe_change_does_not_refill_the_cache(a
     body = {**SwingSettings().model_dump(), "min_price": 15.0}
     assert api.client.put("/v1/settings", json=body).status_code == 200
 
-    swing_routes.set_context(CTX)  # the running job's context, built with the old filters
-    assert swing_routes._CACHE.ctx is None
-    swing_routes.set_context(CTX)  # the next job's
-    assert swing_routes._CACHE.ctx is CTX
+    swing_context.set_context(CTX)  # the running job's context, built with the old filters
+    assert swing_context._CACHE.ctx is None
+    swing_context.set_context(CTX)  # the next job's
+    assert swing_context._CACHE.ctx is CTX
 
 
 async def test_a_failed_build_returns_none_and_is_not_retried_at_once(api, monkeypatch):
@@ -779,10 +780,10 @@ async def test_a_failed_build_returns_none_and_is_not_retried_at_once(api, monke
         calls.append(1)
         raise RuntimeError("no assets stored: run `python -m swing_engine backfill` first")
 
-    monkeypatch.setattr(swing_routes, "loader", broken)
+    monkeypatch.setattr(swing_context, "loader", broken)
 
-    assert await swing_routes.get_context() is None
-    assert await swing_routes.get_context() is None
+    assert await swing_context.get_context() is None
+    assert await swing_context.get_context() is None
     assert calls == [1]
 
 
@@ -799,7 +800,7 @@ def test_job_deps_always_feed_the_cache(monkeypatch):
 
     deps = swing_deps.make_swing_deps()
 
-    assert deps.on_context is swing_routes.set_context
+    assert deps.on_context is swing_context.set_context
     assert made["client"] is client and made["repo"] == REPO == swing_deps.repo_root()
 
 
@@ -850,8 +851,8 @@ async def test_the_warm_up_fails_soft_when_the_database_is_down(api):
             raise ConnectionRefusedError("[Errno 61] Connect call failed")
 
     api.store = Down()
-    await swing_routes.warm_context()  # logs, never raises
-    assert swing_routes._CACHE.ctx is None
+    await swing_context.warm_context()  # logs, never raises
+    assert swing_context._CACHE.ctx is None
 
 
 # ---------------------------------------------------------------------------- the stock page
@@ -866,7 +867,7 @@ def _stock(api: Api, symbol: str) -> dict[str, Any]:
 def test_a_stock_with_an_idea_has_its_chart_levels_narration_and_checklist(api):
     idea = next(i for i in RESULT.ideas if i.setup == "breakout")
     api.store = FakeStore(scan=_scan_row())
-    swing_routes.set_context(CTX, UniverseFilter())
+    swing_context.set_context(CTX, UniverseFilter())
 
     j = _stock(api, idea.symbol.lower())  # any letter case
 
@@ -903,7 +904,7 @@ def test_a_held_stock_shows_the_trail(api):
                     "entry_price": 100.0, "shares": 3.0, "initial_stop": 90.0,
                     "current_stop": 96.5}],
     )  # fmt: skip
-    swing_routes.set_context(CTX, UniverseFilter())
+    swing_context.set_context(CTX, UniverseFilter())
 
     j = _stock(api, symbol)
 
@@ -926,7 +927,7 @@ def test_the_checklist_uses_the_pre_registered_params_and_the_contexts_universe(
               "ranking": {"rs_helps": True}, "verdict": {"passed": False, "failures": ["x"]}}  # fmt: skip
     (folder / "breakout-v1.report.json").write_text(json.dumps(report))
     universe = dataclasses.replace(UniverseFilter(), min_price=12.0)
-    swing_routes.set_context(build_context(PANEL, KINDS, SESSION, universe), universe)
+    swing_context.set_context(build_context(PANEL, KINDS, SESSION, universe), universe)
     api.store = FakeStore(scan=_scan_row(), settings=SwingSettings(min_price=12.0))
 
     rules = [c["rule"] for c in _stock(api, "S13")["checklist"]]
@@ -936,7 +937,7 @@ def test_the_checklist_uses_the_pre_registered_params_and_the_contexts_universe(
 
 
 def test_a_known_stock_below_the_prefilter_reads_its_stored_bars(api):
-    swing_routes.set_context(CTX, UniverseFilter())
+    swing_context.set_context(CTX, UniverseFilter())
     api.store = FakeStore(scan=_scan_row())
 
     j = _stock(api, "TINY")
@@ -961,7 +962,7 @@ def test_a_known_stock_below_the_prefilter_reads_its_stored_bars(api):
 
 
 def test_the_store_fallback_lines_match_the_indicators_of_the_reindexed_bars(api):
-    swing_routes.set_context(CTX, UniverseFilter())
+    swing_context.set_context(CTX, UniverseFilter())
     j = _stock(api, "TINY")
     panel = build_panel(_tiny_bars())
     frames = {
@@ -976,7 +977,7 @@ def test_the_stock_page_needs_a_context(api, monkeypatch):
     async def broken(*args: Any, **kwargs: Any) -> Any:
         raise RuntimeError("no SPY bars stored")
 
-    monkeypatch.setattr(swing_routes, "loader", broken)
+    monkeypatch.setattr(swing_context, "loader", broken)
     response = api.get("/v1/stocks/S13")
     assert response.status_code == 503 and "scan" in response.json()["detail"]
 
@@ -995,7 +996,7 @@ def _add_position(
 
 
 def test_creating_a_position_advises_it_at_once_on_the_cached_context(api):
-    swing_routes.set_context(CTX, UniverseFilter())
+    swing_context.set_context(CTX, UniverseFilter())
     opened = PANEL.dates()[430].date()
     entry = float(PANEL.close.at[pd.Timestamp(opened), "S13"])
     stop = round(entry * 0.8, 2)
@@ -1026,7 +1027,7 @@ def test_creating_a_position_advises_it_at_once_on_the_cached_context(api):
 
 
 def test_a_position_opened_on_the_scan_session_holds(api):
-    swing_routes.set_context(CTX, UniverseFilter())
+    swing_context.set_context(CTX, UniverseFilter())
     out = api.client.post("/v1/positions", json=_position_body(opened_on=NEXT.isoformat())).json()
     assert (out["last_action"], out["last_action_text"]) == ("hold", "hold, stop 95.00")
     assert out["current_stop"] == 95.0
@@ -1036,7 +1037,7 @@ def test_without_a_context_the_position_is_stored_without_advice(api, monkeypatc
     async def broken(*args: Any, **kwargs: Any) -> Any:
         raise RuntimeError("no SPY bars stored")
 
-    monkeypatch.setattr(swing_routes, "loader", broken)
+    monkeypatch.setattr(swing_context, "loader", broken)
 
     response = api.client.post("/v1/positions", json=_position_body())
 
@@ -1047,7 +1048,7 @@ def test_without_a_context_the_position_is_stored_without_advice(api, monkeypatc
 
 
 def test_a_position_from_an_idea_takes_its_stop(api):
-    swing_routes.set_context(CTX, UniverseFilter())
+    swing_context.set_context(CTX, UniverseFilter())
     api.store = FakeStore(scan=_scan_row())
     idea = next(r for r in api.store.ideas if r["setup"] == "breakout")
     body = {"symbol": idea["symbol"], "opened_on": NEXT.isoformat(),
@@ -1082,7 +1083,7 @@ def test_positions_list_by_status(api):
 
 
 def test_r_now_and_held_sessions_come_from_the_cached_panel(api):
-    swing_routes.set_context(CTX, UniverseFilter())
+    swing_context.set_context(CTX, UniverseFilter())
     opened = PANEL.dates()[440].date()
     _add_position(api, entry=100.0, stop=90.0, opened=opened)
     _add_position(api, symbol="ZZZZ", entry=10.0, stop=9.0, opened=opened)  # not in the panel
@@ -1096,7 +1097,7 @@ def test_r_now_and_held_sessions_come_from_the_cached_panel(api):
 
 
 def test_patch_validates_and_re_advises_an_edited_stop_without_testing_todays_low(api):
-    swing_routes.set_context(CTX, UniverseFilter())
+    swing_context.set_context(CTX, UniverseFilter())
     opened = PANEL.dates()[440].date()
     entry = float(PANEL.close.at[pd.Timestamp(opened), "S13"])
     pid = _add_position(api, entry=entry, stop=entry * 0.8, opened=opened, last_action="hold",
@@ -1138,7 +1139,7 @@ def test_closing_validates_the_date_and_refuses_a_second_close(api):
 
 
 def test_a_closed_position_counts_the_sessions_it_was_held(api):
-    swing_routes.set_context(CTX, UniverseFilter())
+    swing_context.set_context(CTX, UniverseFilter())
     opened = PANEL.dates()[440].date()
     pid = _add_position(api, entry=100.0, stop=95.0, opened=opened)
 
@@ -1285,8 +1286,7 @@ def test_the_track_record_never_runs_a_backtest(api, monkeypatch):
     def must_not_run(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("a request recomputed something")
 
-    for name in ("build_context", "run_scan"):
-        monkeypatch.setattr(swing_routes, name, must_not_run, raising=False)
+    monkeypatch.setattr(swing_context, "build_context", must_not_run)
     api.repo = REPO
     assert api.get("/v1/track-record").status_code == 200
     assert api.loads == []
@@ -1390,7 +1390,7 @@ def test_run_scan_now_starts_a_manual_job_and_returns_its_id(api, monkeypatch):
 
     monkeypatch.setattr(
         swing_routes, "make_swing_deps",
-        lambda: dataclasses.replace(_fake_deps(log, store), on_context=swing_routes.set_context),
+        lambda: dataclasses.replace(_fake_deps(log, store), on_context=swing_context.set_context),
     )  # fmt: skip
     monkeypatch.setattr(swing_routes, "run_job", fake_run)
 
@@ -1402,7 +1402,7 @@ def test_run_scan_now_starts_a_manual_job_and_returns_its_id(api, monkeypatch):
             threading.Event().wait(0.01)
 
     assert response.status_code == 202 and response.json() == {"job_id": str(store.job_id)}
-    assert runs == [("manual", swing_routes.set_context)]
+    assert runs == [("manual", swing_context.set_context)]
     assert log == ["closed"]  # the Alpaca client is closed once the job is done
     assert not swing_routes._BACKGROUND
 
@@ -1496,7 +1496,7 @@ def test_an_idea_scanned_live_whose_family_is_no_longer_live_is_unproven(api):
     assert any(i.live and i.setup == "breakout" for i in RESULT.ideas)  # premise
     _failed_report(api.repo)
     api.store = FakeStore(scan=_scan_row())
-    swing_routes.set_context(CTX, UniverseFilter())
+    swing_context.set_context(CTX, UniverseFilter())
 
     j = _today(api)
 
@@ -1515,9 +1515,9 @@ def test_an_idea_scanned_live_whose_family_is_no_longer_live_is_unproven(api):
 
 def test_the_cache_never_goes_back_to_an_earlier_session(api):
     """I2 (a): a context for an earlier session never replaces a later one."""
-    swing_routes.set_context(CTX)
-    swing_routes.set_context(CTX_PREV, UniverseFilter())
-    assert swing_routes._CACHE.ctx is CTX
+    swing_context.set_context(CTX)
+    swing_context.set_context(CTX_PREV, UniverseFilter())
+    assert swing_context._CACHE.ctx is CTX
 
 
 async def test_a_warm_up_that_finishes_after_the_job_hands_over_does_not_win(api, monkeypatch):
@@ -1530,15 +1530,15 @@ async def test_a_warm_up_that_finishes_after_the_job_hands_over_does_not_win(api
         await release.wait()
         return PANEL, KINDS, as_of
 
-    monkeypatch.setattr(swing_routes, "loader", slow_loader)
-    warm = asyncio.create_task(swing_routes.warm_context())
+    monkeypatch.setattr(swing_context, "loader", slow_loader)
+    warm = asyncio.create_task(swing_context.warm_context())
     await started.wait()
-    swing_routes.set_context(CTX)  # the job, done with session S
+    swing_context.set_context(CTX)  # the job, done with session S
     release.set()
     await warm
 
-    assert swing_routes._CACHE.ctx is CTX
-    assert await swing_routes.get_context() is CTX
+    assert swing_context._CACHE.ctx is CTX
+    assert await swing_context.get_context() is CTX
 
 
 def test_a_universe_change_during_a_job_never_leaves_an_older_session_cached(api, monkeypatch):
@@ -1549,14 +1549,14 @@ def test_a_universe_change_during_a_job_never_leaves_an_older_session_cached(api
     body = {**SwingSettings().model_dump(), "min_price": 15.0}
     assert api.client.put("/v1/settings", json=body).status_code == 200
     assert api.get("/v1/positions").status_code == 200  # a lazy build, from the S-1 scan
-    assert swing_routes._CACHE.ctx is not None and swing_routes._CACHE.ctx.session.date() == PREV
+    assert swing_context._CACHE.ctx is not None and swing_context._CACHE.ctx.session.date() == PREV
 
-    swing_routes.set_context(CTX)  # the job's S context, built with the old filters: dropped
+    swing_context.set_context(CTX)  # the job's S context, built with the old filters: dropped
 
-    assert swing_routes._CACHE.ctx is None  # S-1 cleared too
+    assert swing_context._CACHE.ctx is None  # S-1 cleared too
     api.store.scan = _scan_row()  # the job saved S before it handed its context over
     assert api.get("/v1/positions").status_code == 200
-    assert swing_routes._CACHE.ctx.session.date() == SESSION
+    assert swing_context._CACHE.ctx.session.date() == SESSION
     assert [load[0] for load in api.loads] == [PREV, SESSION]
 
 
@@ -1564,7 +1564,7 @@ async def test_a_build_older_than_a_dropped_job_context_is_not_cached(api, monke
     """I2 (b): the lazy build was still running when the job's newer context was dropped."""
     monkeypatch.setattr(swing_routes.job, "is_running", lambda: True)
     api.store = FakeStore(scan={**_scan_row(), "session": PREV})
-    swing_routes.invalidate_context(during_job=True)
+    swing_context.invalidate_context(during_job=True)
     started, release = asyncio.Event(), asyncio.Event()
 
     async def slow_loader(as_of, universe, extra_symbols=()):
@@ -1572,20 +1572,20 @@ async def test_a_build_older_than_a_dropped_job_context_is_not_cached(api, monke
         await release.wait()
         return PANEL, KINDS, as_of
 
-    monkeypatch.setattr(swing_routes, "loader", slow_loader)
-    build = asyncio.create_task(swing_routes.get_context())
+    monkeypatch.setattr(swing_context, "loader", slow_loader)
+    build = asyncio.create_task(swing_context.get_context())
     await started.wait()
-    swing_routes.set_context(CTX)  # dropped: built with the old filters
+    swing_context.set_context(CTX)  # dropped: built with the old filters
     release.set()
 
-    assert await build is None and swing_routes._CACHE.ctx is None  # S-1 refused
+    assert await build is None and swing_context._CACHE.ctx is None  # S-1 refused
 
 
 def test_a_stale_cached_context_never_overwrites_newer_advice(api):
     """I2 (c): the job (run from the CLI) advised the position for S; the API's cache is still at
     S-1. Editing the stop must not write S-1 advice over it, which the next nightly would walk
     from with the stop checked (a false stop hit)."""
-    swing_routes.set_context(CTX_PREV, UniverseFilter())
+    swing_context.set_context(CTX_PREV, UniverseFilter())
     pid = _add_position(
         api, entry=100.0, stop=90.0, opened=PANEL.dates()[440].date(), last_action="hold",
         last_action_text="hold, stop 90.00", last_action_on=SESSION,
@@ -1641,7 +1641,7 @@ def test_a_failed_context_build_says_why_on_the_stock_page(api, monkeypatch):
     async def broken(*args: Any, **kwargs: Any) -> Any:
         raise ConnectionRefusedError("connection to postgresql://atlas:hunter2@db:5432 refused")
 
-    monkeypatch.setattr(swing_routes, "loader", broken)
+    monkeypatch.setattr(swing_context, "loader", broken)
     api.store = FakeStore(scan=_scan_row())
 
     response = api.get("/v1/stocks/S13")
@@ -1654,7 +1654,7 @@ def test_a_failed_context_build_says_why_on_the_stock_page(api, monkeypatch):
 def test_closing_a_position_bought_before_a_split_gives_r_on_one_scale(api):
     """M4: a 4:1 split between the purchase and the close, not yet rescaled by the nightly job.
     The user paid 4x today's adjusted prices and sold at today's price."""
-    swing_routes.set_context(CTX, UniverseFilter())
+    swing_context.set_context(CTX, UniverseFilter())
     opened, closed = PANEL.dates()[440], PANEL.dates()[448]
     adjusted = float(PANEL.close.at[opened, "S13"])
     entry, stop = 4 * adjusted, 4 * adjusted * 0.9  # the prices before the split

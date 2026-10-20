@@ -38,7 +38,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from fastapi.testclient import TestClient
 from signal_service import main as api
-from signal_service import swing_deps, swing_routes
+from signal_service import swing_context, swing_deps
 from swing_engine import scheduler
 from swing_engine.calendar import Session, TradingCalendar
 from swing_engine.data.alpaca import AlpacaError
@@ -967,7 +967,7 @@ def test_make_deps_builds_the_live_deps_for_this_checkout(monkeypatch):
     monkeypatch.setattr(swing_deps, "live_deps", fake_live_deps)
 
     deps = swing_deps.make_swing_deps()
-    assert deps.client is client and deps.on_context is swing_routes.set_context
+    assert deps.client is client and deps.on_context is swing_context.set_context
     assert made["client"] is client
     assert (made["repo"] / "ml" / "validation").is_dir()  # where the setups' reports live
     assert made["repo"] == Path(__file__).resolve().parents[1]

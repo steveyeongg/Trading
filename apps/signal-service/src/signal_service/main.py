@@ -38,9 +38,9 @@ from signal_service.routes import router
 from signal_service.state import load_trend_model
 from signal_service.stream import broadcaster
 from signal_service.stream import router as stream_router
+from signal_service.swing_context import warm_context as warm_swing_context
 from signal_service.swing_deps import make_swing_deps
 from signal_service.swing_routes import router as swing_router
-from signal_service.swing_routes import warm_context as warm_swing_context
 from signal_service.watchlist import router as watchlist_router
 
 setup_logging()
