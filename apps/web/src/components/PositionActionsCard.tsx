@@ -1,4 +1,6 @@
 import Link from 'next/link';
+import { SectionHeading } from '@/components/SectionHeading';
+import { plural } from '@/lib/copy';
 import type { ActionOut } from '@/lib/swing-types';
 
 // An action's colour by its kind. A kind this build does not know keeps the plain colour and shows
@@ -12,8 +14,6 @@ const KIND_TONE: Record<string, string> = {
 };
 
 export const NO_POSITIONS_HINT = "Record a trade from any idea's stock page.";
-
-const countText = (n: number) => `${n} ${n === 1 ? 'action' : 'actions'}`;
 
 /**
  * What to do with the open positions tonight, one line each, every line linking to /positions.
@@ -33,9 +33,11 @@ export function PositionActionsCard({
       aria-labelledby="positions-heading"
       className="rounded-lg border border-line bg-bg-surface px-4 py-3"
     >
-      <h2 id="positions-heading" className="text-sm font-semibold uppercase tracking-wider">
-        {none ? 'YOUR POSITIONS: none open' : `YOUR POSITIONS: ${countText(actions.length)}`}
-      </h2>
+      <SectionHeading id="positions-heading">
+        {none
+          ? 'YOUR POSITIONS: none open'
+          : `YOUR POSITIONS: ${actions.length} ${plural(actions.length, 'action')}`}
+      </SectionHeading>
       {none && <p className="mt-1 text-sm text-ink-muted">{NO_POSITIONS_HINT}</p>}
       {!none && actions.length === 0 && (
         <p className="mt-1 text-sm text-ink-muted">

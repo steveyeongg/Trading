@@ -6,6 +6,7 @@ import type { FreshnessOut, ProgressOut, TodayOut } from '@/lib/swing-types';
 export const DOWNTREND_TEXT =
   'Market in downtrend: no new buy ideas (stand aside). Strongest names below are watch-only.';
 export const NO_SETUP_PASSED_TEXT = 'No setup has passed testing yet';
+export const NO_VALIDATED_IDEAS_TEXT = 'No validated-setup ideas tonight.';
 export const WAITING_FOR_FIRST_SCAN_TEXT = 'Waiting for the first scan to start.';
 
 export const firstRunText = (percent: number) =>
@@ -32,7 +33,7 @@ export function scanFailedText(freshness: FreshnessOut): string {
 /** The download's progress as a whole percent, 0 when it has not reported any. */
 export function backfillPercent(backfill: ProgressOut | null): number {
   if (backfill === null || !(backfill.total > 0)) return 0;
-  return Math.max(0, Math.min(100, Math.floor((backfill.done / backfill.total) * 100)));
+  return Math.max(0, Math.min(100, Math.floor((backfill.done * 100) / backfill.total)));
 }
 
 type Tone = 'warn' | 'plain';

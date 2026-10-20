@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useId, type ReactNode } from 'react';
 import { Term } from '@/components/Term';
+import { plural } from '@/lib/copy';
 import { money, pct, price, r } from '@/lib/format';
 import type { IdeaOut } from '@/lib/swing-types';
 
@@ -134,7 +135,7 @@ export function trackRecordText(idea: IdeaOut, kind: TableKind): string {
   if (kind === 'unproven' || !idea.live) return t.verdict_text;
   if (t.win_rate === null && t.expectancy_r === null && t.trades === null) return t.verdict_text;
   const trades =
-    t.trades === null ? '—' : `${count.format(t.trades)} ${t.trades === 1 ? 'trade' : 'trades'}`;
+    t.trades === null ? '—' : `${count.format(t.trades)} ${plural(t.trades, 'trade')}`;
   const text = `${pct(t.win_rate)} win · ${r(t.expectancy_r)} · ${trades}`;
   return t.source === 'insample' ? `${text} (in-sample)` : text;
 }
@@ -184,10 +185,13 @@ function IdeaRow({ idea, kind, place }: { idea: IdeaOut; kind: TableKind; place:
   const sized = kind !== 'watch';
   return (
     <tr
-      // The symbol is a real link (keyboard, middle-click). A click anywhere else on the row
-      // follows it too, unless the click was on a link or button, or ended a text selection.
+      // The symbol is a real link (keyboard, middle-click, open in a new tab). A plain click
+      // anywhere else on the row follows it too, unless the click was on a link or button, ended a
+      // text selection, or carried a modifier key (the browser's own link handling is for those).
       onClick={(event) => {
         if (event.defaultPrevented) return;
+        if (event.button !== 0) return;
+        if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
         if ((event.target as Element).closest('a, button')) return;
         if (window.getSelection()?.toString()) return;
         router.push(href);
@@ -229,9 +233,9 @@ function IdeaRow({ idea, kind, place }: { idea: IdeaOut; kind: TableKind; place:
 }
 
 /**
- * Ideas in the server's rank order (numbered 1, 2, 3... down this table) as a table that scrolls sideways inside its own box on a narrow screen (the page
- * itself never does). A watch-only table has no Shares or Risk $ columns: nothing is sized for it.
- * `label` names the table for screen readers.
+ * Ideas in the server's rank order (numbered 1, 2, 3... down this table). On a narrow screen the
+ * table scrolls sideways inside its own box; the page itself never does. A watch-only table has no
+ * Shares or Risk $ columns: nothing is sized for it. `label` names the table for screen readers.
  */
 export function IdeasTable({
   ideas,

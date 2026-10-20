@@ -6,6 +6,7 @@ import { ApiDown } from '@/components/ApiDown';
 import {
   EmptyState,
   NO_SETUP_PASSED_TEXT,
+  NO_VALIDATED_IDEAS_TEXT,
   ScanFailedBanner,
 } from '@/components/EmptyState';
 import {
@@ -19,6 +20,7 @@ import {
 } from '@/components/IdeasTable';
 import { PositionActionsCard } from '@/components/PositionActionsCard';
 import { RegimeBanner } from '@/components/RegimeBanner';
+import { SectionHeading } from '@/components/SectionHeading';
 import { errorText } from '@/lib/error-text';
 import { money } from '@/lib/format';
 import { isUnreachable, swingApi } from '@/lib/swing-api';
@@ -30,10 +32,14 @@ const DISCLAIMER_TEXT = 'Informational only, not financial advice. You place eve
 const REFRESH_MS = 60_000; // normally: once a minute
 const REFRESH_WHILE_RUNNING_MS = 5_000; // while a scan runs
 
-const HEADING = 'text-sm font-semibold uppercase tracking-wider';
+/** "(14)": always the whole list's count, whatever the filters show. */
+const totalText = (all: number) => `(${all})`;
 
-/** "(14)", or "(10 of 14)" when the filters hide some. */
-const countText = (shown: number, all: number) => (shown === all ? `(${all})` : `(${shown} of ${all})`);
+/** "showing 10 after filters", only when the filters hide some of the list. */
+function FilterNote({ shown, all }: { shown: number; all: number }) {
+  if (shown === all) return null;
+  return <span className="text-xs font-normal normal-case tracking-normal text-ink-muted">{`showing ${shown} after filters`}</span>;
+}
 
 function FilteredOut({ hidden, onReset }: { hidden: number; onReset: () => void }) {
   return (
@@ -61,7 +67,7 @@ function UnprovenSection({
   onReset: () => void;
 }) {
   const panelId = useId();
-  const title = `Unproven ideas: these setups have not passed testing ${countText(shown.length, all.length)}`;
+  const title = `Unproven ideas: these setups have not passed testing ${totalText(all.length)}`;
   return (
     <section aria-label="Unproven ideas" className="space-y-3">
       <h2 className="text-sm font-semibold text-ink-muted">
@@ -72,7 +78,9 @@ function UnprovenSection({
           onClick={onToggle}
           className="flex w-full items-center justify-between gap-3 rounded text-left outline-none focus-visible:ring-1 focus-visible:ring-accent"
         >
-          <span>{title}</span>
+          <span className="min-w-0">
+            {title} <FilterNote shown={shown.length} all={all.length} />
+          </span>
           <span aria-hidden="true" className="shrink-0 text-xs font-normal text-ink-subtle">
             {expanded ? 'Hide ▴' : 'Show ▾'}
           </span>
@@ -94,22 +102,31 @@ function TodayView({ today }: { today: TodayOut }) {
   // The user's own choice for the Unproven section; until they make one, it follows the data.
   const [unprovenChoice, setUnprovenChoice] = useState<boolean | null>(null);
 
+  // The server already splits live from unproven. As a guard, only a row that is live may sit in
+  // the validated table; any row of `ideas` that is not live is listed with the unproven ones.
+  const live = useMemo(() => today.ideas.filter((i) => i.live), [today.ideas]);
+  const unprovenAll = useMemo(
+    () => [...today.unproven, ...today.ideas.filter((i) => !i.live)].sort((a, b) => a.rank - b.rank),
+    [today.ideas, today.unproven],
+  );
+
   const options = useMemo(
-    () => setupOptions(today.ideas, today.unproven, today.watch_only),
-    [today.ideas, today.unproven, today.watch_only],
+    () => setupOptions(live, unprovenAll, today.watch_only),
+    [live, unprovenAll, today.watch_only],
   );
   // A setup filter whose family has gone from the data counts as "All".
   const active: IdeaFilters = options.some((o) => o.value === filters.setup)
     ? filters
     : { ...filters, setup: ALL_SETUPS };
-  const validated = useMemo(() => filterIdeas(today.ideas, active), [today.ideas, active]);
-  const unproven = useMemo(() => filterIdeas(today.unproven, active), [today.unproven, active]);
+  const validated = useMemo(() => filterIdeas(live, active), [live, active]);
+  const unproven = useMemo(() => filterIdeas(unprovenAll, active), [unprovenAll, active]);
   const reset = () => setFilters({ setup: ALL_SETUPS, minPrice: 0 });
 
   const firstRun = today.empty_reason === 'first_run';
-  const hasLive = today.ideas.length > 0;
-  // Unproven ideas lead the page when nothing is validated; otherwise they stay out of the way.
-  const unprovenExpanded = unprovenChoice ?? !hasLive;
+  const hasLive = live.length > 0;
+  // The Unproven section leads the page only when no setup at all has passed testing; when one
+  // has (even if it found nothing tonight), it stays collapsed until the user opens it.
+  const unprovenExpanded = unprovenChoice ?? !today.any_live_setup;
   const { capacity } = today;
 
   return (
@@ -123,30 +140,31 @@ function TodayView({ today }: { today: TodayOut }) {
         <>
           <section aria-labelledby="ideas-heading" className="space-y-3">
             <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
-              <h2 id="ideas-heading" className={HEADING}>
-                {`TRADE IDEAS FOR NEXT SESSION ${countText(validated.length, today.ideas.length)}`}
-              </h2>
-              {(today.ideas.length > 0 || today.unproven.length > 0) && (
+              <SectionHeading id="ideas-heading">
+                {`TRADE IDEAS FOR NEXT SESSION ${totalText(live.length)}`}{' '}
+                <FilterNote shown={validated.length} all={live.length} />
+              </SectionHeading>
+              {(live.length > 0 || unprovenAll.length > 0) && (
                 <IdeasFilters filters={active} options={options} onChange={setFilters} />
               )}
             </div>
             {!hasLive ? (
               <p className="rounded-lg border border-line bg-bg-surface px-4 py-3 text-sm text-ink-muted">
-                {NO_SETUP_PASSED_TEXT}
+                {today.any_live_setup ? NO_VALIDATED_IDEAS_TEXT : NO_SETUP_PASSED_TEXT}
               </p>
             ) : validated.length > 0 ? (
               <IdeasTable ideas={validated} kind="validated" label="Trade ideas for the next session" />
             ) : (
-              <FilteredOut hidden={today.ideas.length} onReset={reset} />
+              <FilteredOut hidden={live.length} onReset={reset} />
             )}
           </section>
 
           {today.watch_only.length > 0 && (
             <section aria-labelledby="watch-heading" className="space-y-3">
               <div>
-                <h2 id="watch-heading" className={HEADING}>
+                <SectionHeading id="watch-heading">
                   {`WATCH-ONLY NAMES (${today.watch_only.length})`}
-                </h2>
+                </SectionHeading>
                 <p className="mt-1 text-xs text-ink-muted">
                   These are not buy ideas tonight, so no share count or risk is shown.
                 </p>
@@ -155,9 +173,9 @@ function TodayView({ today }: { today: TodayOut }) {
             </section>
           )}
 
-          {today.unproven.length > 0 && (
+          {unprovenAll.length > 0 && (
             <UnprovenSection
-              all={today.unproven}
+              all={unprovenAll}
               shown={unproven}
               expanded={unprovenExpanded}
               onToggle={() => setUnprovenChoice(!unprovenExpanded)}

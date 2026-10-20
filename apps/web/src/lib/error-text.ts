@@ -1,4 +1,4 @@
-import { API_DOWN_TEXT } from '@/components/ApiDown';
+import { API_DOWN_TEXT } from './copy';
 import { isUnreachable } from './swing-api';
 
 /**

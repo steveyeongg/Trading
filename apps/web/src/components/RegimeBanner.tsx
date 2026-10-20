@@ -5,7 +5,7 @@ import { useEffect, useRef, useState } from 'react';
 import { errorText } from '@/lib/error-text';
 import { dateTimeET, sessionDate } from '@/lib/format';
 import { swingApi } from '@/lib/swing-api';
-import type { FreshnessOut, RegimeOut, TodayOut } from '@/lib/swing-types';
+import type { FreshnessOut, RegimeOut, StatusOut, TodayOut } from '@/lib/swing-types';
 
 const SCAN_STARTED_TEXT = 'Scan started.';
 const SCAN_STARTING_TEXT = 'Scan is starting…';
@@ -14,6 +14,20 @@ const SCAN_RUNNING_TEXT = 'Scan running…';
 // How long, after a scan was asked for, the page checks for it every few seconds.
 const POLL_MS = 3_000;
 const GIVE_UP_MS = 45_000;
+// The server stamps a run's start with its own clock; allow for the browser's being a little off.
+const CLOCK_SKEW_MS = 5_000;
+
+/**
+ * Whether the scan asked for at `clickedAt` (a `Date.now()` value) has finished: the latest job
+ * run started after the click and is no longer running. Today's own fields can't say so when a
+ * quick scan of the same session ends between two looks, but the run's start time can.
+ */
+export function scanSettled(status: StatusOut, clickedAt: number): boolean {
+  const last = status.last_scan;
+  if (last === null || last.status === 'running' || last.started_at === null) return false;
+  const started = Date.parse(last.started_at);
+  return Number.isFinite(started) && started >= clickedAt - CLOCK_SKEW_MS;
+}
 
 const REGIME_TONE: Record<string, string> = {
   uptrend: 'text-bull',
@@ -98,14 +112,29 @@ export function RegimeBanner({ today }: { today: TodayOut }) {
     wasRunning.current = running;
   }, [running, kind]);
 
-  // After a 202 the job may not be recorded yet, so look again every few seconds for a while.
+  // After a 202 the job may not be recorded yet, and a quick one can finish between two looks at
+  // Today. So for a while, look again every few seconds, at Today and at the latest job run: once
+  // that run started after the click and has ended, the scan is over and the note and the lock go.
+  const clickedAt = useRef(0);
   useEffect(() => {
     if (kind !== 'starting' && kind !== 'started') return;
-    const poll = window.setInterval(() => {
+    let alive = true;
+    const look = () => {
       void queryClient.invalidateQueries({ queryKey: ['today'] });
-    }, POLL_MS);
-    const giveUp = window.setTimeout(() => setNotice(null), GIVE_UP_MS);
+      swingApi
+        .status()
+        .then((status) => {
+          if (alive && scanSettled(status, clickedAt.current)) setNotice(null);
+        })
+        .catch(() => undefined); // the next look tries again
+    };
+    look();
+    const poll = window.setInterval(look, POLL_MS);
+    // Give up GIVE_UP_MS after the click, however often this effect runs again (starting -> started).
+    const left = Math.max(0, GIVE_UP_MS - (Date.now() - clickedAt.current));
+    const giveUp = window.setTimeout(() => setNotice(null), left);
     return () => {
+      alive = false;
       window.clearInterval(poll);
       window.clearTimeout(giveUp);
     };
@@ -140,6 +169,7 @@ export function RegimeBanner({ today }: { today: TodayOut }) {
             type="button"
             disabled={busy}
             onClick={() => {
+              clickedAt.current = Date.now();
               setNotice(null);
               scan.mutate();
             }}
