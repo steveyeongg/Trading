@@ -45,6 +45,7 @@ def _idea(
     shares: int = 30,
     risk: float = 243.0,
     live: bool = True,
+    regime_warning: bool = False,
 ) -> Idea:
     return Idea(
         symbol=symbol,
@@ -60,7 +61,7 @@ def _idea(
         ),
         overlaps=[],
         live=live,
-        regime_warning=False,
+        regime_warning=regime_warning,
     )
 
 
@@ -214,6 +215,142 @@ def test_digest_with_every_live_idea_held_lists_none():
     assert "XYZ" not in text and "buy above" not in text
     assert "Top ideas" not in text
     assert "Tonight's validated ideas are all stocks you already hold." in text
+
+
+def test_zero_share_idea_is_not_listed_and_says_it_does_not_fit_the_risk_settings():
+    # The incident: a $912 stock at half size sizes to 0 shares and printed
+    # "buy above 912.00 · stop 850.00 · 0 sh · risk $0", which reads as risk-free.
+    nvda = _idea("NVDA", rank=1, trigger=912.0, stop=850.0, shares=0, risk=0.0)
+
+    text = format_digest(_scan([nvda], regime=Regime.MIXED), TARGET, [], [], 0)
+
+    assert "NVDA" not in text and "buy above" not in text and "0 sh" not in text
+    assert "Top ideas" not in text
+    assert "Tonight's validated ideas don't fit your risk settings; see the dashboard." in text
+    assert text.endswith(DISCLAIMER)
+
+
+def test_zero_share_idea_does_not_take_a_slot_from_a_placeable_one():
+    ideas = [_idea("ZERO", rank=1, shares=0, risk=0.0)] + [
+        _idea(sym, rank=n) for n, sym in enumerate(["AAA", "BBB", "CCC", "DDD", "EEE"], start=2)
+    ]
+
+    text = format_digest(_scan(ideas), TARGET, [], [], 0)
+
+    assert "ZERO" not in text
+    lines = [line for line in text.splitlines() if "buy above" in line]
+    assert [line.split(" ")[:2] for line in lines] == [
+        ["1.", "AAA"], ["2.", "BBB"], ["3.", "CCC"], ["4.", "DDD"], ["5.", "EEE"]
+    ]  # fmt: skip
+    assert "don't fit your risk settings" not in text
+
+
+def test_held_ideas_and_zero_share_ideas_together_say_risk_settings_not_all_held():
+    ideas = [_idea("HELD", rank=1), _idea("ZERO", rank=2, shares=0, risk=0.0)]
+
+    text = format_digest(_scan(ideas), TARGET, [], [], 0, held=["HELD"])
+
+    assert "don't fit your risk settings" in text
+    assert "all stocks you already hold" not in text
+
+
+def test_no_validated_idea_tonight_wording_when_a_validated_setup_exists():
+    scan = _scan([_idea("UNP1", rank=1, live=False), _idea("UNP2", rank=2, live=False)])
+
+    text = format_digest(scan, TARGET, [], [], 6, any_live_setup=True)
+
+    assert "No validated-setup ideas tonight; 6 unproven ideas on the dashboard" in text
+    assert "No validated setups yet" not in text
+    assert "buy above" not in text
+
+
+def test_no_validated_idea_tonight_wording_is_singular_for_one():
+    text = format_digest(_scan([_idea("UNP", live=False)]), TARGET, [], [], 1, any_live_setup=True)
+
+    assert "No validated-setup ideas tonight; 1 unproven idea on the dashboard" in text
+
+
+def test_any_live_setup_with_nothing_unproven_says_nothing_met_the_rules():
+    text = format_digest(_scan([]), TARGET, [], [], 0, any_live_setup=True)
+
+    assert "No stock met a setup's rules after Fri 16 Oct's close." in text
+    assert "validated" not in text
+
+
+def test_any_live_setup_does_not_change_a_digest_that_has_ideas():
+    scan = _scan([_xyz(), _abc()])
+
+    assert format_digest(scan, TARGET, [RAISE_MSFT], [], 1, any_live_setup=True) == format_digest(
+        scan, TARGET, [RAISE_MSFT], [], 1
+    )
+
+
+def test_regime_warning_idea_is_tagged_and_others_are_not():
+    ideas = [
+        _idea("WARN", rank=1, regime_warning=True),
+        _idea("CALM", rank=2),
+    ]
+
+    text = format_digest(_scan(ideas, regime=Regime.MIXED), TARGET, [], [], 0)
+
+    lines = {line.split(" ")[1]: line for line in text.splitlines() if "buy above" in line}
+    assert lines["WARN"].endswith("· risk $243 · regime warning")
+    assert "regime warning" not in lines["CALM"]
+    assert text.count("regime warning") == 1
+
+
+def test_symbols_in_position_actions_are_not_listed_as_new_ideas():
+    # `held` was not passed: the open positions' actions alone keep a held stock out of the list.
+    ideas = [_idea("MSFT", rank=1), _idea("AAA", rank=2)]
+    actions = [RAISE_MSFT, _action("aaa", "hold, stop 10.00")]
+
+    text = format_digest(_scan(ideas), TARGET, actions, [], 0)
+
+    assert "buy above" not in text
+    assert "1. MSFT" not in text and "AAA Breakout" not in text
+    assert "Tonight's validated ideas are all stocks you already hold." in text
+    assert "• MSFT raise stop to 512.40 (trail)" in text  # the positions section is untouched
+
+
+def test_action_symbol_does_not_use_up_a_slot():
+    ideas = [_idea(s, rank=n) for n, s in enumerate(["AAA", "BBB", "CCC", "DDD", "EEE", "FFF"], 1)]
+
+    text = format_digest(_scan(ideas), TARGET, [_action("bbb", "hold, stop 1.00")], [], 0)
+
+    lines = [line for line in text.splitlines() if "buy above" in line]
+    assert [line.split(" ")[1] for line in lines] == ["AAA", "CCC", "DDD", "EEE", "FFF"]
+
+
+def test_a_stock_flagged_by_two_setups_is_listed_once_under_its_best_rank():
+    ideas = [
+        _idea("AAA", "breakout", rank=1),
+        _idea("AAA", "pullback", rank=2, trigger=72.15, stop=69.30),
+        _idea("BBB", rank=3),
+        _idea("CCC", rank=4),
+        _idea("DDD", rank=5),
+        _idea("EEE", rank=6),
+    ]
+
+    text = format_digest(_scan(ideas), TARGET, [], [], 0)
+
+    lines = [line for line in text.splitlines() if "buy above" in line]
+    # Deduped before the cut, so the sixth idea (five distinct stocks) is not pushed out.
+    assert [line.split(" ")[:2] for line in lines] == [
+        ["1.", "AAA"], ["2.", "BBB"], ["3.", "CCC"], ["4.", "DDD"], ["5.", "EEE"]
+    ]  # fmt: skip
+    assert "AAA Breakout" in text and "AAA Pullback" not in text
+
+
+def test_dedupe_falls_to_the_placeable_idea_when_the_best_ranked_has_no_shares():
+    ideas = [
+        _idea("AAA", "breakout", rank=1, shares=0, risk=0.0),
+        _idea("AAA", "pullback", rank=2, trigger=72.15, stop=69.30, shares=87, risk=247.95),
+    ]
+
+    text = format_digest(_scan(ideas), TARGET, [], [], 0)
+
+    assert "1. AAA Pullback · buy above 72.15" in text
+    assert "AAA Breakout" not in text
 
 
 def test_digest_caps_at_five_ideas_by_rank_and_numbers_them_in_output_order():

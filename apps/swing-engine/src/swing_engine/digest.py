@@ -6,9 +6,17 @@ promises nothing. What it will and will not list:
 * **Validated setups only.** An idea is listed only when ``idea.live`` is True (its setup passed
   out-of-sample testing). Unproven ideas are never listed, and neither are watch-only names; the
   digest says how many unproven ideas wait on the dashboard when there is nothing validated.
+* **Only ideas that can be placed.** An idea sized at zero shares (the risk budget or the position
+  cap leaves nothing to buy) is left out, since ``0 sh · risk $0`` beside a buy reads as risk-free.
+  When validated ideas exist but none can be placed, the digest says they don't fit the user's
+  risk settings.
 * **At most five**, best rank first, numbered 1 to 5 in the order printed (the idea's own rank can
-  have gaps once held names and unproven setups are taken out).
-* **Never a stock the user already holds**, taken out before the cut to five.
+  have gaps once held names and unproven setups are taken out). A stock that two setups both
+  flagged is listed once, under its best-ranked idea.
+* **Never a stock the user already holds**: the ``held`` symbols plus the symbol of every position
+  action, taken out before the cut to five.
+* **A regime warning stays attached.** An ungated setup's idea in a non-uptrend market ends with
+  ``· regime warning``.
 * **Nothing to buy in a downtrend.** The market line says to stand aside, and listing a buy line
   under it would contradict it, so no idea is printed even if an ungated validated setup produced
   one (it is still on the dashboard).
@@ -58,18 +66,25 @@ def format_digest(
     missed: Sequence[date],
     unproven_count: int,
     held: Collection[str] = (),
+    any_live_setup: bool = False,
 ) -> str:
     """The Telegram text for one scan.
 
     ``target_session`` is the session the buy-stops are live for. ``actions`` are the nightly
     actions for the user's open positions, ``missed`` the sessions caught up by this run,
     ``unproven_count`` how many unproven ideas the scan found (for the nothing-validated line) and
-    ``held`` the symbols of the user's open positions, which are not listed as new ideas.
+    ``held`` the symbols of the user's open positions. Those and the symbol of every action are
+    not listed as new ideas, in any letter case.
+
+    ``any_live_setup`` says whether at least one setup is validated at all. It only changes the
+    wording when there is no validated idea tonight: with it the digest says the validated setups
+    found nothing, and without it that no setup has been validated yet.
     """
     head = [f"ATLAS · ideas for {day_label(target_session)}", _market_line(scan)]
     if missed:
         head.append(_missed_line(missed))
-    head.extend(_ideas_block(scan, held, unproven_count))
+    owned = {s.upper() for s in held} | {a.symbol.upper() for a in actions}
+    head.extend(_ideas_block(scan, owned, unproven_count, any_live_setup))
 
     rows = [f"• {a.symbol} {a.text}" for a in actions]
     text = _assemble(head, rows)
@@ -119,32 +134,42 @@ def _missed_line(missed: Sequence[date]) -> str:
     return line
 
 
-def _ideas_block(scan: ScanResult, held: Collection[str], unproven_count: int) -> list[str]:
+def _ideas_block(
+    scan: ScanResult, owned: set[str], unproven_count: int, any_live_setup: bool
+) -> list[str]:
+    """The ideas lines. ``owned`` is the upper-case symbols the user holds."""
     if Regime(scan.regime) is Regime.DOWNTREND:
         return []  # the market line already says to stand aside
     live = [i for i in scan.ideas if i.live]
-    owned = {s.upper() for s in held}
-    fresh = sorted(
-        (i for i in live if i.symbol.upper() not in owned),
-        key=lambda i: (i.rank, i.symbol, i.setup),
-    )[:MAX_IDEAS]
+    unheld = [i for i in live if i.symbol.upper() not in owned]
+    # Placeable ideas, best rank first, one per symbol (the best-ranked of a stock two setups
+    # flagged), then the cut. Dict insertion order is the rank order.
+    best: dict[str, Idea] = {}
+    for idea in sorted(unheld, key=lambda i: (i.rank, i.symbol, i.setup)):
+        if idea.sizing.shares > 0:
+            best.setdefault(idea.symbol.upper(), idea)
+    fresh = list(best.values())[:MAX_IDEAS]
     if fresh:
         return [
             "Top ideas (validated setups):",
             *(f"{n}. {_idea_line(i)}" for n, i in enumerate(fresh, start=1)),
         ]
+    if unheld:
+        return ["Tonight's validated ideas don't fit your risk settings; see the dashboard."]
     if live:
         return ["Tonight's validated ideas are all stocks you already hold."]
     if unproven_count > 0:
         noun = "idea" if unproven_count == 1 else "ideas"
-        return [f"No validated setups yet; {unproven_count} unproven {noun} on the dashboard"]
+        lead = "No validated-setup ideas tonight" if any_live_setup else "No validated setups yet"
+        return [f"{lead}; {unproven_count} unproven {noun} on the dashboard"]
     return [f"No stock met a setup's rules after {day_label(scan.session)}'s close."]
 
 
 def _idea_line(idea: Idea) -> str:
     label = SETUP_LABEL.get(idea.setup, idea.setup.capitalize())
     sizing = idea.sizing
-    return (
+    line = (
         f"{idea.symbol} {label} · buy above {idea.trigger:.2f} · stop {idea.stop:.2f}"
         f" · {sizing.shares} sh · risk ${sizing.risk_dollars:.0f}"
     )
+    return f"{line} · regime warning" if idea.regime_warning else line
