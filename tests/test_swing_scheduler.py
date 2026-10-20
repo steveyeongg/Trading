@@ -196,8 +196,9 @@ class Rig:
     ``stop_after_runs(n)`` makes the n-th ``run_job`` raise ``CancelledError`` (after recording it)
     so a test can drive the otherwise endless loop and see it end the way a real shutdown does.
     ``effects`` maps a 1-based ``run_job`` call number to an exception it raises instead of
-    returning, and ``oversleep`` maps a 1-based sleep number to extra seconds the clock jumps (a
-    laptop asleep).
+    returning (or to a function that does something and returns the exception to raise, or None),
+    ``statuses`` maps a call number to the status of the run it returns instead of ``ok``, and
+    ``oversleep`` maps a 1-based sleep number to extra seconds the clock jumps (a laptop asleep).
     """
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -208,7 +209,8 @@ class Rig:
         self.states: list[dict[str, Any]] = []
         self.runs: list[tuple[str, datetime]] = []
         self.job_deps: list[JobDeps] = []
-        self.effects: dict[int, BaseException] = {}
+        self.effects: dict[int, BaseException | Callable[[], BaseException | None]] = {}
+        self.statuses: dict[int, str] = {}
         self.oversleep: dict[int, float] = {}
         self.calendar_calls = 0
         self.calendar_down_for = 0
@@ -265,11 +267,14 @@ class Rig:
         if self.hang is not None:
             await self.hang.wait()
         await deps.calendar()
-        if number in self.effects:
-            raise self.effects[number]
+        effect = self.effects.get(number)
+        if callable(effect):
+            effect = effect()
+        if effect is not None:
+            raise effect
         if self.stop_at is not None and number >= self.stop_at:
             raise asyncio.CancelledError
-        return {"status": "ok", "kind": kind, "session": None}
+        return {"status": self.statuses.get(number, "ok"), "kind": kind, "session": None}
 
     async def drive(self) -> None:
         """Run the scheduler to the ``stop_after_runs`` cancellation, as a shutdown would end it."""
@@ -409,24 +414,156 @@ async def test_a_job_that_is_already_running_is_skipped_and_logged(rig):
     assert not [r for r in rig.log.records if r[0] in ("warning", "error")]
 
 
-async def test_a_failed_catch_up_does_not_stop_the_nightly_loop(rig):
+async def test_a_failed_catch_up_does_not_stop_the_loop(rig):
     rig.start(MON_1700_ET, latest=FRI)
     rig.effects = {1: RuntimeError("alpaca 503")}
+    rig.stop_after_runs(3)
+
+    await rig.drive()
+
+    # the failure is retried 15 minutes later, then the nightly schedule carries on
+    assert rig.runs == [
+        ("catchup", MON_1700_ET),
+        ("catchup", MON_1700_ET + CALENDAR_RETRY),
+        ("nightly", TUE_SCAN),
+    ]
+
+
+# ------------------------------------------------------------------------ catch-up retries
+
+QUARTER_HOUR = timedelta(minutes=15)
+MON_1620_ET = datetime(2026, 10, 19, 16, 20, tzinfo=ET)  # session done, scan due 16:45
+
+
+async def test_a_catch_up_that_fails_twice_is_retried_every_15_minutes_until_it_works(rig):
+    """The Mac boots before Postgres or Docker is ready: Today must not stay stale until tomorrow."""
+    rig.start(MON_1700_ET, latest=FRI)
+    rig.effects = {1: RuntimeError("connection refused"), 2: RuntimeError("connection refused")}
+    rig.stop_after_runs(4)
+
+    await rig.drive()
+
+    assert rig.runs == [
+        ("catchup", MON_1700_ET),
+        ("catchup", MON_1700_ET + QUARTER_HOUR),
+        ("catchup", MON_1700_ET + 2 * QUARTER_HOUR),
+        ("nightly", TUE_SCAN),  # the third attempt worked: no more catch-ups
+    ]
+    assert max(rig.sleeps) <= MAX_SLEEP_S  # the retry waits are chunked like every other wait
+    assert len([r for r in rig.log.records if r[0] == "warning"]) == 2
+
+
+async def test_a_run_that_comes_back_not_ok_counts_as_failed_and_is_retried(rig):
+    rig.start(MON_1700_ET, latest=FRI)
+    rig.statuses = {1: "failed"}  # run_job records step failures in the row instead of raising
+    rig.stop_after_runs(3)
+
+    await rig.drive()
+
+    assert rig.runs == [
+        ("catchup", MON_1700_ET),
+        ("catchup", MON_1700_ET + QUARTER_HOUR),
+        ("nightly", TUE_SCAN),
+    ]
+
+
+async def test_a_catch_up_that_keeps_failing_gives_way_to_the_nightly_when_it_is_due(rig):
+    """Mon 16:20 ET: 16:20 and 16:35 fail; 16:50 would be after the 16:45 scan, so that runs."""
+    rig.start(MON_1620_ET, latest=FRI)
+    rig.effects = {1: RuntimeError("alpaca 503"), 2: RuntimeError("alpaca 503")}
+    rig.stop_after_runs(3)
+
+    await rig.drive()
+
+    assert rig.runs == [
+        ("catchup", MON_1620_ET),
+        ("catchup", MON_1620_ET + QUARTER_HOUR),
+        ("nightly", MON_SCAN),
+    ]
+
+
+async def test_the_nightly_ends_the_retries_even_when_it_fails_too(rig):
+    rig.start(MON_1620_ET, latest=FRI)
+    rig.effects = {i: RuntimeError("alpaca 503") for i in (1, 2, 3)}
+    rig.stop_after_runs(4)
+
+    await rig.drive()
+
+    # 16:20, 16:35 catch-ups, the 16:45 nightly, then tomorrow's nightly: no catch-up after it
+    assert [(kind, at) for kind, at in rig.runs] == [
+        ("catchup", MON_1620_ET),
+        ("catchup", MON_1620_ET + QUARTER_HOUR),
+        ("nightly", MON_SCAN),
+        ("nightly", TUE_SCAN),
+    ]
+
+
+async def test_a_catch_up_that_succeeds_is_not_retried(rig):
+    rig.start(MON_1700_ET, latest=FRI)
     rig.stop_after_runs(2)
 
     await rig.drive()
 
     assert rig.runs == [("catchup", MON_1700_ET), ("nightly", TUE_SCAN)]
+    assert set(rig.sleeps) == {MAX_SLEEP_S}  # straight on to waiting for tomorrow's scan
+    assert sum(rig.sleeps) == (TUE_SCAN - MON_1700_ET).total_seconds()
 
 
-async def test_a_catch_up_that_finds_a_job_running_is_skipped(rig):
-    rig.start(MON_1700_ET, latest=None)
-    rig.effects = {1: JobBusy("a scan is already running")}
+async def test_a_job_running_elsewhere_is_rechecked_after_15_minutes_and_not_rerun_if_done(rig):
+    """JobBusy: someone else (the Run scan now button) is scanning. If the last completed session
+    is stored 15 minutes later, there is nothing left to catch up."""
+    rig.start(MON_1700_ET, latest=FRI)
+
+    def the_other_job_finishes() -> BaseException:
+        rig.store.latest = MON
+        return JobBusy("a scan is already running")
+
+    rig.effects = {1: the_other_job_finishes}
     rig.stop_after_runs(2)
 
     await rig.drive()
 
-    assert [kind for kind, _ in rig.runs] == ["catchup", "nightly"]
+    assert rig.runs == [("catchup", MON_1700_ET), ("nightly", TUE_SCAN)]
+    assert rig.store.calls == 2  # the startup check and the re-check
+    assert "already running" in rig.log.text()
+
+
+async def test_a_job_running_elsewhere_that_has_not_finished_the_session_is_caught_up_later(rig):
+    rig.start(MON_1700_ET, latest=FRI)
+    rig.effects = {1: JobBusy("a scan is already running")}  # and the session is still unscanned
+    rig.stop_after_runs(2)
+
+    await rig.drive()
+
+    assert rig.runs == [("catchup", MON_1700_ET), ("catchup", MON_1700_ET + QUARTER_HOUR)]
+    assert rig.store.calls == 2
+
+
+async def test_a_busy_catch_up_gives_way_to_the_nightly_when_it_is_due(rig):
+    rig.start(MON_1620_ET, latest=FRI)
+    rig.effects = {1: JobBusy("a scan is already running"), 2: JobBusy("a scan is already running")}
+    rig.stop_after_runs(3)
+
+    await rig.drive()
+
+    assert [kind for kind, _ in rig.runs] == ["catchup", "catchup", "nightly"]
+    assert rig.runs[-1][1] == MON_SCAN
+
+
+async def test_a_catch_up_that_runs_past_the_scan_time_is_followed_by_the_nightly_at_once(rig):
+    """A slow first run (a long backfill) ends after tonight's scan time: that scan is not skipped."""
+    rig.start(MON_1620_ET, latest=FRI)
+
+    def takes_an_hour() -> BaseException | None:
+        rig.clock += timedelta(hours=1)
+        return None
+
+    rig.effects = {1: takes_an_hour}
+    rig.stop_after_runs(2)
+
+    await rig.drive()
+
+    assert rig.runs == [("catchup", MON_1620_ET), ("nightly", MON_1620_ET + timedelta(hours=1))]
 
 
 # ------------------------------------------------------------------------ cancellation
