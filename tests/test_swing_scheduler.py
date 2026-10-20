@@ -1,15 +1,18 @@
 """Swing engine: the after-close scheduler and its wiring into the API's lifespan.
 
 ``swing_scheduler`` runs inside the FastAPI process: on startup it catches up when the last stored
-scan is older than the last completed session, then each night it sleeps until the close plus 45
-minutes and runs the nightly job. These tests pin what the review asked about:
+scan is older than the last session whose scan time (its close plus 45 minutes) has passed, then
+each night it sleeps until that scan time and runs the nightly job. Starting between the settle
+time (close + 16 minutes) and the scan time waits for the nightly, so the digest uses settled
+bars. These tests pin what the review asked about:
 
 * **Half days and the DST switch.** The next scan is the close + 45 minutes in New York: 13:45 on
   the half day Fri 27 Nov 2026, and 16:45 EST (21:45 UTC) on Mon 2 Nov, after DST ended.
 * **The Mac slept.** macOS pauses the monotonic clock while asleep, so the scheduler sleeps in
   chunks of at most 5 minutes and re-reads the wall clock after each one: a laptop that wakes after
   the scan time runs within one chunk, and the job's own catch-up covers the missed sessions.
-* **Nothing kills the loop.** A job that raises, one that is already running (the "Run scan now"
+* **Nothing kills the loop.** Any exception in a pass of the loop (even one nobody foresaw, like a
+  stored session that is not a date) is logged and waited out for 15 minutes. A job that raises, one that is already running (the "Run scan now"
   button) and a failed catch-up are logged and skipped. Only cancellation ends the task, and it
   propagates. A scheduler that cannot be built (no Alpaca keys), or cannot reach the database or
   the calendar, says why in ``scheduler_state()`` and never stops the API from starting.
@@ -53,7 +56,7 @@ HOLIDAYS = {date(2026, 9, 7), date(2026, 11, 26), date(2026, 12, 25)}
 HALF_DAYS = {date(2026, 11, 27), date(2026, 12, 24)}
 
 
-def _calendar() -> TradingCalendar:
+def _sessions() -> list[Session]:
     """NYSE sessions from Aug 2026 to Jan 2027: weekdays minus holidays, 13:00 closes on half days."""
     sessions = []
     day = date(2026, 8, 3)
@@ -62,14 +65,18 @@ def _calendar() -> TradingCalendar:
             close = time(13, 0) if day in HALF_DAYS else time(16, 0)
             sessions.append(Session(day, time(9, 30), close))
         day += timedelta(days=1)
-    return TradingCalendar(sessions)
+    return sessions
 
 
-CAL = _calendar()
-FRI, MON, TUE = date(2026, 10, 16), date(2026, 10, 19), date(2026, 10, 20)
+SESSIONS = _sessions()
+CAL = TradingCalendar(SESSIONS)
+THU, FRI, MON, TUE = date(2026, 10, 15), date(2026, 10, 16), date(2026, 10, 19), date(2026, 10, 20)
 MON_1000_ET = datetime(2026, 10, 19, 10, 0, tzinfo=ET)
 MON_1700_ET = datetime(2026, 10, 19, 17, 0, tzinfo=ET)
 MON_SCAN = datetime(2026, 10, 19, 16, 45, tzinfo=ET)
+QUARTER_HOUR = timedelta(minutes=15)
+MON_1620_ET = datetime(2026, 10, 19, 16, 20, tzinfo=ET)  # Monday's scan is due at 16:45
+# With Thursday scanned, Friday is owed at 16:20 Monday (its scan time has passed).
 TUE_SCAN = datetime(2026, 10, 20, 16, 45, tzinfo=ET)
 
 
@@ -131,6 +138,28 @@ def test_next_scan_past_the_end_of_the_calendar_is_a_lookup_error():
         next_scan_at(CAL, datetime(2027, 2, 1, 12, 0, tzinfo=ET))
 
 
+@pytest.mark.parametrize("delay", [45, 479, 480, 600, 1439, 1440, 1500])
+@pytest.mark.parametrize(
+    "now",
+    [
+        datetime(2026, 10, 20, 1, 0, tzinfo=ET),  # Tue 01:00: a long delay still owes Monday's
+        datetime(2026, 10, 17, 12, 0, tzinfo=ET),  # Saturday
+        datetime(2026, 10, 19, 23, 59, 59, tzinfo=ET),
+        datetime(2026, 11, 2, 0, 30, tzinfo=ET),  # the night after DST ended
+    ],
+    ids=["tue-0100", "saturday", "mon-2359", "after-dst"],
+)
+def test_next_scan_equals_a_brute_force_search_for_any_delay(now, delay):
+    """The search must start early enough that a session whose scan time is still ahead (a long
+    delay pushes it past midnight) is never skipped, whatever the delay."""
+    expected = min(
+        when
+        for s in SESSIONS
+        if (when := CAL.scan_time(s.day, delay)).astimezone(UTC) > now.astimezone(UTC)
+    )
+    assert next_scan_at(CAL, now, delay) == expected
+
+
 # ------------------------------------------------------------------------ scheduler_enabled
 
 
@@ -167,11 +196,13 @@ class FakeLog:
 
 
 class FakeStore:
-    """The one store call the scheduler makes, ``latest_scan``, with a database that can be down."""
+    """The one store call the scheduler makes, ``latest_scan``: the database can be down, or hand
+    back a row the scheduler cannot compare."""
 
     def __init__(self, latest: date | None) -> None:
         self.latest = latest
         self.down_for = 0
+        self.garbled = 0
         self.calls = 0
 
     async def latest_scan(self) -> dict[str, Any] | None:
@@ -179,6 +210,9 @@ class FakeStore:
         if self.down_for > 0:
             self.down_for -= 1
             raise ConnectionRefusedError("connect call failed ('127.0.0.1', 5432)")
+        if self.garbled > 0:  # a row the code did not expect: the session is not a date
+            self.garbled -= 1
+            return {"session": "2026-10-16T00:00:00 s3cr3t-alpaca-value"}
         return None if self.latest is None else {"session": self.latest}
 
 
@@ -299,8 +333,8 @@ async def test_catch_up_runs_when_nothing_was_ever_scanned(rig):
     assert rig.runs == [("catchup", MON_1000_ET)] and rig.sleeps == []
 
 
-async def test_catch_up_runs_when_the_last_scan_is_behind_the_last_completed_session(rig):
-    """Mon 17:00 ET: Monday's session is complete but only Friday's was scanned."""
+async def test_catch_up_runs_when_the_last_scan_is_behind_the_last_due_session(rig):
+    """Mon 17:00 ET: Monday's scan time (16:45) has passed but only Friday's was scanned."""
     rig.start(MON_1700_ET, latest=FRI)
     rig.stop_after_runs(1)
 
@@ -309,7 +343,7 @@ async def test_catch_up_runs_when_the_last_scan_is_behind_the_last_completed_ses
     assert rig.runs == [("catchup", MON_1700_ET)]
 
 
-async def test_no_catch_up_when_the_last_completed_session_was_scanned(rig):
+async def test_no_catch_up_when_the_last_due_session_was_scanned(rig):
     rig.start(MON_1700_ET, latest=MON)
     rig.stop_after_runs(1)
 
@@ -319,14 +353,59 @@ async def test_no_catch_up_when_the_last_completed_session_was_scanned(rig):
     assert rig.runs == [("nightly", TUE_SCAN)]
 
 
-async def test_no_catch_up_before_todays_session_is_complete(rig):
-    """Mon 10:00 ET: the last completed session is Friday's, which was scanned."""
+async def test_no_catch_up_before_todays_scan_time(rig):
+    """Mon 10:00 ET: the last session whose scan time has passed is Friday's, which was scanned."""
     rig.start(MON_1000_ET, latest=FRI)
     rig.stop_after_runs(1)
 
     await rig.drive()
 
     assert [kind for kind, _ in rig.runs] == ["nightly"]
+
+
+async def test_starting_between_the_settle_time_and_the_scan_time_waits_for_the_nightly(rig):
+    """Mon 16:30 ET is after the close + 16 minutes (the bars exist) but before the 16:45 scan
+    time: with Friday scanned there is nothing due, so no catch-up; the 16:45 nightly runs so
+    tonight's digest uses settled bars."""
+    at_1630 = datetime(2026, 10, 19, 16, 30, tzinfo=ET)
+    rig.start(at_1630, latest=FRI)
+    rig.stop_after_runs(1)
+
+    await rig.drive()
+
+    assert rig.runs == [("nightly", MON_SCAN)]
+    assert sum(rig.sleeps) == (MON_SCAN - at_1630).total_seconds()
+
+
+async def test_starting_just_after_the_scan_time_catches_up(rig):
+    at_1646 = datetime(2026, 10, 19, 16, 46, tzinfo=ET)
+    rig.start(at_1646, latest=FRI)
+    rig.stop_after_runs(1)
+
+    await rig.drive()
+
+    assert rig.runs == [("catchup", at_1646)]
+
+
+async def test_starting_before_the_scan_time_still_catches_up_an_older_gap(rig):
+    """Mon 16:30 ET with Thursday scanned: Friday's scan time passed, so Friday is owed."""
+    at_1630 = datetime(2026, 10, 19, 16, 30, tzinfo=ET)
+    rig.start(at_1630, latest=THU)
+    rig.stop_after_runs(1)
+
+    await rig.drive()
+
+    assert rig.runs == [("catchup", at_1630)]
+
+
+async def test_starting_before_the_scan_time_with_nothing_ever_scanned_catches_up(rig):
+    at_1630 = datetime(2026, 10, 19, 16, 30, tzinfo=ET)
+    rig.start(at_1630, latest=None)
+    rig.stop_after_runs(1)
+
+    await rig.drive()
+
+    assert rig.runs == [("catchup", at_1630)]
 
 
 async def test_no_catch_up_on_a_weekend_when_friday_was_scanned(rig):
@@ -429,10 +508,48 @@ async def test_a_failed_catch_up_does_not_stop_the_loop(rig):
     ]
 
 
-# ------------------------------------------------------------------------ catch-up retries
+async def test_an_unexpected_error_in_the_loop_is_logged_and_waited_out(rig, monkeypatch):
+    """The loop catches everything but cancellation. Here the store hands back a session that is
+    not a date, so the startup comparison raises ``TypeError`` once; the scheduler logs it (no
+    secret in it), says so in its state, waits 15 minutes and goes on to run the nightly."""
+    monkeypatch.setenv("ALPACA_API_SECRET", "s3cr3t-alpaca-value")
+    rig.store.garbled = 1
+    rig.stop_after_runs(1)
 
-QUARTER_HOUR = timedelta(minutes=15)
-MON_1620_ET = datetime(2026, 10, 19, 16, 20, tzinfo=ET)  # session done, scan due 16:45
+    await rig.drive()
+
+    assert rig.store.calls == 2 and rig.runs == [("nightly", MON_SCAN)]
+    first = rig.states[0]
+    assert first["running"] is False and first["next_scan_at"] is None
+    assert "unexpected error" in first["disabled_reason"]
+    assert "15 minutes" in first["disabled_reason"]
+    assert rig.sleeps[:3] == [300.0, 300.0, 300.0]
+    assert any(r[0] == "warning" and "unexpected error" in str(r) for r in rig.log.records)
+    assert "s3cr3t-alpaca-value" not in rig.log.text()
+    assert "s3cr3t-alpaca-value" not in str(first["disabled_reason"])
+    assert rig.states[-1]["running"] is True and rig.states[-1]["disabled_reason"] is None
+
+
+async def test_a_scan_that_falls_due_while_waiting_out_an_error_still_runs(rig):
+    """Mon 16:20: the catch-up finds a job running, and the re-check at 16:35 hits an unexpected
+    error. The 15-minute wait ends at 16:50, after the 16:45 scan time: that night's scan runs
+    then, it is not pushed to tomorrow's."""
+    rig.start(MON_1620_ET, latest=THU)
+
+    def busy_then_garbled() -> BaseException:
+        rig.store.garbled = 1  # the next store read (the re-check) raises TypeError
+        return JobBusy("a scan is already running")
+
+    rig.effects = {1: busy_then_garbled}
+    rig.stop_after_runs(2)
+
+    await rig.drive()
+
+    assert rig.runs == [("catchup", MON_1620_ET), ("nightly", MON_1620_ET + 2 * QUARTER_HOUR)]
+    assert MON_SCAN < rig.runs[1][1] < TUE_SCAN
+
+
+# ------------------------------------------------------------------------ catch-up retries
 
 
 async def test_a_catch_up_that_fails_twice_is_retried_every_15_minutes_until_it_works(rig):
@@ -469,7 +586,7 @@ async def test_a_run_that_comes_back_not_ok_counts_as_failed_and_is_retried(rig)
 
 async def test_a_catch_up_that_keeps_failing_gives_way_to_the_nightly_when_it_is_due(rig):
     """Mon 16:20 ET: 16:20 and 16:35 fail; 16:50 would be after the 16:45 scan, so that runs."""
-    rig.start(MON_1620_ET, latest=FRI)
+    rig.start(MON_1620_ET, latest=THU)
     rig.effects = {1: RuntimeError("alpaca 503"), 2: RuntimeError("alpaca 503")}
     rig.stop_after_runs(3)
 
@@ -483,7 +600,7 @@ async def test_a_catch_up_that_keeps_failing_gives_way_to_the_nightly_when_it_is
 
 
 async def test_the_nightly_ends_the_retries_even_when_it_fails_too(rig):
-    rig.start(MON_1620_ET, latest=FRI)
+    rig.start(MON_1620_ET, latest=THU)
     rig.effects = {i: RuntimeError("alpaca 503") for i in (1, 2, 3)}
     rig.stop_after_runs(4)
 
@@ -510,8 +627,8 @@ async def test_a_catch_up_that_succeeds_is_not_retried(rig):
 
 
 async def test_a_job_running_elsewhere_is_rechecked_after_15_minutes_and_not_rerun_if_done(rig):
-    """JobBusy: someone else (the Run scan now button) is scanning. If the last completed session
-    is stored 15 minutes later, there is nothing left to catch up."""
+    """JobBusy: someone else (the Run scan now button) is scanning. If the last due session is
+    stored 15 minutes later, there is nothing left to catch up."""
     rig.start(MON_1700_ET, latest=FRI)
 
     def the_other_job_finishes() -> BaseException:
@@ -540,7 +657,7 @@ async def test_a_job_running_elsewhere_that_has_not_finished_the_session_is_caug
 
 
 async def test_a_busy_catch_up_gives_way_to_the_nightly_when_it_is_due(rig):
-    rig.start(MON_1620_ET, latest=FRI)
+    rig.start(MON_1620_ET, latest=THU)
     rig.effects = {1: JobBusy("a scan is already running"), 2: JobBusy("a scan is already running")}
     rig.stop_after_runs(3)
 
@@ -552,7 +669,7 @@ async def test_a_busy_catch_up_gives_way_to_the_nightly_when_it_is_due(rig):
 
 async def test_a_catch_up_that_runs_past_the_scan_time_is_followed_by_the_nightly_at_once(rig):
     """A slow first run (a long backfill) ends after tonight's scan time: that scan is not skipped."""
-    rig.start(MON_1620_ET, latest=FRI)
+    rig.start(MON_1620_ET, latest=THU)
 
     def takes_an_hour() -> BaseException | None:
         rig.clock += timedelta(hours=1)
@@ -781,9 +898,8 @@ def test_disable_flag_set_by_load_env_is_honoured(monkeypatch):
     monkeypatch.setattr(scheduler, "_STATE", scheduler._State())
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.delenv("ATLAS_DISABLE_SCHEDULER", raising=False)
-    monkeypatch.setattr(
-        api, "load_env", lambda: os.environ.__setitem__("ATLAS_DISABLE_SCHEDULER", "1")
-    )
+    # What load_env() does with `.env`; monkeypatch undoes it, whatever conftest.py is around.
+    monkeypatch.setattr(api, "load_env", lambda: monkeypatch.setenv("ATLAS_DISABLE_SCHEDULER", "1"))
 
     started, _ = _run_lifespan_with_fake_scheduler(monkeypatch)
 
