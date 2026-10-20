@@ -32,7 +32,7 @@ import io
 import itertools
 import math
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import redirect_stdout
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -249,8 +249,7 @@ class FakeProductStore:
         done = [
             j["started_at"]
             for j in self.jobs
-            if j["status"] == "ok"
-            and ((j.get("steps") or {}).get(step) or {}).get("status") == "ok"
+            if ((j.get("steps") or {}).get(step) or {}).get("status") == "ok"
         ]
         return max(done) if done else None
 
@@ -288,9 +287,9 @@ class FakeIngest:
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
-        self.result = IngestResult(41, 41, 41, [])
+        self.result: IngestResult | None = None
         self.raises: BaseException | None = None
-        self.backfill_total = 1000
+        self.backfill_total = 10
         monkeypatch.setattr(job, "refresh_assets", self.refresh_assets)
         monkeypatch.setattr(job, "backfill", self.backfill)
         monkeypatch.setattr(job, "incremental_update", self.incremental_update)
@@ -308,7 +307,7 @@ class FakeIngest:
         )
         if self.raises is not None:
             raise self.raises
-        return self.result
+        return self.result or IngestResult(41, 41, 41, [])
 
     async def backfill(
         self, client, bars_store, *, start, now, progress=None, **kw
@@ -316,12 +315,14 @@ class FakeIngest:
         self.calls.append(
             ("backfill", {"client": client, "store": bars_store, "start": start, "now": now, **kw})
         )
+        if self.raises is not None:
+            raise self.raises
         total = self.backfill_total
         for done in range(total + 1):
             if progress is not None:
                 progress(done, total)
             await asyncio.sleep(0)  # a real backfill awaits Alpaca between chunks
-        return IngestResult(total, total, 10 * total, [])
+        return self.result or IngestResult(total, total, 10 * total, [])
 
 
 class Harness:
@@ -338,6 +339,7 @@ class Harness:
         self.sent: list[str] = []
         self.delivery = DeliveryResult(ok=True, detail="sent")
         self.loads: list[tuple[date | None, UniverseFilter]] = []
+        self.extras: list[list[str]] = []
         self.contexts: list[ScanContext] = []
 
     async def calendar(self) -> TradingCalendar:
@@ -347,12 +349,21 @@ class Harness:
         self.sent.append(text)
         return self.delivery
 
-    async def loader(self, as_of: date | None, universe: UniverseFilter):
+    async def loader(
+        self, as_of: date | None, universe: UniverseFilter, extra_symbols: Sequence[str] = ()
+    ):
         self.loads.append((as_of, universe))
+        self.extras.append(list(extra_symbols))
         assert as_of is not None
         return truncate(self.panel, pd.Timestamp(as_of)), KINDS, as_of
 
-    def deps(self, now: datetime = MON_19_OCT_1700_ET, **over: Any) -> JobDeps:
+    def deps(
+        self,
+        now: datetime = MON_19_OCT_1700_ET,
+        clock: Callable[[], datetime] | None = None,
+        **over: Any,
+    ) -> JobDeps:
+        """The deps for a run started at ``now``; ``clock`` replaces the clock when time moves."""
         self.store.clock = now
         fields: dict[str, Any] = {
             "client": self.client,
@@ -361,7 +372,7 @@ class Harness:
             "store": self.store,
             "send": self.send,
             "repo": self.repo,
-            "now": lambda: now,
+            "now": clock or (lambda: now),
             "loader": self.loader,
             "on_context": self.contexts.append,
         }
@@ -404,6 +415,11 @@ def _position(symbol: str, opened_on: date, entry: float, stop: float, **kw: Any
 def _only_position(store: FakeProductStore) -> dict[str, Any]:
     (row,) = store.positions.values()
     return row
+
+
+def _refreshed_yesterday() -> dict[str, Any]:
+    """A successful run a day ago that refreshed the asset list: tonight's assets step skips."""
+    return _job_row(MON_19_OCT_1700_ET - timedelta(days=1), "ok", "ok")
 
 
 # ---------------------------------------------------------------------------- the brief's tests
@@ -451,10 +467,10 @@ async def test_second_run_same_session_sends_no_second_digest(h):
 async def test_concurrent_run_raises_job_busy(h):
     entered, release = asyncio.Event(), asyncio.Event()
 
-    async def slow_loader(as_of, universe):
+    async def slow_loader(as_of, universe, extra_symbols=()):
         entered.set()
         await release.wait()
-        return await h.loader(as_of, universe)
+        return await h.loader(as_of, universe, extra_symbols)
 
     first = asyncio.create_task(run_job(h.deps(loader=slow_loader), "nightly"))
     try:
@@ -507,7 +523,7 @@ async def test_raise_stop_action_updates_position_stop(h):
     symbol = _trending_symbol()
     opened = CAL.sessions_between(TARGET - timedelta(days=40), TARGET)[0]
     entry = _close(symbol, opened)
-    pos = _position(symbol, opened, entry, stop=round(entry * 0.7, 2))
+    pos = _position(symbol, opened, entry, stop=round(entry * 0.7, 2), last_action_on=FRI)
     expected = position_action({"id": "x", **pos}, CTX)
     assert expected.kind is ActionKind.RAISE_STOP, "premise: the trail rises tonight"
     assert expected.stop is not None and expected.stop != round(expected.stop, 2), "premise"
@@ -535,7 +551,7 @@ async def test_one_context_per_session_is_reused_for_scan_tracking_positions_and
     built = h.spy("build_context")
     scans = h.spy("run_scan")
     tracked = h.spy("track_ideas")
-    acted = h.spy("position_action")
+    acted = h.spy("nightly_update")
     h.store = FakeProductStore(
         scanned=[WED],
         positions=[_position("S03", TARGET - timedelta(days=30), 100.0, 90.0)],
@@ -550,7 +566,7 @@ async def test_one_context_per_session_is_reused_for_scan_tracking_positions_and
     target_ctx = contexts[-1]
     assert len(h.contexts) == 1 and h.contexts[0] is target_ctx  # the API cache, once
     assert tracked[0][0][1] is target_ctx
-    assert acted and all(args[1].panel is target_ctx.panel for args, _, _ in acted)
+    assert acted and all(args[1] is target_ctx for args, _, _ in acted)
 
 
 async def test_a_failing_cache_hook_does_not_fail_the_job(h):
@@ -620,7 +636,7 @@ def _job_row(started: datetime, status: str, assets: str) -> dict[str, Any]:
         pytest.param([], True, id="never-refreshed"),
         pytest.param([(3, "ok", "ok")], False, id="3-days-ago"),
         pytest.param([(8, "ok", "ok")], True, id="8-days-ago"),
-        pytest.param([(1, "failed", "ok")], True, id="only-a-failed-run"),
+        pytest.param([(1, "failed", "ok")], False, id="a-failed-run-that-refreshed-counts"),
         pytest.param([(9, "ok", "ok"), (1, "ok", "skipped")], True, id="skipped-is-not-a-refresh"),
     ],
 )
@@ -643,12 +659,44 @@ async def test_a_weekly_refresh_is_remembered_by_the_next_run(h):
     assert h.ingest.names().count("refresh_assets") == 1
 
 
-async def test_bars_are_updated_incrementally_when_spy_is_stored(h):
+async def test_bars_are_updated_incrementally_when_spy_is_current_and_assets_unchanged(h):
+    h.store = FakeProductStore(jobs=[_refreshed_yesterday()])
     run = await run_job(h.deps(), "nightly")
-    assert h.ingest.names() == ["refresh_assets", "incremental_update"]
-    _, kwargs = h.ingest.calls[1]
+    assert h.ingest.names() == ["incremental_update"]
+    _, kwargs = h.ingest.calls[0]
     assert kwargs == {"client": h.client, "store": h.bars, "now": MON_19_OCT_1700_ET}
-    assert run["steps"]["bars"]["mode"] == "update" and run["steps"]["bars"]["failed"] == []
+    bars = run["steps"]["bars"]
+    assert bars["mode"] == "update" and bars["trigger"] is None and bars["failed"] == []
+
+
+async def test_a_weekly_asset_refresh_is_followed_by_a_backfill_to_load_new_listings(h):
+    """The incident: the update only maintains symbols already stored, so a new listing (or a
+    symbol whose first load failed) was never fetched at all."""
+    run = await run_job(h.deps(), "nightly")  # SPY is current; the asset list is refreshed
+    assert h.ingest.names() == ["refresh_assets", "backfill"]
+    _, kwargs = h.ingest.calls[1]
+    assert kwargs["start"] == HISTORY_START and kwargs["store"] is h.bars
+    assert "refresh_assets" not in kwargs  # the assets step just did it
+    bars = run["steps"]["bars"]
+    assert bars["mode"] == "backfill" and bars["trigger"] == "asset list refreshed"
+
+
+@pytest.mark.parametrize(
+    ("behind", "mode"),
+    [pytest.param(31, "backfill", id="31-sessions"), pytest.param(30, "update", id="30-sessions")],
+)
+async def test_bars_more_than_30_sessions_behind_are_backfilled(h, behind, mode):
+    h.store = FakeProductStore(jobs=[_refreshed_yesterday()])
+    h.bars.last["SPY"] = PANEL.dates()[450 - behind].date()
+    assert len(CAL.sessions_between(h.bars.last["SPY"], TARGET)) == behind  # premise
+
+    run = await run_job(h.deps(), "nightly")
+
+    bars = run["steps"]["bars"]
+    assert bars["mode"] == mode
+    assert h.ingest.names() == (["backfill"] if mode == "backfill" else ["incremental_update"])
+    if mode == "backfill":
+        assert bars["trigger"] == f"SPY is {behind} sessions behind"
 
 
 async def test_unservable_symbols_are_recorded_and_do_not_fail_the_bars_step(h):
@@ -665,9 +713,12 @@ async def test_unservable_symbols_are_recorded_and_do_not_fail_the_bars_step(h):
 async def test_first_run_backfills_from_2016_and_reports_progress_as_it_goes(h):
     h.bars = FakeBarsStore(spy=False)
 
+    h.ingest.backfill_total = 1000
+
     run = await run_job(h.deps(), "nightly")
 
     assert h.ingest.names() == ["refresh_assets", "backfill"]
+    assert run["steps"]["bars"]["trigger"] == "no SPY bars stored"
     _, kwargs = h.ingest.calls[1]
     assert kwargs["start"] == HISTORY_START == date(2016, 1, 1)
     assert kwargs["now"] == MON_19_OCT_1700_ET and kwargs["store"] is h.bars
@@ -787,21 +838,23 @@ async def test_no_split_inside_the_band_and_no_bar_on_the_open_day_leave_prices_
     assert missing["last_action_text"].startswith("no price data for ZZZZ")
 
 
-def _dip_on_friday() -> tuple[str, float]:
-    """A symbol whose Friday low is under both Thursday's and Monday's, and a stop between."""
+def _dip_on(day: date, others: Sequence[date]) -> tuple[str, float]:
+    """A symbol whose low on ``day`` is under its low on each of ``others``, and a stop between."""
     for symbol in PANEL.symbols():
         if symbol == "SPY":
             continue
-        thu, fri, mon = _low(symbol, THU), _low(symbol, FRI), _low(symbol, TARGET)
-        if fri < min(thu, mon) * 0.995:
-            return symbol, (fri + min(thu, mon)) / 2
-    raise AssertionError("premise: some symbol dips on Friday")
+        dip, rest = _low(symbol, day), min(_low(symbol, d) for d in others)
+        if dip < rest * 0.995:
+            return symbol, (dip + rest) / 2
+    raise AssertionError(f"premise: some symbol dips on {day}")
 
 
 async def test_a_stop_hit_on_a_missed_session_is_reported_not_hidden_by_tonights_hold(h):
-    symbol, stop = _dip_on_friday()
+    symbol, stop = _dip_on(FRI, [THU, TARGET])
     opened = _opened(20)
-    pos = _position(symbol, opened, _close(symbol, opened), stop=stop, trail_atr=50.0)
+    pos = _position(
+        symbol, opened, _close(symbol, opened), stop=stop, trail_atr=50.0, last_action_on=WED
+    )
     tonight_alone = position_action({"id": "x", **pos}, CTX)
     assert tonight_alone.kind is not ActionKind.STOP_HIT, "premise: Monday alone looks fine"
     h.store = FakeProductStore(scanned=[WED], positions=[pos])
@@ -813,12 +866,74 @@ async def test_a_stop_hit_on_a_missed_session_is_reported_not_hidden_by_tonights
     assert row["last_action_text"] == f"Fri 16 Oct: stop hit, exit (stop {stop:.2f})"
     assert row["last_action_on"] == TARGET
 
+    # A second run for the same session keeps what the catch-up found.
+    before = dict(row)
+    await run_job(h.deps(now=MON_19_OCT_1700_ET + timedelta(hours=1)), "manual")
+    assert _only_position(h.store) == before
+
+
+async def test_the_same_session_twice_gives_the_same_actions_and_stops(h):
+    """The incident: a re-run tested tonight's low against the stop the first run had just raised,
+    so "raise stop to 424.95 (trail)" became "stop hit, exit (stop 424.95)"."""
+    trail = 0.5
+    for symbol in PANEL.symbols():
+        opened = _opened()
+        highest = float(CTX.panel.close[symbol].loc[pd.Timestamp(opened) :].max())
+        raised = highest - trail * float(CTX.ind.atr14.at[CTX.session, symbol])
+        low = _low(symbol, TARGET)
+        if symbol != "SPY" and raised > low + 0.05:
+            break
+    else:
+        raise AssertionError("premise: some trail rises above tonight's low")
+    stop = round(low - 0.01, 2)
+    pos = _position(
+        symbol, opened, _close(symbol, opened), stop=stop, trail_atr=trail, last_action_on=FRI
+    )
+    h.store = FakeProductStore(positions=[pos])
+    updates = h.spy("nightly_update")
+
+    await run_job(h.deps(), "nightly")
+    first = dict(_only_position(h.store))
+    await run_job(h.deps(now=MON_19_OCT_1700_ET + timedelta(hours=2)), "manual")
+
+    (_, _, one), (_, _, two) = updates
+    assert one.action.kind is ActionKind.RAISE_STOP and one.action.stop == round(raised, 2)
+    assert two.reused and two.action == one.action
+    assert _only_position(h.store) == first
+
+
+async def test_after_a_failed_catch_up_positions_are_walked_from_their_last_advice(h):
+    symbol, stop = _dip_on(THU, [FRI, TARGET])
+    opened = _opened(20)
+    pos = _position(
+        symbol, opened, _close(symbol, opened), stop=stop, trail_atr=50.0, last_action_on=WED
+    )
+    h.store = FakeProductStore(scanned=[WED], positions=[pos])
+    real_run_scan = job.run_scan
+
+    def friday_fails(panel, kinds, as_of, *args, **kwargs):
+        if as_of == FRI:
+            raise RuntimeError("the scan crashed on Friday")
+        return real_run_scan(panel, kinds, as_of, *args, **kwargs)
+
+    h.monkeypatch.setattr(job, "run_scan", friday_fails)
+    failed = await run_job(h.deps(), "catchup")
+    assert failed["steps"]["scan"]["status"] == "failed" and h.store.saved_sessions == [THU]
+    assert _only_position(h.store)["last_action_on"] == WED  # not advised yet
+
+    h.monkeypatch.setattr(job, "run_scan", real_run_scan)
+    done = await run_job(h.deps(now=MON_19_OCT_1700_ET + timedelta(hours=1)), "catchup")
+
+    assert done["steps"]["scan"]["sessions"] == [FRI.isoformat(), TARGET.isoformat()]
+    row = _only_position(h.store)  # Thursday was scanned by the failed run, yet still walked
+    assert row["last_action_text"] == f"Thu 15 Oct: stop hit, exit (stop {stop:.2f})"
+
 
 async def test_a_trail_raised_on_a_missed_session_is_kept_and_told(h):
     symbol = _trending_symbol()
     opened = _opened(40)
     entry = _close(symbol, opened)
-    pos = _position(symbol, opened, entry, stop=round(entry * 0.7, 2))
+    pos = _position(symbol, opened, entry, stop=round(entry * 0.7, 2), last_action_on=WED)
     h.store = FakeProductStore(scanned=[WED], positions=[pos])
 
     await run_job(h.deps(), "catchup")
@@ -829,6 +944,52 @@ async def test_a_trail_raised_on_a_missed_session_is_kept_and_told(h):
     )
     assert row["last_action"] == "raise_stop"
     assert row["last_action_text"] == f"raise stop to {row['current_stop']:.2f} (trail)"
+
+
+# ---------------------------------------------------------------------------- what a scan sees
+
+
+async def test_the_live_label_uses_the_clock_when_the_scan_is_saved(h):
+    """The incident: a run started at 09:00 and saved at 09:31 marked its ideas live, though the
+    session they were for had already opened when they were published."""
+    start = datetime(2026, 10, 20, 9, 0, tzinfo=ET)  # Tue: Monday's ideas, before the open
+    saved = datetime(2026, 10, 20, 9, 31, tzinfo=ET)
+    ticks = iter([start])
+    h.store.clock = start
+
+    run = await run_job(h.deps(now=start, clock=lambda: next(ticks, saved)), "nightly")
+
+    assert run["session"] == TARGET  # the target comes from the start
+    assert h.store.reconstructed == {TARGET: True}
+    assert {r["published_at"] for r in h.store.ideas.values()} == {saved}
+
+
+async def test_a_past_sessions_book_holds_only_positions_open_by_then(h):
+    old = _position("S01", _opened(), 100.0, 90.0, shares=10.0)  # $100 at risk
+    friday = _position("S02", FRI, 50.0, 40.0, shares=5.0)  # $50, bought on Friday
+    h.store = FakeProductStore(scanned=[WED], positions=[old, friday])
+    scans = h.spy("run_scan")
+
+    await run_job(h.deps(), "catchup")
+
+    books = {args[2]: sorted(args[5]) for args, _, _ in scans}
+    assert books == {
+        THU: [("S01", 100.0)],
+        FRI: [("S01", 100.0), ("S02", 50.0)],
+        TARGET: [("S01", 100.0), ("S02", 50.0)],
+    }
+
+
+async def test_open_position_symbols_are_always_loaded(h):
+    opened = _opened()
+    h.store = FakeProductStore(
+        positions=[
+            _position("S03", opened, _close("S03", opened), 1.0),
+            _position("ZZZZ", opened, 10.0, 9.0),
+        ]
+    )
+    await run_job(h.deps(), "nightly")
+    assert h.extras == [["S03", "ZZZZ"]]
 
 
 # ---------------------------------------------------------------------------- digest inputs
@@ -919,7 +1080,7 @@ async def test_a_failure_reason_never_carries_a_secret(h, monkeypatch):
 
 
 async def test_a_scan_failure_stops_before_tracking(h):
-    async def no_spy(as_of, universe):
+    async def no_spy(as_of, universe, extra_symbols=()):
         raise ScanError("no SPY bar on 2026-10-19: the market regime can't be read")
 
     run = await run_job(h.deps(loader=no_spy), "nightly")

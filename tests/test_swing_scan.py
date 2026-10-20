@@ -694,6 +694,22 @@ async def test_the_loader_returns_the_panel_kinds_and_session(monkeypatch):
     assert fake.prefilter_calls == [UniverseFilter().min_median_dollar_volume]
 
 
+async def test_the_loader_always_loads_extra_symbols_below_the_prefilter(monkeypatch):
+    """The nightly job passes the symbols the user holds: a position in a stock that fell below
+    the liquidity prefilter still needs its bars for tonight's action."""
+    _FakeStore(monkeypatch)
+    from swing_engine.loader import load_scan_inputs
+
+    async def thin_prefilter(min_dollar_volume: float) -> list[str]:
+        return ["S00", "S01"]
+
+    monkeypatch.setattr(store, "liquid_prefilter", thin_prefilter)
+    plain, _, _ = await load_scan_inputs(AS_OF, UniverseFilter())
+    held, _, _ = await load_scan_inputs(AS_OF, UniverseFilter(), extra_symbols=["S07"])
+    assert sorted(plain.symbols()) == ["S00", "S01", "SPY"]
+    assert sorted(held.symbols()) == ["S00", "S01", "S07", "SPY"]
+
+
 def test_scan_prefilter_threshold_is_the_universe_filter_s(monkeypatch):
     """The prefilter is only a cheap necessary condition for the universe's dollar-volume floor,
     so it must use that floor: a hard-coded copy would silently drop names if the floor fell."""

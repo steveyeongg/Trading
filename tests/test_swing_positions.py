@@ -35,7 +35,16 @@ from swing_engine.config import ExecutionParams
 from swing_engine.execution import ExitReason, TrackStatus, simulate_trade
 from swing_engine.indicators import Indicators, compute_indicators
 from swing_engine.panel import Panel
-from swing_engine.positions import Action, ActionKind, position_action
+from swing_engine.positions import (
+    Action,
+    ActionKind,
+    nightly_update,
+    position_action,
+    raise_stop_text,
+    rescaled,
+    split_ratio,
+    walk_action,
+)
 from swing_engine.scan import ScanContext
 from swing_engine.testing import make_bars, trend_series
 
@@ -584,3 +593,173 @@ def test_with_a_real_atr_the_nightly_stop_is_never_above_the_model_stop():
             if out.status is TrackStatus.OPEN:
                 assert act.stop is not None and out.current_stop is not None
                 assert act.stop <= out.current_stop + 1e-9, (seed, act, out)
+
+
+# ------------------------------------------------------------- the nightly update (the job's step)
+#
+# ``nightly_update`` is what the job stores for each open position after a close: the position is
+# rescaled first if a split happened since it was bought, then the rules above are walked over every
+# session since it was last advised (``last_action_on``, or from ``opened_on``), so a stop hit on a
+# day the Mac slept through is reported instead of tonight's hold. A position already advised for
+# this session is left as it is: a second run of the same session must say the same thing, not
+# test tonight's low against the stop the first run raised.
+
+
+def test_the_raise_text_is_the_one_position_action_uses():
+    act = position_action(_pos(0, stop=95.0), _ctx_closes([100, 110, 111]))
+    assert act.kind is ActionKind.RAISE_STOP and act.stop is not None
+    assert act.text == raise_stop_text(act.stop) == "raise stop to 105.00 (trail)"
+
+
+@pytest.mark.parametrize(
+    ("ratio", "snapped"),
+    [
+        pytest.param(1.0, 1.0, id="no-split"),
+        pytest.param(0.75, 1.0, id="band-low-edge"),
+        pytest.param(1.33, 1.0, id="band-high-edge"),
+        pytest.param(0.25, 0.25, id="4-for-1"),
+        pytest.param(0.30, 1 / 3, id="near-3-for-1"),
+        pytest.param(0.60, 2 / 3, id="3-for-2"),
+        pytest.param(1.34, 3 / 2, id="just-over-the-band"),
+        pytest.param(7.0, 8.0, id="nearest-by-ratio-not-by-difference"),
+        pytest.param(0.07, 0.1, id="1-for-10-reverse"),
+    ],
+)
+def test_split_ratio_snaps_outside_the_band(ratio, snapped):
+    ctx = _ctx_closes([100.0, 100.0, 100.0])
+    assert split_ratio(_pos(1, entry_price=100.0 / ratio), ctx) == pytest.approx(snapped)
+
+
+def test_split_ratio_needs_a_bar_on_the_open_day_and_a_positive_entry():
+    spec: dict[str, list[Bar | None]] = {
+        "ABC": [_bar(25.0), None, _bar(25.0)],
+        "XYZ": _rows([5] * 3),
+    }
+    ctx = _context(spec)
+    assert split_ratio(_pos(0), ctx) == 0.25  # bought at 100, now 25 on the open day
+    assert split_ratio(_pos(1), ctx) == 1.0  # no bar on the open day
+    assert split_ratio(_pos(0, symbol="TYPO"), ctx) == 1.0
+    assert split_ratio(_pos(0, entry_price=0.0), ctx) == 1.0
+    assert split_ratio(_pos(5), ctx) == 1.0  # opened after the scan day
+
+
+def test_rescaled_keeps_the_money_at_risk():
+    pos = _pos(0, stop=90.0, current_stop=96.0, shares=12.0)
+    out = rescaled(pos, 0.25)
+    assert out == {"entry_price": 25.0, "initial_stop": 22.5, "current_stop": 24.0, "shares": 48.0}
+    risk = lambda p: p["shares"] * (p["entry_price"] - p["current_stop"])  # noqa: E731
+    assert risk({**pos, **out}) == pytest.approx(risk(pos))
+    assert "current_stop" not in rescaled({**pos, "current_stop": None}, 2.0)
+
+
+def _walked(closes: list[Bar | None], **pos: Any) -> tuple[Action, float]:
+    spec: dict[str, list[Bar | None]] = {"ABC": closes, "XYZ": _rows([50.0] * len(closes))}
+    return walk_action(_pos(0, **pos), _context(spec), max_hold=pos.pop("max_hold", 30))
+
+
+def test_a_stop_hit_on_a_day_since_the_last_advice_is_the_action():
+    # Advised on Thu 4 Jan (day 2); Fri 5 Jan dipped through the stop; Mon 8 Jan looks fine.
+    bars = [_bar(100), _bar(100), _bar(100), _bar(100, low=94.0), _bar(100)]
+    act, stop = _walked(bars, last_action_on=_day(2))
+    assert act.kind is ActionKind.STOP_HIT and stop == 95.0
+    assert act.text == "Fri 5 Jan: stop hit, exit (stop 95.00)"
+
+
+def test_the_walk_starts_after_the_last_advice_not_on_it():
+    bars = [_bar(100), _bar(100), _bar(100, low=94.0), _bar(100), _bar(100)]
+    act, _ = _walked(bars, last_action_on=_day(2))
+    assert act.kind is ActionKind.HOLD  # day 2 was already advised
+
+
+def test_a_position_never_advised_is_walked_from_its_open_day():
+    bars = [_bar(100), _bar(100, low=94.0), _bar(100), _bar(100)]
+    act, _ = _walked(bars)
+    assert act.text == "Wed 3 Jan: stop hit, exit (stop 95.00)"
+
+
+def test_a_stop_raised_on_an_earlier_day_carries_and_is_told_even_if_tonight_holds():
+    bars = _rows([100, 110, 108, 108])  # day 1 raises the trail to 104; nothing moves after
+    act, stop = _walked(bars, last_action_on=_day(0))
+    assert stop == 104.0
+    assert act == Action(
+        "pos-1", "ABC", ActionKind.RAISE_STOP, 104.0, "raise stop to 104.00 (trail)"
+    )
+
+
+def test_a_carried_raise_is_named_beside_a_max_hold():
+    act, stop = _walked(_rows([100, 110, 108, 108]), last_action_on=_day(0), max_hold=3)
+    assert act.kind is ActionKind.MAX_HOLD and stop == 104.0
+    assert act.text == (
+        "max hold reached (3 sessions), consider exiting; raise stop to 104.00 (trail)"
+    )
+
+
+def test_a_carried_raise_is_named_beside_no_data():
+    act, stop = _walked([*_rows([100, 110, 108]), None], last_action_on=_day(0))
+    assert act.kind is ActionKind.NO_DATA and stop == 104.0
+    assert act.text == "no price data for ABC since 2024-01-04; raise stop to 104.00 (trail)"
+
+
+def test_a_walk_over_tonight_only_is_position_action():
+    ctx = _ctx_closes([100, 110, 111])
+    pos = _pos(0, stop=95.0, last_action_on=_day(1))
+    act, stop = walk_action(pos, ctx)
+    assert act == position_action(pos, ctx) and stop == act.stop
+
+
+def test_raised_stops_are_kept_to_the_cent():
+    act, stop = _walked(_rows([100, 101.017, 101.0]), last_action_on=_day(1))  # trail 95.017
+    assert act.kind is ActionKind.RAISE_STOP and stop == 95.02 == act.stop
+    assert act.text == "raise stop to 95.02 (trail)"
+
+
+def test_nightly_update_stores_the_action_for_the_session():
+    ctx = _ctx_closes([100, 110, 111])
+    update = nightly_update(_pos(0, stop=95.0, last_action_on=_day(1)), ctx)
+    assert update.action.kind is ActionKind.RAISE_STOP and not update.reused
+    assert update.fields == {
+        "last_action": "raise_stop",
+        "last_action_text": "raise stop to 105.00 (trail)",
+        "last_action_on": _day(2),
+        "current_stop": 105.0,
+    }
+
+
+def test_the_same_session_twice_gives_the_same_action_and_stop():
+    """The incident: a re-run tested tonight's low against the stop the first run had just raised,
+    so "raise stop to 109.00 (trail)" turned into "stop hit, exit (stop 109.00)"."""
+    bars = [_bar(100), _bar(110), _bar(110, low=108.5)]
+    ctx = _context({"ABC": bars}, atr=2.0)
+    pos = _pos(0, stop=108.4, trail_atr=0.5, last_action_on=_day(1))
+    first = nightly_update(pos, ctx)
+    assert first.action.kind is ActionKind.RAISE_STOP and first.action.stop == 109.0  # premise
+    advised = {**pos, **first.fields}
+    assert position_action(advised, ctx).kind is ActionKind.STOP_HIT  # premise: re-testing flips
+
+    again = nightly_update(advised, ctx)
+    assert again.reused and again.fields == {}
+    assert again.action == first.action
+
+
+def test_a_stored_no_data_action_is_rebuilt_without_a_stop():
+    ctx = _ctx_closes([100, 101])
+    pos = _pos(
+        0,
+        last_action="no_data",
+        last_action_text="no price data for ABC since 2024-01-02",
+        last_action_on=_day(1),
+    )
+    update = nightly_update(pos, ctx)
+    assert update.reused and update.action == Action(
+        "pos-1", "ABC", ActionKind.NO_DATA, None, "no price data for ABC since 2024-01-02"
+    )
+
+
+def test_a_split_is_applied_before_the_rules_and_named_first():
+    ctx = _ctx_closes([25.0, 25.5, 26.0])  # bought at 100 before a 4-for-1 split
+    update = nightly_update(_pos(0, stop=88.0, shares=10.0, last_action_on=_day(1)), ctx)
+    assert update.ratio == 0.25
+    assert update.fields["entry_price"] == 25.0 and update.fields["shares"] == 40.0
+    assert update.fields["initial_stop"] == 22.0
+    assert update.action.text.startswith("adjusted for a split (\u00d70.25); ")
+    assert update.action.kind is not ActionKind.STOP_HIT  # 4:1 is not a crash through the stop

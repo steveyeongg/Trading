@@ -270,10 +270,11 @@ _UPDATE_JOB_STEPS_SQL = text(
 _LATEST_JOB_SQL = text(
     f"SELECT {_cols(_JOB_COLUMNS)} FROM swing_job_runs ORDER BY started_at DESC LIMIT 1"
 )
+# The step's own status: a run that refreshed the asset list and failed later still refreshed it.
 _LAST_STEP_OK_SQL = text(
     """
     SELECT started_at FROM swing_job_runs
-    WHERE status = 'ok' AND steps -> CAST(:step AS TEXT) ->> 'status' = 'ok'
+    WHERE steps -> CAST(:step AS TEXT) ->> 'status' = 'ok'
     ORDER BY started_at DESC LIMIT 1
     """
 )
@@ -611,9 +612,10 @@ async def latest_job() -> dict[str, Any] | None:
 
 
 async def last_step_ok(step: str) -> datetime | None:
-    """When the latest successful job run (status ``ok``) whose ``step`` ran ok started, or None.
+    """When the latest job run whose ``step`` ran ok started, or None.
 
-    A step that was skipped, or one inside a run that failed later, does not count.
+    Only the step's own status counts: a skipped step does not, and a step that ran ok in a run
+    that failed at a later step does.
     """
     async with session_scope() as session:
         row = (await session.execute(_LAST_STEP_OK_SQL, {"step": step})).first()

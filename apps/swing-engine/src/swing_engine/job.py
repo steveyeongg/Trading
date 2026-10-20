@@ -5,23 +5,28 @@
 session (the close plus the 16 minutes Alpaca's free plan holds SIP data back). It runs
 :data:`STEPS` in order and records each in the job's ``swing_job_runs`` row as it goes:
 
-1. ``assets``: re-fetch Alpaca's active and inactive asset lists when the last successful run that
-   refreshed them is more than :data:`ASSET_REFRESH_EVERY` old (new listings and delistings).
-2. ``bars``: the very first time (no SPY bars stored) a full backfill from
-   :data:`~swing_engine.ingest.HISTORY_START`, saving ``{"done": n, "total": m}`` progress about
-   every 5%; afterwards the incremental update. Symbols the data provider cannot serve (several
-   hundred placeholder tickers never can) are listed in the step, not counted as a failure.
+1. ``assets``: re-fetch Alpaca's active and inactive asset lists when the last run that refreshed
+   them did so more than :data:`ASSET_REFRESH_EVERY` ago (new listings and delistings).
+2. ``bars``: the resumable backfill from :data:`~swing_engine.ingest.HISTORY_START` when SPY has no
+   bars (the first run), when the assets step refreshed the list in this run (it loads the new
+   listings and retries symbols whose load failed) or when SPY's newest bar is more than
+   :data:`~swing_engine.ingest.MAX_STALE_SESSIONS` sessions behind (the update maintains only
+   recent symbols); it saves ``{"done": n, "total": m}`` progress about every 5%. Otherwise the
+   incremental update. Symbols the data provider cannot serve (several hundred placeholder
+   tickers never can) are listed in the step, not counted as a failure.
 3. ``scan``: every session after the last stored scan through the target, oldest first, or just
    the target when nothing was ever scanned or the target already was (a re-run refreshes it).
-   One context is built per session and reused for its scan; the target's is kept for the steps
-   below and handed to ``JobDeps.on_context`` (the API's cache). The ideas of a session are for the
-   next one; they are ``reconstructed`` when that session had already opened by now (a catch-up
-   after the Mac slept), so they never count toward the live record.
+   The stored bars are loaded once, with the held symbols whatever their liquidity. One context
+   is built per session and reused for its scan; the target's is kept for the steps below and
+   handed to ``JobDeps.on_context`` (the API's cache). A session's book holds only the positions
+   opened by then. The ideas of a session are for the next one; they are ``reconstructed`` when
+   that session had already opened at the moment they are saved (a catch-up after the Mac slept,
+   or a slow run), so they never count toward the live record.
 4. ``tracking``: every pending or open idea, watch-only ones included, re-simulated to the target.
-5. ``positions``: tonight's action for each open position the user recorded. A position bought
-   before a split is first rescaled to the adjusted prices the bars use. Over a catch-up the
-   actions are worked out session by session, so a stop hit on a missed day is reported instead
-   of tonight's hold, and a raised stop carries forward.
+5. ``positions``: :func:`~swing_engine.positions.nightly_update` for each open position: split
+   adjustment, then the rules walked over every session since its last advice, so a stop hit on
+   a missed day is reported instead of tonight's hold. A position already advised for the target
+   keeps its stored action, so running a session twice says the same thing.
 6. ``digest``: one Telegram digest per session, only when the user has it on.
 
 A failed step records ``{"status": "failed", "error": <reason>}`` (first line only, secrets
@@ -40,7 +45,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import dataclasses
 import math
 import os
 import uuid
@@ -62,7 +66,11 @@ from swing_engine.data.alpaca import AlpacaData
 from swing_engine.data.assets import AssetKind
 from swing_engine.digest import format_digest, format_failure, send_digest
 from swing_engine.ingest import (
+    _SECRET_ENV_VARS as _ALPACA_SECRETS,
+)
+from swing_engine.ingest import (
     HISTORY_START,
+    MAX_STALE_SESSIONS,
     BarSource,
     BarStore,
     IngestResult,
@@ -71,9 +79,8 @@ from swing_engine.ingest import (
     refresh_assets,
 )
 from swing_engine.loader import load_scan_inputs
-from swing_engine.narrate import day_label
 from swing_engine.panel import Panel
-from swing_engine.positions import Action, ActionKind, position_action
+from swing_engine.positions import Action, current_stop, nightly_update
 from swing_engine.scan import (
     BENCHMARK,
     ScanContext,
@@ -104,16 +111,10 @@ ASSET_REFRESH_EVERY = timedelta(days=7)
 PROGRESS_EVERY = 0.05
 """A first backfill saves its progress each time it advances this share of the symbols."""
 
-SPLIT_BAND = (0.75, 1.33)
-"""A position whose opening-day adjusted close is within this ratio of its entry was not split."""
-
-SPLIT_RATIOS = (1 / 10, 1 / 8, 1 / 5, 1 / 4, 1 / 3, 1 / 2, 2 / 3, 3 / 2, 2, 3, 4, 5, 8, 10)
-"""The split ratios a position is snapped to (adjusted price / price paid)."""
-
 DIGEST = "digest"
 FAILURE = "failure"
 
-_SECRET_ENV_VARS = ("ALPACA_API_KEY", "ALPACA_API_SECRET", "TELEGRAM_BOT_TOKEN")
+_SECRET_ENV_VARS = (*_ALPACA_SECRETS, "TELEGRAM_BOT_TOKEN")
 _REASON_CHARS = 300
 
 
@@ -157,9 +158,12 @@ class ProductStore(Protocol):
     ) -> None: ...
 
 
-ScanLoader = Callable[
-    [date | None, UniverseFilter], Awaitable[tuple[Panel, dict[str, AssetKind], date]]
-]
+class ScanLoader(Protocol):
+    """Reads the stored bars a scan needs (:func:`~swing_engine.loader.load_scan_inputs`)."""
+
+    def __call__(
+        self, as_of: date | None, universe: UniverseFilter, extra_symbols: Sequence[str] = ()
+    ) -> Awaitable[tuple[Panel, dict[str, AssetKind], date]]: ...
 
 
 @dataclass
@@ -321,6 +325,7 @@ class _Run:
         self.settings: SwingSettings | None = None
         self.calendar: TradingCalendar | None = None
         self.tonight: _Tonight | None = None
+        self.assets_refreshed = False
         self.actions: list[Action] = []
         self.held: list[str] = []
         self._pending: asyncio.Task[None] | None = None
@@ -431,13 +436,14 @@ class _Run:
         if last is not None and self.now - last <= ASSET_REFRESH_EVERY:
             return {"status": "skipped", "reason": f"refreshed {last.date().isoformat()}"}
         rows = await refresh_assets(self.deps.client, self.deps.bars_store)
+        self.assets_refreshed = True
         return {"status": "ok", "assets": len(rows)}
 
     async def _bars(self) -> dict[str, Any]:
-        stored = await self.deps.bars_store.last_bar_dates()
-        if BENCHMARK in stored:
+        trigger = await self._backfill_trigger()
+        if trigger is None:
             result = await incremental_update(self.deps.client, self.deps.bars_store, now=self.now)
-            return _ingest_info("update", result)
+            return {**_ingest_info("update", result), "trigger": None}
         progress = _Progress(self)
         result = await backfill(
             self.deps.client,
@@ -448,20 +454,40 @@ class _Run:
         )
         return {
             **_ingest_info("backfill", result),
+            "trigger": trigger,
             "done": progress.done,
             "total": progress.total,
         }
 
+    async def _backfill_trigger(self) -> str | None:
+        """Why the bars need the backfill tonight rather than the update, or None.
+
+        The update only maintains symbols already stored and at most
+        :data:`~swing_engine.ingest.MAX_STALE_SESSIONS` behind, so new listings, symbols whose
+        first load failed and a store left behind for weeks need the (resumable) backfill.
+        """
+        assert self.calendar is not None and self.target is not None
+        newest = (await self.deps.bars_store.last_bar_dates()).get(BENCHMARK)
+        if newest is None:
+            return "no SPY bars stored"
+        if self.assets_refreshed:
+            return "asset list refreshed"
+        behind = len(self.calendar.sessions_between(newest, self.target))
+        if behind > MAX_STALE_SESSIONS:
+            return f"SPY is {behind} sessions behind"
+        return None
+
     async def _scan(self) -> dict[str, Any]:
         assert self.settings is not None and self.calendar is not None and self.target is not None
-        cal, target, now = self.calendar, self.target, self.now
+        cal, target = self.calendar, self.target
         universe, risk = self.settings.universe(), self.settings.risk()
         setups = default_setups(self.deps.repo)
         rank_by = ranking_choice(self.deps.repo)
         latest = await self.store.latest_scan()
         sessions = _sessions_to_scan(cal, None if latest is None else latest["session"], target)
-        panel, kinds, _ = await self.deps.loader(target, universe)
-        book = [(str(p["symbol"]), _open_risk(p)) for p in await self.store.list_positions("open")]
+        positions = await self.store.list_positions("open")
+        held = sorted({str(p["symbol"]) for p in positions})
+        panel, kinds, _ = await self.deps.loader(target, universe, extra_symbols=held)
 
         ctx: ScanContext | None = None
         result: ScanResult | None = None
@@ -473,13 +499,16 @@ class _Run:
                 session,
                 risk,
                 setups,
-                book,
+                _book(positions, session),
                 universe=universe,
                 rank_by=rank_by,
                 ctx=ctx,
             )
             ideas_for = cal.next_session(session)
-            await self.store.save_scan(result, ideas_for, now, not is_live(now, ideas_for))
+            saved_at = self.deps.now()  # the moment they are published, not the run's start
+            await self.store.save_scan(
+                result, ideas_for, saved_at, not is_live(saved_at, ideas_for)
+            )
         assert ctx is not None and result is not None  # sessions always ends with the target
         self.tonight = _Tonight(cal, sessions, setups, ctx, result)
         if self.deps.on_context is not None:
@@ -513,35 +542,20 @@ class _Run:
     async def _positions(self) -> dict[str, Any]:
         assert self.tonight is not None and self.target is not None
         positions = await self.store.list_positions("open")
-        actions: list[Action] = []
-        adjusted: list[str] = []
-        for pos in positions:
-            ratio = split_ratio(pos, self.tonight.ctx)
-            fields: dict[str, Any] = {}
-            if ratio != 1.0:
-                fields = _rescaled(pos, ratio)
-                pos = {**pos, **fields}
-                adjusted.append(str(pos["symbol"]))
-            action, stop = _catch_up_action(pos, self.tonight.ctx, self.tonight.sessions)
-            if ratio != 1.0:
-                text = f"adjusted for a split (\u00d7{ratio:g}); {action.text}"
-                action = dataclasses.replace(action, text=text)
-            fields.update(
-                last_action=action.kind.value,
-                last_action_text=action.text,
-                last_action_on=self.target,
-            )
-            if stop != _current_stop(pos):
-                fields["current_stop"] = stop
-            await self.store.update_position(pos["id"], fields)
-            actions.append(action)
-        self.actions = actions
+        updates = [nightly_update(pos, self.tonight.ctx) for pos in positions]
+        for pos, update in zip(positions, updates, strict=True):
+            if update.fields:
+                await self.store.update_position(pos["id"], update.fields)
+        self.actions = [u.action for u in updates]
         self.held = [str(p["symbol"]) for p in positions]
         return {
             "status": "ok",
-            "positions": len(actions),
-            "actions": dict(Counter(a.kind.value for a in actions)),
-            "split_adjusted": adjusted,
+            "positions": len(updates),
+            "actions": dict(Counter(u.action.kind.value for u in updates)),
+            "already_advised": sum(u.reused for u in updates),
+            "split_adjusted": [
+                str(p["symbol"]) for p, u in zip(positions, updates, strict=True) if u.ratio != 1
+            ],
         }
 
     async def _digest(self) -> dict[str, Any]:
@@ -625,14 +639,18 @@ def _sessions_to_scan(cal: TradingCalendar, last_scanned: date | None, target: d
     return cal.sessions_between(last_scanned, target) or [target]
 
 
-def _current_stop(pos: Mapping[str, Any]) -> float:
-    stop = pos.get("current_stop")
-    return float(pos["initial_stop"] if stop is None else stop)
-
-
 def _open_risk(pos: Mapping[str, Any]) -> float:
     """What a position still has at stake if it were stopped out now (never negative)."""
-    return float(pos["shares"]) * max(0.0, float(pos["entry_price"]) - _current_stop(pos))
+    return float(pos["shares"]) * max(0.0, float(pos["entry_price"]) - current_stop(pos))
+
+
+def _book(positions: Sequence[Mapping[str, Any]], session: date) -> list[tuple[str, float]]:
+    """``(symbol, open risk)`` of the positions already opened on ``session``."""
+    return [
+        (str(p["symbol"]), _open_risk(p))
+        for p in positions
+        if pd.Timestamp(p["opened_on"]).date() <= session
+    ]
 
 
 def _inactive(assets: pd.DataFrame) -> set[str]:
@@ -640,87 +658,3 @@ def _inactive(assets: pd.DataFrame) -> set[str]:
     if assets.empty or "status" not in assets.columns:
         return set()
     return {str(s) for s in assets.loc[assets["status"] == "inactive", "symbol"]}
-
-
-def split_ratio(pos: Mapping[str, Any], ctx: ScanContext) -> float:
-    """The factor from the price the user paid to tonight's adjusted prices, 1.0 for no split.
-
-    It is the adjusted close on ``opened_on`` over ``entry_price``. Inside :data:`SPLIT_BAND` it is
-    an ordinary day's move from the fill and 1.0 is returned; outside it, it is snapped to the
-    nearest of :data:`SPLIT_RATIOS` (nearest by ratio, so 7 snaps to 8 and 0.3 to 1/3). When the
-    symbol has no bar on ``opened_on`` (or is not in the panel) nothing can be measured: 1.0.
-    """
-    symbol = str(pos["symbol"])
-    entry = float(pos["entry_price"])
-    opened = pd.Timestamp(pos["opened_on"]).normalize()
-    close = ctx.panel.close
-    if symbol not in close.columns or opened not in close.index or not entry > 0:
-        return 1.0
-    adjusted = float(close.at[opened, symbol])
-    if not (math.isfinite(adjusted) and adjusted > 0):
-        return 1.0
-    ratio = adjusted / entry
-    low, high = SPLIT_BAND
-    if low <= ratio <= high:
-        return 1.0
-    return float(min(SPLIT_RATIOS, key=lambda r: abs(math.log(ratio / r))))
-
-
-def _rescaled(pos: Mapping[str, Any], ratio: float) -> dict[str, Any]:
-    """The position's prices times ``ratio`` and its shares over it (the same money at risk)."""
-    fields = {
-        "entry_price": float(pos["entry_price"]) * ratio,
-        "initial_stop": float(pos["initial_stop"]) * ratio,
-        "shares": float(pos["shares"]) / ratio,
-    }
-    if pos.get("current_stop") is not None:
-        fields["current_stop"] = float(pos["current_stop"]) * ratio
-    return fields
-
-
-def _at(ctx: ScanContext, session: date) -> ScanContext:
-    """``ctx`` read as of an earlier ``session``.
-
-    The position rules read the bars up to their session only, and indicators are causal, so the
-    target's context answers for any session it contains.
-    """
-    return dataclasses.replace(ctx, session=pd.Timestamp(session))
-
-
-def _to_the_cent(action: Action) -> Action:
-    """A raised stop as the user is told it (``raise stop to 95.01``), to the cent."""
-    if action.kind is ActionKind.RAISE_STOP and action.stop is not None:
-        return dataclasses.replace(action, stop=round(action.stop, 2))
-    return action
-
-
-def _catch_up_action(
-    pos: Mapping[str, Any], ctx: ScanContext, sessions: Sequence[date]
-) -> tuple[Action, float]:
-    """Tonight's action and the stop to keep, after walking any missed sessions, oldest first.
-
-    A stop hit on a missed session ends the walk and is the action, its text led by the day. A
-    stop raised on a missed session carries forward, so tonight's rules run from it, and if
-    tonight itself would only hold, the action is still to raise the stop to that level. With no
-    missed session this is :func:`~swing_engine.positions.position_action` at the target. A
-    raised stop is kept to the cent, as the user is told it.
-    """
-    target = ctx.session.date()
-    state = dict(pos)
-    for session in sessions:
-        if session >= target:
-            continue
-        missed = _to_the_cent(position_action(state, _at(ctx, session)))
-        if missed.kind is ActionKind.STOP_HIT:
-            text = f"{day_label(session)}: {missed.text}"
-            return dataclasses.replace(missed, text=text), _current_stop(state)
-        if missed.kind is ActionKind.RAISE_STOP and missed.stop is not None:
-            state["current_stop"] = missed.stop
-    action = _to_the_cent(position_action(state, ctx))
-    carried = _current_stop(state)
-    if action.kind is ActionKind.RAISE_STOP and action.stop is not None:
-        return action, action.stop
-    if action.kind is ActionKind.HOLD and carried > _current_stop(pos):
-        text = f"raise stop to {carried:.2f} (trail)"
-        return dataclasses.replace(action, kind=ActionKind.RAISE_STOP, text=text), carried
-    return action, carried

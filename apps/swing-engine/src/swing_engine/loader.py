@@ -8,6 +8,7 @@ calculation the scan makes (a 252-session relative strength needs about a year o
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import date, timedelta
 
 import pandas as pd
@@ -27,13 +28,16 @@ def _kinds(assets: pd.DataFrame) -> dict[str, AssetKind]:
 
 
 async def load_scan_inputs(
-    as_of: date | None, universe: UniverseFilter
+    as_of: date | None, universe: UniverseFilter, extra_symbols: Sequence[str] = ()
 ) -> tuple[Panel, dict[str, AssetKind], date]:
     """Stored bars for the liquid stocks plus SPY, adjusted and raw, ending on the scan session.
 
     ``as_of`` None means the latest session SPY has a stored bar for. "Liquid" is the store's
     prefilter at ``universe``'s dollar-volume floor, a necessary condition for being eligible
-    under that same filter. Returns the panel, each symbol's asset kind and the session.
+    under that same filter. ``extra_symbols`` are loaded too whatever their liquidity (the nightly
+    job passes the symbols the user holds, which need their bars for tonight's action); a stock
+    below the prefilter fails the same floor in the scan, so it never becomes an idea. Returns the
+    panel, each symbol's asset kind and the session.
     Raises :class:`~swing_engine.scan.ScanError` when there are no assets, no SPY bars or no bars
     in the window, each with what to run first.
     """
@@ -46,7 +50,7 @@ async def load_scan_inputs(
             raise ScanError(f"no {BENCHMARK} bars stored: run `python -m swing_engine backfill`")
         as_of = latest[BENCHMARK]
     liquid = await store.liquid_prefilter(universe.min_median_dollar_volume)
-    symbols = sorted({*liquid, BENCHMARK})
+    symbols = sorted({*liquid, *extra_symbols, BENCHMARK})
     start = as_of - timedelta(days=SCAN_WINDOW_DAYS)
     bars = await store.load_daily_bars(symbols, start, as_of)
     if bars.empty:

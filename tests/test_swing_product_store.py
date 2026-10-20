@@ -304,10 +304,11 @@ def test_job_progress_writes_only_the_steps():
     assert sql == "UPDATE swing_job_runs SET steps = CAST(:steps AS JSONB) WHERE id = :id"
 
 
-def test_last_step_ok_reads_only_successful_runs_whose_step_ran_ok():
+def test_last_step_ok_reads_the_steps_own_status_not_the_runs():
+    """A run that refreshed the asset list and failed later still refreshed it."""
     sql = " ".join(_LAST_STEP_OK_SQL.text.split())
-    assert "status = 'ok'" in sql and "->> 'status' = 'ok'" in sql
-    assert "ORDER BY started_at DESC LIMIT 1" in sql
+    assert "->> 'status' = 'ok'" in sql and "ORDER BY started_at DESC LIMIT 1" in sql
+    assert "WHERE status" not in sql and "AND status" not in sql
 
 
 # --- parameter building against a fake session (no database) ---------------------------
@@ -827,15 +828,16 @@ async def _job_at(conn, started: datetime, status: str, steps: dict[str, Any]) -
 
 
 @db
-async def test_last_step_ok_is_the_latest_successful_run_whose_step_ran_ok(pg):
+async def test_last_step_ok_is_the_latest_run_whose_step_ran_ok(pg):
     step = "zztest_assets"  # a step name no real job writes
     assert await last_step_ok(step) is None
     base = datetime(2099, 1, 5, 22, 0, tzinfo=UTC)
     await _job_at(pg, base, "ok", {step: {"status": "ok"}})
     await _job_at(pg, base + timedelta(days=1), "failed", {step: {"status": "ok"}})
     await _job_at(pg, base + timedelta(days=2), "ok", {step: {"status": "skipped"}})
-    await _job_at(pg, base + timedelta(days=3), "ok", {"other": {"status": "ok"}})
-    assert await last_step_ok(step) == base
+    await _job_at(pg, base + timedelta(days=3), "failed", {step: {"status": "failed"}})
+    await _job_at(pg, base + timedelta(days=4), "ok", {"other": {"status": "ok"}})
+    assert await last_step_ok(step) == base + timedelta(days=1)  # it failed later; still refreshed
 
 
 @db
