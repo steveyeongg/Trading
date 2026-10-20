@@ -113,8 +113,9 @@ ASSET_NAMES_TTL_S = 600.0
 ASSET_MISS_RELOAD_S = 60.0
 """A symbol missing from a map at least this old reloads it once (a listing added tonight)."""
 
-JOB_ID_WAIT_S = 60.0
-"""How long "Run scan now" waits for the job's row (the calendar is fetched first)."""
+JOB_ID_WAIT_S = 20.0
+"""How long "Run scan now" waits for the job's row (the calendar is fetched first). Under the
+dashboard proxy's timeout of about 30 seconds."""
 
 TELEGRAM_TEST_TEXT = (
     "ATLAS test message: the nightly digest will arrive in this chat.\n" + DISCLAIMER
@@ -416,7 +417,8 @@ class PositionOut(_Out):
 
 
 class ScanRunOut(_Out):
-    job_id: str
+    job_id: str | None
+    starting: bool
 
 
 class TelegramTestOut(_Out):
@@ -1063,10 +1065,17 @@ async def _on_todays_scale(
 
     The same split check the nightly job applies (:func:`~swing_engine.positions.split_ratio`):
     the entry against the adjusted close on ``opened_on`` and the exit against the one on
-    ``closed_on``. Without a context, or for a symbol the cached panel lacks, both stay as given.
+    ``closed_on``. Without a context, for a symbol the cached panel lacks, or when the position
+    was advised for a later session than the context's (the same guard as :func:`_advise`), both
+    stay as given.
     """
     ctx = await get_context()
     if ctx is None or str(pos["symbol"]) not in ctx.panel.close.columns:
+        return {}, exit_price
+    last = pos.get("last_action_on")
+    if last is not None and ctx.session.date() < pd.Timestamp(last).date():
+        # The job advised (and split-adjusted) it for a later session than the cache holds: the
+        # older bars may predate a split it already applied, and would undo it.
         return {}, exit_price
     ratio = split_ratio(pos, ctx)
     fields = rescaled(pos, ratio) if ratio != 1.0 else {}
@@ -1177,9 +1186,12 @@ def _finished(task: asyncio.Task[Any]) -> None:
     responses={409: {"model": DetailOut}, 503: {"model": DetailOut}},
 )
 async def run_scan_now() -> Any:
-    """Start the nightly job now ("Run scan now"), in the background: 202 with the job's id.
+    """Start the nightly job now ("Run scan now"), in the background.
 
-    409 while a scan is running, 503 when the job cannot be set up (no Alpaca keys). The job is
+    202 ``{job_id, starting: false}`` once the job has recorded its run, or ``{job_id: null,
+    starting: true}`` when it is still starting after :data:`JOB_ID_WAIT_S` (a slow calendar; it
+    goes on, and the system status shows it). 409 while a scan is running; 503 with the reason
+    when the job cannot be set up (no Alpaca keys) or fails before recording its run. The job is
     the scheduler's own: re-running a session is safe (scans are upserts, one digest a session).
     """
     if job.is_running():
@@ -1202,7 +1214,7 @@ async def run_scan_now() -> Any:
     finally:
         started.cancel()
     if recorder.job_id is not None:
-        return _json({"job_id": str(recorder.job_id)})
+        return _json({"job_id": str(recorder.job_id), "starting": False})
     if task.done() and not task.cancelled():
         error = task.exception()
         if isinstance(error, job.JobBusy):
@@ -1211,15 +1223,9 @@ async def run_scan_now() -> Any:
         return JSONResponse(
             status_code=503, content=_json({"detail": f"The scan could not start: {reason}"})
         )
-    # Still not recorded after the wait (the calendar or the database is slow). It is left to
-    # run: stopping it mid-insert could leave a run marked running forever.
-    return JSONResponse(
-        status_code=503,
-        content={
-            "detail": "The scan has not started yet (the calendar or the database is slow); "
-            "check the system status before running it again."
-        },
-    )
+    # Alive but not recorded yet (the calendar is slow): it is genuinely running, so this is a
+    # start, not an error. Stopping it mid-insert could leave a run marked running forever.
+    return _json({"job_id": None, "starting": True})
 
 
 # --- routes: status ---------------------------------------------------------------------------

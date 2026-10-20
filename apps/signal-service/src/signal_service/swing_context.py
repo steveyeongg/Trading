@@ -4,8 +4,10 @@ positions pages.
 The nightly job hands its target session's context over (:func:`set_context` is
 ``JobDeps.on_context``); otherwise :func:`get_context` builds one lazily, once, off the event loop
 and under a lock, from the stored bars of the latest scanned session and the open positions'
-symbols. It is rebuilt when the universe filters in Settings change, and it never goes back to an
-earlier session (see :class:`_Cache`). A request never builds a context itself.
+symbols. It is rebuilt when the universe filters in Settings change and when the store has a
+scan of a later session than the cached context (a job that ran outside this process, the CLI or
+``ATLAS_DISABLE_SCHEDULER=1``), except while a job runs here, which hands its own over. It never
+goes back to an earlier session (see :class:`_Cache`). A request never builds a context itself.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
+from datetime import date
 from typing import Any
 
 import pandas as pd
@@ -45,12 +48,12 @@ class _Cache:
     The cache never goes back in time: ``newest`` is the latest session any context was offered
     for (a dropped one included), and a context for an earlier session is never cached. Advice
     computed on an older session would be written over newer advice the job stored.
-    ``failed`` is the filter, time and reason of the last failed build.
+    ``failed`` is the filter, session, time and reason of the last failed build.
     """
 
     ctx: ScanContext | None = None
     universe: UniverseFilter | None = None
-    failed: tuple[UniverseFilter, float, str] | None = None
+    failed: tuple[UniverseFilter, date | None, float, str] | None = None
     drop_job_context: bool = False
     newest: pd.Timestamp | None = None
 
@@ -93,7 +96,7 @@ def _offer(ctx: ScanContext, universe: UniverseFilter | None) -> bool:
 
 def last_failure() -> str | None:
     """Why the last context build failed (no secrets in it), or None."""
-    return None if _CACHE.failed is None else _CACHE.failed[2]
+    return None if _CACHE.failed is None else _CACHE.failed[3]
 
 
 def invalidate_context(*, during_job: bool = False) -> None:
@@ -102,48 +105,66 @@ def invalidate_context(*, during_job: bool = False) -> None:
     _CACHE.drop_job_context = during_job
 
 
-def _hit(wanted: UniverseFilter) -> tuple[ScanContext, UniverseFilter] | None:
+def _hit(wanted: UniverseFilter, latest: date | None) -> tuple[ScanContext, UniverseFilter] | None:
+    """The cached context when it is for ``wanted`` and not older than the latest stored scan
+    (a job running here is let finish: it hands its newer context over itself)."""
     cache = _CACHE
     if cache.ctx is None:
         return None
     if cache.universe is None:
         cache.universe = wanted  # the job's context, built from these settings
-    return (cache.ctx, wanted) if cache.universe == wanted else None
+    if cache.universe != wanted:
+        return None
+    if latest is not None and cache.ctx.session.date() < latest and not job.is_running():
+        return None
+    return cache.ctx, wanted
+
+
+def _build_session(latest: date | None) -> date | None:
+    """The session to build: the latest stored scan's, or the newest one offered when that is
+    later (a dropped job context), so the build is never refused as older. None: SPY's latest."""
+    newest: date | None = None if _CACHE.newest is None else _CACHE.newest.date()
+    if latest is None or newest is None:
+        return latest if newest is None else newest
+    return max(latest, newest)
 
 
 async def cached_context() -> tuple[ScanContext, UniverseFilter] | None:
     """The context for the stored settings' universe and that filter, or None when there is none.
 
-    A cache miss builds it once: the stored bars of the latest scanned session (the newest SPY
-    session before any scan) with the open positions' symbols, built off the event loop and under
-    a lock, so concurrent first requests share one build. A failed build is logged and not tried
-    again for :data:`BUILD_RETRY_S`.
+    A miss (nothing cached, another universe, or a stored scan later than the cached session)
+    builds it once: the stored bars of :func:`_build_session` with the open positions' symbols,
+    built off the event loop and under a lock, so concurrent requests share one build. A failed
+    build is logged and not tried again for :data:`BUILD_RETRY_S` (for the same filter and
+    session); meanwhile there is no context.
     """
     wanted = (await store.get_settings()).universe()
-    hit = _hit(wanted)
+    latest = await store.latest_scan_session()
+    hit = _hit(wanted, latest)
     if hit is not None:
         return hit
     async with _CACHE_LOCK:
-        hit = _hit(wanted)
+        hit = _hit(wanted, latest)
         if hit is not None:
             return hit
+        as_of = _build_session(latest)
         failed = _CACHE.failed
         if (
             failed is not None
-            and failed[0] == wanted
-            and time.monotonic() - failed[1] < BUILD_RETRY_S
+            and failed[:2] == (wanted, as_of)
+            and time.monotonic() - failed[2] < BUILD_RETRY_S
         ):
             return None
         try:
-            ctx = await _build_context(wanted)
+            ctx = await _build_context(wanted, as_of)
         except Exception as exc:
             reason = safe_reason(exc)
             log.warning("swing.api.context_unavailable", error=reason)
-            _CACHE.failed = (wanted, time.monotonic(), reason)
+            _CACHE.failed = (wanted, as_of, time.monotonic(), reason)
             return None
         if _offer(ctx, wanted):
             return ctx, wanted
-        return _hit(wanted)  # a newer session arrived while this one was built
+        return _hit(wanted, latest)  # a newer session arrived while this one was built
 
 
 async def get_context() -> ScanContext | None:
@@ -152,10 +173,8 @@ async def get_context() -> ScanContext | None:
     return None if cached is None else cached[0]
 
 
-async def _build_context(universe: UniverseFilter) -> ScanContext:
-    latest = await store.latest_scan()
+async def _build_context(universe: UniverseFilter, as_of: date | None) -> ScanContext:
     held = sorted({str(p["symbol"]) for p in await store.list_positions("open")})
-    as_of = None if latest is None else latest["session"]
     panel, kinds, session = await loader(as_of, universe, extra_symbols=held)
     return await asyncio.to_thread(build_context, panel, kinds, session, universe)
 

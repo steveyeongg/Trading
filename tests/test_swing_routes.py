@@ -206,6 +206,9 @@ class FakeStore:
         self.calls.append("latest_scan")
         return None if self.scan is None else dict(self.scan)
 
+    async def latest_scan_session(self) -> date | None:
+        return None if self.scan is None else self.scan["session"]
+
     async def latest_job(self) -> dict[str, Any] | None:
         return dict(self.jobs[-1]) if self.jobs else None
 
@@ -1401,7 +1404,8 @@ def test_run_scan_now_starts_a_manual_job_and_returns_its_id(api, monkeypatch):
                 break
             threading.Event().wait(0.01)
 
-    assert response.status_code == 202 and response.json() == {"job_id": str(store.job_id)}
+    assert response.status_code == 202
+    assert response.json() == {"job_id": str(store.job_id), "starting": False}
     assert runs == [("manual", swing_context.set_context)]
     assert log == ["closed"]  # the Alpaca client is closed once the job is done
     assert not swing_routes._BACKGROUND
@@ -1690,3 +1694,117 @@ def test_open_risk_is_one_shared_rule():
     assert open_risk({"shares": 4.0, "entry_price": 50.0, "initial_stop": 40.0,
                       "current_stop": 55.0}) == 0.0  # fmt: skip
     assert not hasattr(job, "_open_risk") and not hasattr(swing_routes, "_open_risk")
+
+
+# ---------------------------------------------------------------------------- fix round 2
+
+
+def _pre_split(panel: Panel, symbol: str, factor: float) -> Panel:
+    """``panel`` as it read before a split restated ``symbol``'s history (prices x ``factor``)."""
+    frames = {f: getattr(panel, f).copy() for f in ("open", "high", "low", "close", "volume")}
+    for f in ("open", "high", "low", "close"):
+        frames[f][symbol] = frames[f][symbol] * factor
+    return Panel(**frames, raw_close=frames["close"].copy())
+
+
+def test_closing_on_a_stale_context_never_reverts_a_split_rescale(api):
+    """The nightly job ran outside the API (the CLI) and rescaled the position for a 4:1 split; the
+    API's cache still holds the context from before the split. Closing must not rescale it back."""
+    stale = build_context(_pre_split(PANEL, "S13", 4.0), KINDS, PREV)
+    swing_context.set_context(stale, UniverseFilter())
+    opened, closed = PANEL.dates()[440], PANEL.dates()[450]
+    entry = float(PANEL.close.at[opened, "S13"])  # already on today's (post-split) scale
+    exit_price = entry * 1.1
+    pid = _add_position(
+        api, entry=entry, stop=entry * 0.9, opened=opened.date(), shares=40.0,
+        last_action="hold", last_action_text="hold", last_action_on=closed.date(),
+    )  # fmt: skip
+
+    out = api.client.post(
+        f"/v1/positions/{pid}/close",
+        json={"closed_on": closed.date().isoformat(), "exit_price": exit_price},
+    ).json()
+
+    assert out["r_multiple"] == pytest.approx(1.0)
+    assert out["entry_price"] == pytest.approx(entry) and out["shares"] == pytest.approx(40.0)
+    assert out["exit_price"] == pytest.approx(exit_price)
+
+
+def test_the_cache_follows_a_newer_stored_scan_without_a_handover(api):
+    """The job ran outside the API (the CLI): the store has session S, the cache S-1."""
+    swing_context.set_context(CTX_PREV, UniverseFilter())
+    api.store = FakeStore(scan=_scan_row())
+
+    assert api.get("/v1/positions").status_code == 200
+
+    assert [load[0] for load in api.loads] == [SESSION]
+    assert swing_context._CACHE.ctx is not None
+    assert swing_context._CACHE.ctx.session.date() == SESSION
+
+
+def test_a_cache_as_new_as_the_stored_scan_is_not_rebuilt(api):
+    swing_context.set_context(CTX, UniverseFilter())
+    api.store = FakeStore(scan=_scan_row())
+    for _ in range(3):
+        assert api.get("/v1/positions").status_code == 200
+    assert api.loads == [] and swing_context._CACHE.ctx is CTX
+
+
+def test_while_a_job_runs_here_the_cache_waits_for_its_handover(api, monkeypatch):
+    """The in-process job hands its context over when it is done; rebuilding the same session
+    beside it would double the memory and CPU for nothing."""
+    monkeypatch.setattr(swing_context.job, "is_running", lambda: True)
+    swing_context.set_context(CTX_PREV, UniverseFilter())
+    api.store = FakeStore(scan=_scan_row())
+
+    assert api.get("/v1/positions").status_code == 200
+
+    assert api.loads == [] and swing_context._CACHE.ctx is CTX_PREV
+
+
+def test_a_build_that_would_lose_to_a_newer_session_is_not_retried_on_every_request(api):
+    """A dropped job context (universe changed mid-job) is newer than the stored scan: the build
+    goes to that session, so it is cached and the next requests do not reload."""
+    api.store = FakeStore(scan={**_scan_row(), "session": PREV})
+    swing_context.invalidate_context(during_job=True)
+    swing_context.set_context(CTX)  # dropped, but S is the newest session now
+
+    for _ in range(3):
+        assert api.get("/v1/positions").status_code == 200
+
+    assert [load[0] for load in api.loads] == [SESSION]
+    assert swing_context._CACHE.ctx.session.date() == SESSION
+
+
+def test_run_scan_now_answers_starting_when_the_job_is_slow_to_record_its_run(api, monkeypatch):
+    """The dashboard's proxy gives up after about 30 s: a slow calendar is "starting", not an
+    error, and the job goes on (the dashboard then polls the system status)."""
+    log: list[str] = []
+    store = _JobStore()
+    release = threading.Event()
+
+    async def slow_run(deps: JobDeps, kind: str) -> dict[str, Any]:
+        while not release.is_set():
+            await asyncio.sleep(0.01)  # the calendar fetch
+        await deps.store.start_job(kind, SESSION)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(swing_routes, "JOB_ID_WAIT_S", 0.05)
+    monkeypatch.setattr(swing_routes, "make_swing_deps", lambda: _fake_deps(log, store))
+    monkeypatch.setattr(swing_routes, "run_job", slow_run)
+
+    with TestClient(api.app) as client:
+        response = client.post("/v1/scan/run")
+        release.set()
+        for _ in range(200):
+            if log:
+                break
+            threading.Event().wait(0.01)
+
+    assert response.status_code == 202
+    assert response.json() == {"job_id": None, "starting": True}
+    assert log == ["closed"]  # it ran to the end after the answer
+
+
+def test_run_scan_now_waits_at_most_20_seconds():
+    assert swing_routes.JOB_ID_WAIT_S <= 20.0

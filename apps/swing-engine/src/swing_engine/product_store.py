@@ -210,6 +210,7 @@ _LATEST_SCAN_SQL = text(
     f"SELECT {_cols(_SCAN_COLUMNS)} FROM swing_scans ORDER BY session DESC LIMIT 1"
 )
 _SCANNED_SESSIONS_SQL = text("SELECT session FROM swing_scans WHERE session >= :since")
+_LATEST_SCAN_SESSION_SQL = text("SELECT max(session) FROM swing_scans")
 
 _TRACKABLE_IDEAS_SQL = text(
     f"""
@@ -378,7 +379,8 @@ async def put_settings(settings: SwingSettings) -> SwingSettings:
 
 
 Narration = Mapping[tuple[str, str], Mapping[str, str | None]]
-"""Per ``(symbol, setup)``, the idea's ``why`` and ``cancels`` text (:mod:`swing_engine.narrate`)."""
+"""Per ``(symbol, setup)``, the idea's ``why`` and ``cancels`` text (from
+:mod:`swing_engine.narrate`)."""
 
 _NARRATION_KEYS = ("why", "cancels")
 
@@ -478,6 +480,13 @@ async def latest_scan() -> dict[str, Any] | None:
     """The most recent scan row (``payload`` parsed), or None when nothing has been scanned."""
     rows = await _fetch(_LATEST_SCAN_SQL)
     return rows[0] if rows else None
+
+
+async def latest_scan_session() -> date | None:
+    """The session of the most recent scan (without its payload), or None before any scan."""
+    async with session_scope() as session:
+        value = (await session.execute(_LATEST_SCAN_SESSION_SQL)).scalar()
+    return None if value is None else value
 
 
 async def scanned_sessions(since: date) -> set[date]:

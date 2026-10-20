@@ -295,6 +295,7 @@ def test_product_store_exposes_the_async_interface_later_tasks_rely_on():
         mark_digest,
         product_store.get_idea,
         product_store.session_ideas,
+        product_store.latest_scan_session,
     ):
         assert inspect.iscoroutinefunction(fn), fn.__name__
 
@@ -840,6 +841,8 @@ async def test_get_idea_and_session_ideas_read_what_save_scan_stored(pg):
     assert one is not None and (one["symbol"], one["stop"]) == ("ZZTEST2", 47.0)
     assert await product_store.get_idea(uuid.uuid4()) is None
     assert await product_store.session_ideas(TARGET) == []
+    latest = await product_store.latest_scan_session()
+    assert latest is not None and latest >= SESSION  # the real rows may be later; never earlier
 
 
 @db
