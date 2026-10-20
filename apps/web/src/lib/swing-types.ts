@@ -166,6 +166,9 @@ export interface TodayOut {
   empty_reason: EmptyReason | null;
   /** The first-time download's progress, only while that job is running. */
   backfill: ProgressOut | null;
+  /** Some setup family's verdict is Live now. False is exactly when "no setup has passed testing"
+   * is true; it does not depend on tonight's ideas. */
+  any_live_setup: boolean;
 }
 
 // --- GET /v1/stocks/{symbol} ----------------------------------------------------------------

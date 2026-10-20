@@ -608,6 +608,39 @@ def test_today_with_nothing_found_says_so(api):
     assert _today(api)["empty_reason"] == "no_candidates"
 
 
+def test_today_reports_whether_any_setup_is_live(api):
+    """The dashboard says "No setup has passed testing yet" only when no family's verdict is Live.
+
+    Incident: it said so whenever there were no live ideas, which is untrue on a night a Live
+    family simply found nothing. ``any_live_setup`` is the family verdict, not the idea count.
+    """
+    # No family has passed: ideas exist but none is live, and so is the first run (no scan).
+    api.store = FakeStore(scan=_scan_row())
+    j = _today(api)
+    assert j["any_live_setup"] is False and j["ideas"] == [] and j["unproven"]
+    api.store = FakeStore()
+    assert _today(api)["any_live_setup"] is False
+
+    # Breakout is Live but tonight's only ideas are the unproven pullbacks: nothing live to show.
+    _live(api.repo, "breakout")
+    pullbacks = [i for i in RESULT.ideas if i.setup == "pullback"]
+    only_pullback = dataclasses.replace(RESULT, ideas=pullbacks, watch_only=[])
+    api.store = FakeStore(scan=_scan_row(only_pullback))
+    j = _today(api)
+    assert j["any_live_setup"] is True and j["ideas"] == [] and j["unproven"]
+
+    # Breakout is Live and has ideas tonight.
+    api.store = FakeStore(scan=_scan_row())
+    j = _today(api)
+    assert j["any_live_setup"] is True and j["ideas"]
+
+    # Breakout is Live and found nothing tonight.
+    empty = dataclasses.replace(RESULT, ideas=[], watch_only=[])
+    api.store = FakeStore(scan=_scan_row(empty), ideas=[])
+    j = _today(api)
+    assert j["any_live_setup"] is True and j["empty_reason"] == "no_candidates"
+
+
 def test_an_older_payload_without_narration_reads_null(api):
     api.store = FakeStore(scan=_scan_row(narrated=False))
     j = _today(api)

@@ -277,6 +277,9 @@ class TodayOut(_Out):
     capacity: CapacityOut
     empty_reason: Literal["first_run", "downtrend", "no_candidates", "last_scan_failed"] | None
     backfill: ProgressOut | None
+    # Whether any setup family's verdict is Live now (read from the committed validation files,
+    # like each idea's ``live``): "no setup has passed testing" is true exactly when this is False.
+    any_live_setup: bool
 
 
 class BarOut(_Out):
@@ -725,6 +728,7 @@ async def today() -> dict[str, Any]:
             },
             "empty_reason": empty,
             "backfill": _backfill(run),
+            "any_live_setup": any(f.verdict == "live" for f in families.values()),
         }
     )
 
