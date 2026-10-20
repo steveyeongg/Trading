@@ -772,3 +772,25 @@ def test_a_split_is_applied_before_the_rules_and_named_first():
     assert update.fields["initial_stop"] == 22.0
     assert update.action.text.startswith("adjusted for a split (\u00d70.25); ")
     assert update.action.kind is not ActionKind.STOP_HIT  # 4:1 is not a crash through the stop
+
+
+# ------------------------------------------------- a stop edited after the close (Task 8 PATCH)
+
+
+def test_a_stop_set_after_the_close_is_not_tested_against_that_sessions_low():
+    """``PATCH /v1/positions/{id}`` re-advises a position at once when the user edits its stop.
+    That stop was not working during tonight's session, so tonight's low says nothing about it:
+    ``check_stop=False`` skips rule 3 and nothing else."""
+    ctx = _ctx_closes([100, 110, 111])  # tonight's low is 110; the trail is 111 - 3 x 2 = 105
+    pos = _pos(0, stop=110.5)
+    assert position_action(pos, ctx).kind is ActionKind.STOP_HIT  # premise: rule 3 would fire
+
+    act = position_action(pos, ctx, check_stop=False)
+    assert act == Action("pos-1", "ABC", ActionKind.HOLD, 110.5, "hold, stop 110.50")
+    update = nightly_update(pos, ctx, check_stop=False)
+    assert update.action == act and update.fields["last_action"] == "hold"
+
+
+def test_an_edited_stop_under_the_trail_is_still_raised():
+    act = position_action(_pos(0, stop=100.0), _ctx_closes([100, 110, 111]), check_stop=False)
+    assert act == Action("pos-1", "ABC", ActionKind.RAISE_STOP, 105.0, raise_stop_text(105.0))

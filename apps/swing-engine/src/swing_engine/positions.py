@@ -126,12 +126,16 @@ def _value_on(series: pd.Series | None, d: pd.Timestamp) -> float:
     return float(series.at[d])
 
 
-def position_action(pos: Mapping[str, Any], ctx: ScanContext, max_hold: int = 30) -> Action:
+def position_action(
+    pos: Mapping[str, Any], ctx: ScanContext, max_hold: int = 30, *, check_stop: bool = True
+) -> Action:
     """The action for one position as of ``ctx.session``, by the rules in the module docstring.
 
     ``pos`` is a row from ``product_store.list_positions``: ``id, symbol, opened_on,
     initial_stop, current_stop`` and ``trail_atr`` (None means the default of 3.0). Prices are
-    on the adjusted scale the panel uses.
+    on the adjusted scale the panel uses. ``check_stop=False`` skips rule 3 for a stop the user
+    set after the session's close (an edit tonight): it was not working during the session, so
+    the session's low says nothing about it.
     """
     position_id = str(pos["id"])
     symbol = str(pos["symbol"])
@@ -163,7 +167,7 @@ def position_action(pos: Mapping[str, Any], ctx: ScanContext, max_hold: int = 30
         return act(ActionKind.HOLD, stop, f"hold, stop {stop:.2f}")
 
     # 3. The stop in force at the open was reached.
-    if low_d <= stop:
+    if check_stop and low_d <= stop:
         return act(ActionKind.STOP_HIT, stop, f"stop hit, exit (stop {stop:.2f})")
 
     # 4. The time limit. Only sessions with a bar count.
@@ -259,7 +263,7 @@ def _unadvised_sessions(pos: Mapping[str, Any], ctx: ScanContext) -> list[pd.Tim
 
 
 def walk_action(
-    pos: Mapping[str, Any], ctx: ScanContext, max_hold: int = 30
+    pos: Mapping[str, Any], ctx: ScanContext, max_hold: int = 30, *, check_stop: bool = True
 ) -> tuple[Action, float]:
     """Tonight's action and the stop to keep, after every session since the last advice.
 
@@ -269,7 +273,7 @@ def walk_action(
     forward: if tonight would only hold, the action is to raise the stop to it, and a max-hold or
     no-data action names it too. With nothing to walk this is :func:`position_action` at the
     session. A raised stop is kept to the cent; the returned stop is the one to save (the stop
-    in force, also for ``NO_DATA``).
+    in force, also for ``NO_DATA``). ``check_stop`` applies to tonight's session only.
     """
     state = dict(pos)
     for session in _unadvised_sessions(pos, ctx):
@@ -279,7 +283,7 @@ def walk_action(
             return dataclasses.replace(earlier, text=text), current_stop(state)
         if earlier.kind is ActionKind.RAISE_STOP and earlier.stop is not None:
             state["current_stop"] = earlier.stop
-    action = _to_the_cent(position_action(state, ctx, max_hold))
+    action = _to_the_cent(position_action(state, ctx, max_hold, check_stop=check_stop))
     if action.kind is ActionKind.RAISE_STOP and action.stop is not None:
         return action, action.stop
     carried = current_stop(state)
@@ -320,13 +324,17 @@ class PositionUpdate:
     reused: bool = False
 
 
-def nightly_update(pos: Mapping[str, Any], ctx: ScanContext, max_hold: int = 30) -> PositionUpdate:
+def nightly_update(
+    pos: Mapping[str, Any], ctx: ScanContext, max_hold: int = 30, *, check_stop: bool = True
+) -> PositionUpdate:
     """The advice to store for one open position after ``ctx.session``'s close.
 
     See "The nightly update" in the module docstring. ``fields`` holds, when the position is
     advised now: the rescaled ``entry_price, initial_stop, current_stop, shares`` after a split,
     ``last_action, last_action_text, last_action_on`` (the session) and ``current_stop`` when the
-    stop to keep changed. A split's action text starts ``adjusted for a split (xR); `` (a multiplication sign).
+    stop to keep changed. A split's action text starts ``adjusted for a split (xR); `` (with a
+    multiplication sign). ``check_stop=False`` is for a stop edited after the close (see
+    :func:`position_action`); the nightly job always checks it.
     """
     d = pd.Timestamp(ctx.session).date()
     last: date | None = pos.get("last_action_on")
@@ -339,7 +347,7 @@ def nightly_update(pos: Mapping[str, Any], ctx: ScanContext, max_hold: int = 30)
     if ratio != 1.0:
         fields = dict(rescaled(pos, ratio))
         pos = {**pos, **fields}
-    action, stop = walk_action(pos, ctx, max_hold)
+    action, stop = walk_action(pos, ctx, max_hold, check_stop=check_stop)
     if ratio != 1.0:
         text = f"adjusted for a split (\u00d7{ratio:g}); {action.text}"
         action = dataclasses.replace(action, text=text)

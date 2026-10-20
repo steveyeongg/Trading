@@ -219,6 +219,15 @@ _TRACKABLE_IDEAS_SQL = text(
     ORDER BY session, symbol, setup
     """
 )
+_SESSION_IDEAS_SQL = text(
+    f"""
+    SELECT {_cols(_IDEA_COLUMNS)}
+    FROM swing_ideas
+    WHERE session = :session
+    ORDER BY watch_only, symbol, setup
+    """
+)
+_GET_IDEA_SQL = text(f"SELECT {_cols(_IDEA_COLUMNS)} FROM swing_ideas WHERE id = :id")
 _ALL_IDEAS_SQL = text(
     f"SELECT {_cols(_IDEA_COLUMNS)} FROM swing_ideas ORDER BY session, symbol, setup"
 )
@@ -488,6 +497,17 @@ async def idea_rows(setup: str | None = None) -> list[dict[str, Any]]:
     if setup is None:
         return await _fetch(_ALL_IDEAS_SQL)
     return await _fetch(_SETUP_IDEAS_SQL, {"setup": setup})
+
+
+async def session_ideas(session: date) -> list[dict[str, Any]]:
+    """The ideas of one scanned ``session`` (watch-only last), each with its row ``id``."""
+    return await _fetch(_SESSION_IDEAS_SQL, {"session": session})
+
+
+async def get_idea(idea_id: uuid.UUID | str) -> dict[str, Any] | None:
+    """One idea by its row id, or None."""
+    rows = await _fetch(_GET_IDEA_SQL, {"id": _uuid(idea_id)})
+    return rows[0] if rows else None
 
 
 async def update_idea_tracks(rows: Sequence[Mapping[str, Any]]) -> None:

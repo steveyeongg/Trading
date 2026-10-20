@@ -293,6 +293,8 @@ def test_product_store_exposes_the_async_interface_later_tasks_rely_on():
         last_step_ok,
         digest_sent,
         mark_digest,
+        product_store.get_idea,
+        product_store.session_ideas,
     ):
         assert inspect.iscoroutinefunction(fn), fn.__name__
 
@@ -815,6 +817,29 @@ async def test_position_can_link_to_the_idea_it_came_from(pg):
         }
     )
     assert made["idea_id"] == idea["id"] and isinstance(made["idea_id"], uuid.UUID)
+
+
+@db
+async def test_get_idea_and_session_ideas_read_what_save_scan_stored(pg):
+    """Task 8: the routes attach each idea's row id (the "I bought this" link) and read the
+    linked idea's stop when a position is recorded from it."""
+    await save_scan(
+        _scan([_idea("ZZTEST1"), _idea("ZZTEST2", "pullback")], [_idea("ZZTEST3")]),
+        TARGET,
+        FIRST_PUBLISH,
+        reconstructed=False,
+    )
+    rows = await product_store.session_ideas(SESSION)
+    assert [(r["symbol"], r["setup"], r["watch_only"]) for r in rows] == [
+        ("ZZTEST1", "breakout", False),
+        ("ZZTEST2", "pullback", False),
+        ("ZZTEST3", "breakout", True),
+    ]
+    assert all(isinstance(r["id"], uuid.UUID) for r in rows)
+    one = await product_store.get_idea(rows[1]["id"])
+    assert one is not None and (one["symbol"], one["stop"]) == ("ZZTEST2", 47.0)
+    assert await product_store.get_idea(uuid.uuid4()) is None
+    assert await product_store.session_ideas(TARGET) == []
 
 
 @db

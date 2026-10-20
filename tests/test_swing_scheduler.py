@@ -38,6 +38,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from fastapi.testclient import TestClient
 from signal_service import main as api
+from signal_service import swing_deps, swing_routes
 from swing_engine import scheduler
 from swing_engine.calendar import Session, TradingCalendar
 from swing_engine.data.alpaca import AlpacaError
@@ -838,6 +839,10 @@ def api_keys_off(monkeypatch):
     monkeypatch.delenv("ALPACA_API_SECRET", raising=False)
 
 
+async def _no_warm_up() -> None:
+    """Stands in for the swing context warm-up, which would read the real database."""
+
+
 def test_testclient_startup_under_pytest_does_not_start_the_scheduler(monkeypatch, api_keys_off):
     started: list[object] = []
 
@@ -871,6 +876,7 @@ def _run_lifespan_with_fake_scheduler(monkeypatch) -> tuple[list[object], list[b
             raise
 
     monkeypatch.setattr(api, "swing_scheduler", forever)
+    monkeypatch.setattr(api, "warm_swing_context", _no_warm_up)
     with TestClient(api.app) as client:
         assert client.get("/healthz").status_code == 200
         for _ in range(100):
@@ -889,7 +895,7 @@ def test_lifespan_starts_the_scheduler_when_enabled_and_cancels_it_on_shutdown(
 
     started, cancelled = _run_lifespan_with_fake_scheduler(monkeypatch)
 
-    assert started == [api._make_swing_deps]
+    assert started == [swing_deps.make_swing_deps]
     assert cancelled == [True]
 
 
@@ -926,7 +932,8 @@ def test_missing_alpaca_keys_leave_the_api_up_and_say_why(monkeypatch, api_keys_
     def no_client() -> object:
         raise AlpacaError("ALPACA_API_KEY and ALPACA_API_SECRET are not configured")
 
-    monkeypatch.setattr(api, "AlpacaData", no_client)
+    monkeypatch.setattr(swing_deps, "AlpacaData", no_client)
+    monkeypatch.setattr(api, "warm_swing_context", _no_warm_up)
 
     with TestClient(api.app) as client:
         for _ in range(300):
@@ -943,18 +950,24 @@ def test_missing_alpaca_keys_leave_the_api_up_and_say_why(monkeypatch, api_keys_
 
 
 def test_make_deps_builds_the_live_deps_for_this_checkout(monkeypatch):
+    """The factory moved to ``swing_deps`` (Task 8), shared with "Run scan now"; it also wires the
+    API's context cache as ``on_context``."""
     made: dict[str, Any] = {}
     client = object()
 
-    monkeypatch.setattr(api, "AlpacaData", lambda: client)
+    monkeypatch.setattr(swing_deps, "AlpacaData", lambda: client)
 
-    def fake_live_deps(c: object, repo: Path) -> str:
+    def fake_live_deps(c: object, repo: Path) -> JobDeps:
         made["client"], made["repo"] = c, repo
-        return "deps"
+        return JobDeps(
+            client=c, calendar=None, bars_store=None, store=None, send=None, repo=repo,
+            now=lambda: MON_1700_ET,
+        )  # type: ignore[arg-type]  # fmt: skip
 
-    monkeypatch.setattr(api, "live_deps", fake_live_deps)
+    monkeypatch.setattr(swing_deps, "live_deps", fake_live_deps)
 
-    assert api._make_swing_deps() == "deps"
+    deps = swing_deps.make_swing_deps()
+    assert deps.client is client and deps.on_context is swing_routes.set_context
     assert made["client"] is client
     assert (made["repo"] / "ml" / "validation").is_dir()  # where the setups' reports live
     assert made["repo"] == Path(__file__).resolve().parents[1]

@@ -4,6 +4,8 @@ Endpoints:
   GET  /healthz, /readyz
   GET  /v1/signals/{symbol}     — pull latest bars, score, return Signal | null
   POST /v1/scan                 — multi-symbol filtered scan
+  /v1/today, /v1/stocks/{symbol}, /v1/positions, /v1/track-record, /v1/settings,
+  /v1/scan/run, /v1/system/status — the swing engine's routes (signal_service.swing_routes)
 """
 
 from __future__ import annotations
@@ -14,14 +16,11 @@ import os
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from atlas_shared import get_logger, get_settings, load_env, setup_logging
 from atlas_shared import metrics as mx
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from swing_engine.data.alpaca import AlpacaData
-from swing_engine.job import JobDeps, live_deps
 from swing_engine.scheduler import (
     disabled_reason,
     mark_disabled,
@@ -39,6 +38,9 @@ from signal_service.routes import router
 from signal_service.state import load_trend_model
 from signal_service.stream import broadcaster
 from signal_service.stream import router as stream_router
+from signal_service.swing_deps import make_swing_deps
+from signal_service.swing_routes import router as swing_router
+from signal_service.swing_routes import warm_context as warm_swing_context
 from signal_service.watchlist import router as watchlist_router
 
 setup_logging()
@@ -70,22 +72,6 @@ async def _monitor_loop() -> None:
         raise
 
 
-def _repo_root() -> Path:
-    """The checkout this file lives in (where ``ml/validation`` is), else the working directory.
-
-    The swing job reads the setups' committed validation reports from here; a wrong root would
-    silently mark every setup unproven, so it does not depend on where the API was started.
-    """
-    root = Path(__file__).resolve().parents[4]
-    return root if (root / "ml").is_dir() else Path.cwd()
-
-
-def _make_swing_deps() -> JobDeps:
-    """The real dependencies of the swing scheduler. Raises (e.g. no Alpaca keys) when it cannot
-    build them; the scheduler task catches that and records why, so the API starts anyway."""
-    return live_deps(AlpacaData(), _repo_root())
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Bridge `.env` → os.environ before anything reads it. Fixes the provider
@@ -108,9 +94,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     else:
         log.info("monitor.disabled", reason="auto-execution opt-in; set ATLAS_ENABLE_AUTO_EXECUTION=1 to enable")
     # Evaluated here, after load_env(), so ATLAS_DISABLE_SCHEDULER=1 works from `.env` too. The
-    # deps are built inside the task: a failure there is the scheduler's, never the API's.
+    # deps are built inside the task: a failure there is the scheduler's, never the API's. The
+    # swing context cache is warmed in the background after it (it logs and gives up on a DB
+    # error), so the first stock page does not wait for the build; never under pytest.
     if scheduler_enabled():
-        tasks.append(asyncio.create_task(swing_scheduler(_make_swing_deps)))
+        tasks.append(asyncio.create_task(swing_scheduler(make_swing_deps)))
+        tasks.append(asyncio.create_task(warm_swing_context()))
         log.info("swing.scheduler.enabled")
     else:
         reason = disabled_reason() or "Automatic scans are off."
@@ -152,6 +141,7 @@ app.include_router(watchlist_router)
 app.include_router(alert_router)
 app.include_router(auth_router)
 app.include_router(execution_router)
+app.include_router(swing_router)
 
 
 @app.middleware("http")
