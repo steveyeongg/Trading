@@ -4,6 +4,7 @@
     uv run python -m swing_engine backfill --refresh-assets
     uv run python -m swing_engine update
     uv run python -m swing_engine scan [--as-of 2026-10-16]
+    uv run python -m swing_engine job
     uv run python -m swing_engine insample --family breakout [--hypothesis "..."]
     uv run python -m swing_engine oos --family breakout --version breakout-v1
 
@@ -27,6 +28,13 @@ first line and a one-line hint (``environment_hint``) instead of a traceback.
 ranked swing ideas for the latest SPY session, or for ``--as-of``. It exits with status 1 and a
 message when there is no data or SPY has no bar on that date. It ranks by relative strength
 unless a validated setup's report found that RS ranking did not help.
+
+``job`` runs the nightly job once now, as the "Run scan now" button does (see
+:mod:`swing_engine.job`): the weekly asset refresh, the bar update (the full backfill on a first
+run), a scan of every session since the last stored one, forward tracking, the actions for your
+positions and the Telegram digest when it is on and not yet sent for the session. It prints each
+step's status and exits with status 1 when a step failed. It needs the Alpaca keys and a migrated
+database, like ``update``. It never places an order.
 
 ``insample`` and ``oos`` are the validation protocol (spec §7.8), run from the repo root because
 they read and write ``ml/validation/``. ``insample`` runs the declared grid on 2016-2022 only and
@@ -58,6 +66,7 @@ from swing_engine import store
 from swing_engine.config import TOP_N_DEFAULT, RiskSettings, UniverseFilter
 from swing_engine.data.alpaca import AlpacaData, AlpacaError
 from swing_engine.ingest import HISTORY_START, IngestResult, backfill, incremental_update
+from swing_engine.job import format_job, live_deps, run_job
 from swing_engine.loader import load_scan_inputs
 from swing_engine.scan import (
     Idea,
@@ -164,6 +173,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="session to scan (default: the latest stored SPY session)",
     )
 
+    commands.add_parser(
+        "job",
+        help="run the nightly job once now and print each step's status",
+        description=(
+            "Run the nightly job once, as a manual run: refresh the asset list if it is a week "
+            "old, update the bars (or backfill them the first time), scan every session since "
+            "the last stored scan, track the published ideas, work out tonight's action for each "
+            "position you recorded and send the Telegram digest if it is on and not yet sent. "
+            "Needs ALPACA_API_KEY and ALPACA_API_SECRET and a migrated database."
+        ),
+    )
+
     ins = commands.add_parser(
         "insample",
         help="run a setup's in-sample grid and draft its pre-registration",
@@ -218,6 +239,11 @@ async def _run_backfill(args: argparse.Namespace) -> IngestResult:
 async def _run_update() -> IngestResult:
     async with AlpacaData() as client:
         return await incremental_update(client, store, now=datetime.now(UTC))
+
+
+async def _run_job() -> dict[str, Any]:
+    async with AlpacaData() as client:
+        return await run_job(live_deps(client, Path.cwd()), "manual")
 
 
 def _names(symbols: list[str]) -> str:
@@ -519,6 +545,12 @@ def _run(args: argparse.Namespace) -> None:
         return
     if args.cmd in ("insample", "oos"):
         print(_validation_report(args))
+        return
+    if args.cmd == "job":
+        run = asyncio.run(_run_job())
+        print(format_job(run))
+        if run["status"] != "ok":
+            raise SystemExit(1)
         return
     job = _run_backfill(args) if args.cmd == "backfill" else _run_update()
     result = asyncio.run(job)

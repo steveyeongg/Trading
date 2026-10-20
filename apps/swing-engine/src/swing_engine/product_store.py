@@ -263,8 +263,19 @@ _FINISH_JOB_SQL = text(
     WHERE id = :id
     """
 )
+# Progress while a job runs (a first backfill takes hours): the step log only, never the status.
+_UPDATE_JOB_STEPS_SQL = text(
+    "UPDATE swing_job_runs SET steps = CAST(:steps AS JSONB) WHERE id = :id"
+)
 _LATEST_JOB_SQL = text(
     f"SELECT {_cols(_JOB_COLUMNS)} FROM swing_job_runs ORDER BY started_at DESC LIMIT 1"
+)
+_LAST_STEP_OK_SQL = text(
+    """
+    SELECT started_at FROM swing_job_runs
+    WHERE status = 'ok' AND steps -> CAST(:step AS TEXT) ->> 'status' = 'ok'
+    ORDER BY started_at DESC LIMIT 1
+    """
 )
 
 _DIGEST_SENT_SQL = text("SELECT ok FROM swing_digests WHERE session = :session AND kind = :kind")
@@ -586,10 +597,27 @@ async def finish_job(job_id: uuid.UUID | str, status: str, steps: Any, error: st
         await session.execute(_FINISH_JOB_SQL, params)
 
 
+async def update_job_steps(job_id: uuid.UUID | str, steps: Any) -> None:
+    """Save a running job's per-step log (its progress); the status and times are left alone."""
+    params = {"id": _uuid(job_id), "steps": None if steps is None else _dumps(steps)}
+    async with session_scope() as session:
+        await session.execute(_UPDATE_JOB_STEPS_SQL, params)
+
+
 async def latest_job() -> dict[str, Any] | None:
     """The most recently started job run (``steps`` parsed), or None."""
     rows = await _fetch(_LATEST_JOB_SQL)
     return rows[0] if rows else None
+
+
+async def last_step_ok(step: str) -> datetime | None:
+    """When the latest successful job run (status ``ok``) whose ``step`` ran ok started, or None.
+
+    A step that was skipped, or one inside a run that failed later, does not count.
+    """
+    async with session_scope() as session:
+        row = (await session.execute(_LAST_STEP_OK_SQL, {"step": step})).first()
+    return None if row is None else row[0]
 
 
 async def digest_sent(session_date: date, kind: str) -> bool:

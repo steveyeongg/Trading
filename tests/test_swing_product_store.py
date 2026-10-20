@@ -33,7 +33,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from swing_engine import product_store
 from swing_engine.config import RiskSettings, UniverseFilter
 from swing_engine.product_store import (
+    _LAST_STEP_OK_SQL,
     _MARK_DIGEST_SQL,
+    _UPDATE_JOB_STEPS_SQL,
     _UPSERT_IDEA_SQL,
     _UPSERT_SCAN_SQL,
     create_position,
@@ -41,6 +43,7 @@ from swing_engine.product_store import (
     finish_job,
     get_position,
     idea_rows,
+    last_step_ok,
     latest_job,
     latest_scan,
     list_positions,
@@ -51,6 +54,7 @@ from swing_engine.product_store import (
     start_job,
     trackable_ideas,
     update_idea_tracks,
+    update_job_steps,
     update_position,
 )
 from swing_engine.product_store import (
@@ -284,11 +288,26 @@ def test_product_store_exposes_the_async_interface_later_tasks_rely_on():
         get_position,
         start_job,
         finish_job,
+        update_job_steps,
         latest_job,
+        last_step_ok,
         digest_sent,
         mark_digest,
     ):
         assert inspect.iscoroutinefunction(fn), fn.__name__
+
+
+def test_job_progress_writes_only_the_steps():
+    """A running job saves its per-step log as it goes (backfill progress); that must not close
+    it, change its status or stamp a finish time."""
+    sql = " ".join(_UPDATE_JOB_STEPS_SQL.text.split())
+    assert sql == "UPDATE swing_job_runs SET steps = CAST(:steps AS JSONB) WHERE id = :id"
+
+
+def test_last_step_ok_reads_only_successful_runs_whose_step_ran_ok():
+    sql = " ".join(_LAST_STEP_OK_SQL.text.split())
+    assert "status = 'ok'" in sql and "->> 'status' = 'ok'" in sql
+    assert "ORDER BY started_at DESC LIMIT 1" in sql
 
 
 # --- parameter building against a fake session (no database) ---------------------------
@@ -444,6 +463,16 @@ async def test_track_and_position_updates_reject_unknown_columns_before_the_data
 async def test_update_idea_tracks_of_nothing_never_opens_a_session(fake_db):
     await update_idea_tracks([])
     assert fake_db.sessions == 0
+
+
+async def test_update_job_steps_sends_json_with_nan_as_null(fake_db):
+    job_id = uuid.uuid4()
+    await update_job_steps(
+        job_id, {"bars": {"status": "running", "done": 3, "total": float("nan")}}
+    )
+    ((statement, params),) = fake_db.calls
+    assert statement is _UPDATE_JOB_STEPS_SQL and params["id"] == job_id
+    assert json.loads(params["steps"]) == {"bars": {"status": "running", "done": 3, "total": None}}
 
 
 # --- round trips against a real database ------------------------------------------------
@@ -775,6 +804,38 @@ async def test_job_runs_start_finish_latest(pg):
     newest = await latest_job()
     assert newest is not None and newest["id"] == later and newest["session"] is None
     assert newest["steps"] == {"scan": {"ideas": 3}} and newest["error"] is None
+
+
+@db
+async def test_job_steps_can_be_saved_while_it_runs(pg):
+    started = await start_job("zztest-nightly", SESSION)
+    await update_job_steps(started, {"bars": {"status": "running", "done": 380, "total": 1000}})
+    running = await latest_job()
+    assert running is not None and running["id"] == started
+    assert running["steps"] == {"bars": {"status": "running", "done": 380, "total": 1000}}
+    assert running["status"] == "running" and running["finished_at"] is None
+
+
+async def _job_at(conn, started: datetime, status: str, steps: dict[str, Any]) -> None:
+    await conn.execute(
+        text(
+            "INSERT INTO swing_job_runs (kind, session, started_at, status, steps) "
+            "VALUES ('zztest', NULL, :started, :status, CAST(:steps AS JSONB))"
+        ),
+        {"started": started, "status": status, "steps": json.dumps(steps)},
+    )
+
+
+@db
+async def test_last_step_ok_is_the_latest_successful_run_whose_step_ran_ok(pg):
+    step = "zztest_assets"  # a step name no real job writes
+    assert await last_step_ok(step) is None
+    base = datetime(2099, 1, 5, 22, 0, tzinfo=UTC)
+    await _job_at(pg, base, "ok", {step: {"status": "ok"}})
+    await _job_at(pg, base + timedelta(days=1), "failed", {step: {"status": "ok"}})
+    await _job_at(pg, base + timedelta(days=2), "ok", {step: {"status": "skipped"}})
+    await _job_at(pg, base + timedelta(days=3), "ok", {"other": {"status": "ok"}})
+    assert await last_step_ok(step) == base
 
 
 @db
