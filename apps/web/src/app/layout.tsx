@@ -2,12 +2,12 @@ import type { Metadata } from 'next';
 import Link from 'next/link';
 import './globals.css';
 import { Providers } from './providers';
-import { LiveDot } from '@/components/LiveDot';
-import { TierBadge } from '@/components/TierBadge';
+import { NavLinks } from '@/components/NavLinks';
+import { StockSearch } from '@/components/StockSearch';
 
 export const metadata: Metadata = {
-  title: 'ATLAS — Trading Intelligence',
-  description: 'Multi-asset signal engine.',
+  title: 'ATLAS · Swing trade ideas',
+  description: 'Rules-based daily swing trade ideas for US stocks.',
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
@@ -16,23 +16,15 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body className="min-h-screen bg-bg text-ink">
         <Providers>
           <header className="border-b border-line bg-bg-surface">
-            <div className="mx-auto flex max-w-7xl items-center gap-6 px-6 py-3">
+            {/* Phone: the logo and the search on one row, the nav wrapped onto its own row. */}
+            <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-x-6 gap-y-2 px-6 py-3">
               <Link href="/" className="font-mono text-lg font-semibold tracking-tight text-accent">
                 ATLAS
               </Link>
-              <nav className="flex gap-4 text-sm text-ink-muted">
-                <Link href="/" className="hover:text-ink">Dashboard</Link>
-                <Link href="/scanner" className="hover:text-ink">Scanner</Link>
-                <Link href="/alerts" className="hover:text-ink">Alerts</Link>
-                <Link href="/backtest" className="hover:text-ink">Backtest</Link>
-                <Link href="/portfolio" className="hover:text-ink">Portfolio</Link>
-                <Link href="/journal" className="hover:text-ink">Journal</Link>
-                <Link href="/settings" className="hover:text-ink">Settings</Link>
-              </nav>
+              <NavLinks />
               <div className="ml-auto flex items-center gap-4">
-                <LiveDot />
-                <TierBadge />
-                <span className="text-xs font-mono text-ink-subtle">v0.1.0</span>
+                <StockSearch />
+                <span className="hidden font-mono text-xs text-ink-subtle md:inline">v0.1.0</span>
               </div>
             </div>
           </header>
