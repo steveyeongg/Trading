@@ -188,6 +188,7 @@ def run_scan(
     open_positions: Sequence[tuple[str, float]] = (),
     universe: UniverseFilter = UniverseFilter(),  # noqa: B008  (frozen dataclass)
     rank_by: RankBy = "rs",
+    ctx: ScanContext | None = None,
 ) -> ScanResult:
     """Scan the panel as of ``as_of`` and return the full ranked ideas and watch-only lists.
 
@@ -196,10 +197,17 @@ def run_scan(
     first, ``"proximity"`` puts the idea whose close is nearest its trigger (``close / trigger``
     highest) first; ties go to the symbol, then the setup. A stock that is a candidate for two
     specs appears once per spec.
+
+    ``ctx`` is a context already built by :func:`build_context` for this same ``panel``,
+    ``kinds``, ``as_of`` and ``universe``; it is used instead of building it again (the slow part
+    of a scan), and the result is the same. A context for another session raises ``ValueError``.
     """
     if rank_by not in ("rs", "proximity"):
         raise ValueError(f"rank_by must be 'rs' or 'proximity', not {rank_by!r}")
-    ctx = build_context(panel, kinds, as_of, universe)
+    if ctx is None:
+        ctx = build_context(panel, kinds, as_of, universe)
+    elif ctx.session.date() != as_of:
+        raise ValueError(f"the context is for {ctx.session.date()}, not the scan session {as_of}")
     session = ctx.session
     regime = Regime(ctx.regime.loc[session])
     market_factor = REGIME_FACTOR[regime.value]

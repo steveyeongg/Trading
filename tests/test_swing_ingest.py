@@ -1087,7 +1087,7 @@ ENVIRONMENT_ERRORS = [
 COMMANDS = [
     pytest.param(["backfill"], "_run_backfill", id="backfill"),
     pytest.param(["update"], "_run_update", id="update"),
-    pytest.param(["scan"], "_load_scan_inputs", id="scan"),
+    pytest.param(["scan"], "load_scan_inputs", id="scan"),
     pytest.param(["insample", "--family", "breakout"], "run_insample", id="insample"),
     pytest.param(["oos", "--family", "breakout", "--version", "breakout-v1"], "run_oos", id="oos"),
 ]

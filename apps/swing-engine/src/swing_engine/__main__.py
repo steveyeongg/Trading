@@ -45,12 +45,11 @@ import argparse
 import asyncio
 import math
 from collections.abc import Mapping, Sequence
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
 import httpx
-import pandas as pd
 import sqlalchemy.exc
 from atlas_shared.config import load_env
 from atlas_shared.logging import get_logger, setup_logging
@@ -58,11 +57,9 @@ from atlas_shared.logging import get_logger, setup_logging
 from swing_engine import store
 from swing_engine.config import TOP_N_DEFAULT, RiskSettings, UniverseFilter
 from swing_engine.data.alpaca import AlpacaData, AlpacaError
-from swing_engine.data.assets import AssetKind
 from swing_engine.ingest import HISTORY_START, IngestResult, backfill, incremental_update
-from swing_engine.panel import Panel, build_panel
+from swing_engine.loader import load_scan_inputs
 from swing_engine.scan import (
-    BENCHMARK,
     Idea,
     ScanError,
     ScanResult,
@@ -82,7 +79,6 @@ from swing_engine.validation.run import (
 log = get_logger("swing.cli")
 
 _LISTED_LIMIT = 50
-_SCAN_WINDOW_DAYS = 800  # calendar days of bars: about 550 sessions, enough for a 252-bar RS
 
 
 def _iso_date(value: str) -> date:
@@ -243,38 +239,6 @@ def _report(cmd: str, result: IngestResult) -> str:
     return "\n".join(lines)
 
 
-def _kinds(assets: pd.DataFrame) -> dict[str, AssetKind]:
-    return {str(s): AssetKind(k) for s, k in zip(assets["symbol"], assets["kind"], strict=True)}
-
-
-async def _load_scan_inputs(
-    as_of: date | None, universe: UniverseFilter
-) -> tuple[Panel, dict[str, AssetKind], date]:
-    """Stored bars for the liquid stocks plus SPY, adjusted and raw, ending on the scan session.
-
-    "Liquid" is the store's prefilter at ``universe``'s dollar-volume floor, a necessary
-    condition for being eligible under that same filter.
-    """
-    assets = await store.load_assets()
-    if assets.empty:
-        raise ScanError("no assets stored: run `python -m swing_engine backfill` first")
-    if as_of is None:
-        latest = await store.last_bar_dates()
-        if BENCHMARK not in latest:
-            raise ScanError(f"no {BENCHMARK} bars stored: run `python -m swing_engine backfill`")
-        as_of = latest[BENCHMARK]
-    liquid = await store.liquid_prefilter(universe.min_median_dollar_volume)
-    symbols = sorted({*liquid, BENCHMARK})
-    start = as_of - timedelta(days=_SCAN_WINDOW_DAYS)
-    bars = await store.load_daily_bars(symbols, start, as_of)
-    if bars.empty:
-        raise ScanError(
-            f"no daily bars stored for {start} to {as_of}: run `python -m swing_engine backfill`"
-        )
-    raw = await store.load_daily_bars(symbols, start, as_of, resolution=store.RAW_DAILY)
-    return build_panel(bars, raw_bars=raw), _kinds(assets), as_of
-
-
 _TABLE = (
     ("#", ">"),
     ("Symbol", "<"),
@@ -353,7 +317,7 @@ def format_scan(r: ScanResult, top_n: int = TOP_N_DEFAULT) -> str:
 def _scan_report(as_of: date | None) -> str:
     universe = UniverseFilter()
     try:
-        panel, kinds, session = asyncio.run(_load_scan_inputs(as_of, universe))
+        panel, kinds, session = asyncio.run(load_scan_inputs(as_of, universe))
         result = run_scan(
             panel,
             kinds,

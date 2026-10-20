@@ -142,6 +142,36 @@ def test_build_context_honours_the_universe_filter():
     assert _scan(universe=UniverseFilter(min_price=1e9)).ideas == []
 
 
+# ---------------------------------------------------------------------------- a prebuilt context
+
+
+def test_a_prebuilt_context_gives_the_same_scan_as_building_one():
+    """The nightly job builds one context per session and reuses it for the scan, tracking,
+    positions and the API cache; handing it to ``run_scan`` must not change a single number."""
+    ctx = build_context(PANEL, KINDS, AS_OF)
+    held = [("S01", 240.0)]
+    rebuilt = _scan(open_positions=held, rank_by="proximity")
+    reused = _scan(open_positions=held, rank_by="proximity", ctx=ctx)
+    assert rebuilt.ideas, "premise: the scan has ideas, so the comparison says something"
+    assert scan_to_dict(reused) == scan_to_dict(rebuilt)
+
+
+def test_a_prebuilt_context_is_used_instead_of_rebuilding(monkeypatch):
+    ctx = build_context(PANEL, KINDS, AS_OF)
+
+    def no_rebuild(*args, **kwargs):
+        raise AssertionError("run_scan rebuilt the context it was given")
+
+    monkeypatch.setattr("swing_engine.scan.build_context", no_rebuild)
+    assert scan_to_dict(_scan(ctx=ctx))["session"] == AS_OF.isoformat()
+
+
+def test_a_prebuilt_context_for_another_session_is_refused():
+    ctx = build_context(PANEL, KINDS, PANEL.dates()[449].date())
+    with pytest.raises(ValueError, match="context"):
+        _scan(ctx=ctx)
+
+
 # ---------------------------------------------------------------------------- the result
 
 
@@ -642,6 +672,26 @@ def test_scan_command_ranks_by_proximity_when_a_live_setup_found_rs_did_not_help
     by_proximity = [(i.symbol, i.setup) for i in _scan(rank_by="proximity").ideas]
     assert by_proximity != [(i.symbol, i.setup) for i in _scan().ideas]  # premise
     assert [(r[1], r[2]) for r in rows] == by_proximity
+
+
+def test_the_scan_loader_is_public_and_the_cli_uses_it():
+    """One data path: the CLI's scan and the nightly job load bars through the same function."""
+    from swing_engine import loader
+
+    assert cli.load_scan_inputs is loader.load_scan_inputs
+    assert not hasattr(cli, "_load_scan_inputs")
+
+
+async def test_the_loader_returns_the_panel_kinds_and_session(monkeypatch):
+    fake = _FakeStore(monkeypatch)
+    from swing_engine.loader import load_scan_inputs
+
+    panel, kinds, session = await load_scan_inputs(AS_OF, UniverseFilter())
+    assert session == AS_OF and panel.dates()[-1] == D and kinds == KINDS
+    expected = PANEL.close.loc[:D]
+    assert list(panel.dates()) == list(expected.index)
+    assert np.allclose(panel.close[expected.columns].to_numpy(), expected.to_numpy())
+    assert fake.prefilter_calls == [UniverseFilter().min_median_dollar_volume]
 
 
 def test_scan_prefilter_threshold_is_the_universe_filter_s(monkeypatch):
