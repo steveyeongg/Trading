@@ -1,0 +1,75 @@
+{
+  "created_at": "2026-10-20T02:22:51+00:00",
+  "family": "pullback",
+  "gate": {
+    "coverage_floor": 0.9,
+    "min_expectancy_r": 0.0,
+    "min_profit_factor": 1.2,
+    "min_profit_factor_low_coverage": 1.3,
+    "min_trades": 100
+  },
+  "hypothesis": "",
+  "is_window": [
+    "2016-01-01",
+    "2022-12-31"
+  ],
+  "oos_start": "2023-01-01",
+  "params": {
+    "ema_window": 20,
+    "low_window": 5,
+    "max_hold": 30,
+    "max_stop_atr": 3.0,
+    "min_stop_atr": 1.0,
+    "rsi2_max": 10.0,
+    "stop_buffer_atr": 0.5,
+    "trail_atr": 3.5,
+    "trigger_atr": 0.05,
+    "version": "pullback-v1"
+  },
+  "protocol": {
+    "execution": {
+      "max_gap_atr": 1.0,
+      "slippage_bps": 10.0
+    },
+    "grid": {
+      "stop_buffer_atr": [
+        0.25,
+        0.5
+      ],
+      "trail_atr": [
+        2.5,
+        3.0,
+        3.5
+      ]
+    },
+    "leader": {
+      "rs_min_pct": 70.0,
+      "sma200_rising_lookback": 20,
+      "within_high_pct": 0.25
+    },
+    "regime_factor": {
+      "downtrend": 0.0,
+      "mixed": 0.5,
+      "uptrend": 1.0
+    },
+    "risk": {
+      "equity": 25000.0,
+      "max_position_pct": 0.2,
+      "max_positions": 8,
+      "max_total_risk_pct": 0.06,
+      "overlap_corr": 0.8,
+      "overlap_window": 60,
+      "risk_pct": 0.01
+    },
+    "universe": {
+      "dollar_volume_window": 50,
+      "max_gap_sessions": 10,
+      "min_atr_pct": 0.005,
+      "min_history_sessions": 252,
+      "min_median_dollar_volume": 20000000.0,
+      "min_price": 10.0
+    }
+  },
+  "sha256": "b341a0a4bb4eee584945a81ae485662290b78f8c6712110d68c6bd8fed9dcdb3",
+  "version": "pullback-v1"
+}
