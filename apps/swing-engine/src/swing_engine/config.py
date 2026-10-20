@@ -11,13 +11,20 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class UniverseFilter:
-    """Which symbols are tradable on a given scan day."""
+    """Which symbols are tradable on a given scan day.
+
+    ``min_atr_pct`` is the minimum 14-session ATR as a fraction of the close (0.005 is 0.5%).
+    It keeps out price-pinned stocks, such as a pending cash buyout trading at the deal price,
+    whose upside is capped and whose stop would sit a fraction of a percent below the trigger.
+    0 turns the rule off.
+    """
 
     min_price: float = 10.0
     min_median_dollar_volume: float = 20_000_000.0
     dollar_volume_window: int = 50
     min_history_sessions: int = 252
     max_gap_sessions: int = 10
+    min_atr_pct: float = 0.005
 
 
 @dataclass(frozen=True)

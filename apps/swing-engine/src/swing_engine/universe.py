@@ -3,8 +3,9 @@
 A symbol is eligible at ``(d, s)`` only if every rule holds using data at or before ``d``:
 it has a bar on ``d`` (a halted or not-yet-printed symbol is out, and yesterday's price is
 never carried forward), it trades at or above the price floor, its 50-bar median dollar
-volume clears the liquidity floor, its current segment is long enough, and its asset kind
-is tradeable. Segments follow :func:`swing_engine.panel.segments`, so a reused ticker
+volume clears the liquidity floor, its current segment is long enough, it moves enough (its
+14-session ATR is at least ``min_atr_pct`` of the close, which keeps out stocks pinned to a
+buyout price) and its asset kind is tradeable. Segments follow :func:`swing_engine.panel.segments`, so a reused ticker
 restarts both the history count and the dollar-volume window, and a missing day is never
 filled.
 
@@ -23,14 +24,27 @@ import pandas as pd
 
 from swing_engine.config import UniverseFilter
 from swing_engine.data.assets import TRADEABLE_KINDS, AssetKind
+from swing_engine.indicators import atr
 from swing_engine.panel import Panel, segments
 
+ATR_WINDOW = 14
+"""The ATR the minimum-volatility rule reads (the same 14 as ``Indicators.atr14``)."""
 
-def eligibility(panel: Panel, kinds: Mapping[str, AssetKind], f: UniverseFilter) -> pd.DataFrame:
+
+def eligibility(
+    panel: Panel,
+    kinds: Mapping[str, AssetKind],
+    f: UniverseFilter,
+    atr14: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     """Boolean frame shaped like ``panel.close``: True where the symbol may be scanned.
 
     ``kinds`` maps symbol to :class:`AssetKind`. A symbol with no entry (``SPY`` is a
     reference series, not a candidate) is never eligible.
+
+    ``atr14`` is the panel's 14-session ATR (``compute_indicators(panel).atr14``), passed by a
+    caller that already has it; None computes it here. It is read only when ``f.min_atr_pct``
+    is above 0.
 
     The price floor uses ``panel.raw_close`` where it has a value and the adjusted close
     where it does not (cell by cell); with no ``raw_close`` it uses the adjusted close.
@@ -59,4 +73,10 @@ def eligibility(panel: Panel, kinds: Mapping[str, AssetKind], f: UniverseFilter)
         & (history >= f.min_history_sessions)
         & tradeable[np.newaxis, :]
     )
+    if f.min_atr_pct > 0.0:
+        a = atr(panel, ATR_WINDOW) if atr14 is None else atr14
+        a = a.reindex(index=close.index, columns=close.columns)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            moves = a.to_numpy() / close.to_numpy()
+        ok &= moves >= f.min_atr_pct  # a NaN ratio (warm-up, no bar) compares False
     return pd.DataFrame(ok, index=close.index, columns=close.columns)

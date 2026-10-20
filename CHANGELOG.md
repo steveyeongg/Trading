@@ -34,8 +34,9 @@ from the default path (code kept). Decision and evidence:
 - **Engine.** Wide `Panel` and strict per-segment indicators (a gap of more than
   10 sessions restarts a symbol, so a reused ticker never blends companies);
   point-in-time universe ($10 raw-close floor, $20M 50-bar median dollar volume,
-  252 sessions of history); SPY regime (uptrend / mixed / downtrend) and
-  breadth; relative-strength percentile and leader gate; `breakout-v1` and
+  252 sessions of history, ATR14 at least 0.5% of the close); SPY regime
+  (uptrend / mixed / downtrend) and breadth; relative-strength percentile and
+  leader gate; `breakout-v1` and
   `pullback-v1` setups; one fill/exit model (next-session buy-stop, no chase
   above trigger + 1 ATR, gap-through stops fill at the open, chandelier trail,
   30-session time stop, `delisted` exit) shared by the scan, the backtest and
@@ -86,6 +87,15 @@ from the default path (code kept). Decision and evidence:
   issues (ZVZZT and friends) are excluded. Panels keep only SPY's sessions. The
   prefilters use `UniverseFilter`'s dollar-volume floor. Database, migration and
   network errors end with a one-line `hint:` instead of a traceback.
+- **Minimum-volatility universe rule.** A symbol is eligible only if its
+  14-session ATR is at least 0.5% of the close (`UniverseFilter.min_atr_pct`;
+  0 turns it off). The first real scan listed pending cash buyouts (HZO, UTZ)
+  as breakouts: pinned to the deal price for two months with an ATR near 0.25%
+  of price, their stops sat 0.6-0.7% under the trigger, so upside was capped
+  and a broken deal would gap through the stop. Both values are adjusted, so a
+  split leaves the ratio alone, and a NaN ATR (warm-up) is not eligible. The
+  rule is part of the sealed `protocol` block, so it lands before any
+  pre-registration.
 
 ### Legacy composite: guarded, not deleted
 

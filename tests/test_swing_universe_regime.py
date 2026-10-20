@@ -2,15 +2,24 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import numpy as np
 import pandas as pd
 import pytest
+import swing_engine.scan as scan_module
 from swing_engine.config import UniverseFilter
 from swing_engine.data.assets import TRADEABLE_KINDS, AssetKind
-from swing_engine.indicators import MAX_GAP, compute_indicators
+from swing_engine.indicators import MAX_GAP, atr, compute_indicators
 from swing_engine.panel import Panel, truncate
 from swing_engine.regime import Regime, breadth, market_regime
-from swing_engine.testing import make_panel, trend_series
+from swing_engine.scan import build_context
+from swing_engine.testing import (
+    make_panel,
+    synthetic_kinds,
+    synthetic_universe_panel,
+    trend_series,
+)
 from swing_engine.universe import eligibility
 
 COMMON = AssetKind.COMMON
@@ -165,6 +174,156 @@ def test_eligibility_has_no_look_ahead():
     for row in (150, 299, 314, 400, 566, 650):
         cut = eligibility(truncate(p, p.dates()[row]), kinds, f)
         pd.testing.assert_frame_equal(full.iloc[: row + 1], cut)
+
+
+# --- minimum volatility: a price-pinned stock (a pending cash buyout) is not tradable --------
+#
+# Incident: the first real scan listed HZO and UTZ as breakouts with stops 0.6-0.7% below the
+# trigger. Both had sat in a ~1% band for two months (ATR14 about 0.25% of price) because they
+# were pending cash buyouts, so the price was pinned to the deal price. Upside is capped and a
+# broken deal gaps through a tiny stop, so they are out of the universe: ATR14 / close must reach
+# ``UniverseFilter.min_atr_pct``.
+
+
+def _pinned(n: int = 300, price: float = 50.0, move: float = 0.0005) -> list[float]:
+    """Closes that alternate +/- ``move`` around ``price`` (a stock pinned to a deal price)."""
+    return [price * (1.0 + move * (-1) ** i) for i in range(n)]
+
+
+def _swinging(n: int = 300, price: float = 50.0, move: float = 0.015) -> list[float]:
+    """Closes that alternate +/- ``move`` around ``price`` (an ordinary, moving stock)."""
+    return _pinned(n, price, move)
+
+
+def _pinned_and_swinging() -> Panel:
+    # Same price, same $50M a day, same 300 bars; only the daily range differs.
+    return make_panel(
+        {"PINNED": _pinned(), "SWING": _swinging()}, volume=1_000_000, range_pct=0.0002
+    )
+
+
+def test_pinned_stock_excluded_by_min_atr_pct():
+    p = _pinned_and_swinging()
+    e = eligibility(p, {"PINNED": COMMON, "SWING": COMMON}, UniverseFilter())
+    atr_pct = (atr(p, 14) / p.close).iloc[-1]
+    assert atr_pct["PINNED"] < 0.002 and atr_pct["SWING"] > 0.015  # the premise
+    assert not e["PINNED"].iloc[-1] and e["SWING"].iloc[-1]
+    assert not e["PINNED"].any()  # pinned throughout, so never eligible on any day
+
+
+def test_min_atr_pct_zero_disables_rule():
+    p = _pinned_and_swinging()
+    kinds = {"PINNED": COMMON, "SWING": COMMON}
+    e = eligibility(p, kinds, UniverseFilter(min_atr_pct=0.0))
+    assert e["PINNED"].iloc[-1] and e["SWING"].iloc[-1]
+    # Disabled means no effect at all, warm-up days included (their ATR is still NaN).
+    warm = UniverseFilter(min_atr_pct=0.0, dollar_volume_window=1, min_history_sessions=1)
+    assert eligibility(p, kinds, warm)["PINNED"].iloc[:13].all()
+
+
+def test_min_atr_pct_default_and_boundary():
+    assert UniverseFilter().min_atr_pct == 0.005
+    p = _pinned_and_swinging()
+    kinds = {"PINNED": COMMON, "SWING": COMMON}
+    ratio = float((atr(p, 14) / p.close).iloc[-1]["PINNED"])
+    on = eligibility(p, kinds, UniverseFilter(min_atr_pct=ratio))["PINNED"].iloc[-1]
+    over = eligibility(p, kinds, UniverseFilter(min_atr_pct=ratio * 1.0001))["PINNED"].iloc[-1]
+    assert on and not over  # the comparison is >=
+
+
+def test_nan_atr_during_warmup_is_not_eligible():
+    # Only the ATR rule can bind here: no history floor, a one-bar dollar-volume window.
+    f = UniverseFilter(dollar_volume_window=1, min_history_sessions=1)
+    p = make_panel({"SWING": _swinging(40)}, volume=1_000_000, range_pct=0.0002)
+    assert atr(p, 14)["SWING"].iloc[:13].isna().all()
+    e = eligibility(p, {"SWING": COMMON}, f)["SWING"]
+    assert not e.iloc[:13].any() and e.iloc[13:].all()  # the 14th bar is the first with an ATR
+    # Without the rule the same days are eligible, so the ATR rule alone excluded them.
+    off = dataclasses.replace(f, min_atr_pct=0.0)
+    assert eligibility(p, {"SWING": COMMON}, off)["SWING"].all()
+
+
+def test_atr14_argument_matches_computing_it_inside():
+    p = _pinned_and_swinging()
+    kinds = {"PINNED": COMMON, "SWING": COMMON}
+    f = UniverseFilter()
+    pd.testing.assert_frame_equal(
+        eligibility(p, kinds, f), eligibility(p, kinds, f, atr14=atr(p, 14))
+    )
+    # The argument is what is read: an ATR of zero everywhere excludes the moving stock too.
+    zero = pd.DataFrame(0.0, index=p.close.index, columns=p.close.columns)
+    assert not eligibility(p, kinds, f, atr14=zero).any().any()
+    assert eligibility(p, kinds, f, atr14=p.close * 0.5).iloc[-1].all()  # ... and 50% admits both
+
+
+def test_atr_ratio_uses_the_adjusted_close_not_the_raw_close():
+    # Adjusted $500 with a 0.1% ATR is pinned; raw $50 would read the ATR as 1% and let it in.
+    p = make_panel({"AAA": _pinned(300, price=500.0)}, volume=100_000, range_pct=0.0002)
+    raw = pd.DataFrame(p.close.to_numpy() / 10.0, index=p.close.index, columns=p.close.columns)
+    with_raw = Panel(p.open, p.high, p.low, p.close, p.volume, raw_close=raw)
+    assert (raw >= 10.0).all().all()  # the premise: raw clears the $10 floor
+    assert (atr(p, 14) / raw).iloc[-1]["AAA"] > 0.005  # ... and a raw ratio would pass
+    assert not eligibility(with_raw, {"AAA": COMMON}, UniverseFilter())["AAA"].any()
+
+
+def test_atr_ratio_is_split_invariant():
+    # A 10:1 split rescales every adjusted price in history; ATR and close scale together.
+    p = _pinned_and_swinging()
+    scaled = Panel(*(getattr(p, f) / 10.0 for f in ("open", "high", "low", "close")), p.volume * 10)
+    f = UniverseFilter(min_price=0.0)  # the price floor is about the price, not the ratio
+    kinds = {"PINNED": COMMON, "SWING": COMMON}
+    pd.testing.assert_frame_equal(eligibility(p, kinds, f), eligibility(scaled, kinds, f))
+
+
+def test_atr_rule_is_point_in_time():
+    # PINNED trades normally, is deal-pinned from row 350, then breaks loose at row 500: the
+    # rule's answer flips twice, and every row's answer must not depend on later rows.
+    moves = np.r_[np.full(350, 0.015), np.full(150, 0.0005), np.full(200, 0.015)]
+    price = 50.0 * np.cumprod(1.0 + moves * (-1.0) ** np.arange(700))
+    p = make_panel(
+        {"PINNED": price.tolist(), "SWING": _swinging(700)}, volume=1_000_000, range_pct=0.0002
+    )
+    kinds = {"PINNED": COMMON, "SWING": COMMON}
+    f = UniverseFilter()
+    full = eligibility(p, kinds, f)
+    flips = full["PINNED"].astype(int).diff().abs().sum()
+    assert flips >= 2 and full["SWING"].iloc[252:].all()  # premise: the answer really changes
+    for row in (260, 349, 360, 380, 450, 499, 520, 600, 699):
+        cut = eligibility(truncate(p, p.dates()[row]), kinds, f)
+        pd.testing.assert_frame_equal(full.iloc[: row + 1], cut)
+
+
+def test_build_context_uses_ind_atr14(monkeypatch):
+    panel = synthetic_universe_panel(seed=5)
+    kinds = synthetic_kinds(panel)
+    as_of = panel.dates()[450].date()
+    seen: list[dict] = []
+    real = scan_module.eligibility
+
+    def spy(*args, **kwargs):
+        seen.append({"args": args, "kwargs": kwargs})
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(scan_module, "eligibility", spy)
+    ctx = build_context(panel, kinds, as_of)
+
+    assert len(seen) == 1
+    # It reuses the indicators it just computed rather than recomputing the ATR.
+    assert seen[0]["kwargs"]["atr14"] is ctx.ind.atr14
+    expected = real(ctx.panel, kinds, UniverseFilter(), atr14=ctx.ind.atr14)
+    expected[scan_module.BENCHMARK] = False
+    pd.testing.assert_frame_equal(ctx.eligible, expected)
+
+
+def test_build_context_applies_min_atr_pct():
+    panel = synthetic_universe_panel(seed=5)
+    kinds = synthetic_kinds(panel)
+    as_of = panel.dates()[450].date()
+    default = build_context(panel, kinds, as_of)
+    off = build_context(panel, kinds, as_of, universe=UniverseFilter(min_atr_pct=0.0))
+    strict = build_context(panel, kinds, as_of, universe=UniverseFilter(min_atr_pct=0.5))
+    assert not strict.eligible.to_numpy().any()  # 50% of price a day: nothing qualifies
+    assert off.eligible.to_numpy().sum() >= default.eligible.to_numpy().sum()
 
 
 def test_regime_rules():

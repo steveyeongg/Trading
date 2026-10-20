@@ -135,7 +135,7 @@ def build_context(
     _require_benchmark(cut, session)
 
     ind = compute_indicators(cut)
-    eligible = eligibility(cut, kinds, universe)
+    eligible = eligibility(cut, kinds, universe, atr14=ind.atr14)
     eligible[BENCHMARK] = False
     rs_pct = rs_percentile(rs_score(cut.close), eligible)
     leaders = leader_mask(cut.close, ind, rs_pct, eligible, LeaderParams())

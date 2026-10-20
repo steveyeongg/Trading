@@ -82,6 +82,14 @@ passing the full gate). The combined portfolio in a report includes the other
 family only after that family's own out-of-sample run, with its registered
 parameters.
 
+**Universe.** A stock is scanned on a given day only if it has a bar that day,
+its raw close is at least $10, its 50-bar median dollar volume is at least $20M,
+it has 252 sessions of history in its current segment, it is an operating-company
+stock, **and its 14-session ATR is at least 0.5% of its close**. The last rule
+keeps out stocks pinned to a pending cash-buyout price, whose upside is capped
+and whose stops would sit a fraction of a percent below the trigger. The rules
+are `UniverseFilter` in `config.py` and are sealed into each pre-registration.
+
 **Data notes**
 
 - The **free Alpaca plan** provides SIP historical daily bars with a 15-minute
