@@ -98,6 +98,7 @@ export interface IdeaOut {
   shares: number;
   risk_dollars: number | null;
   position_value: number | null;
+  /** Relative-strength percentile among the eligible stocks, 0 to 100 (99 = strongest). */
   rs_pct: number | null;
   rank: number;
   /** The scan said Live and the family's verdict is Live now. */
@@ -129,6 +130,7 @@ export interface FreshnessOut {
 export interface RegimeOut {
   state: RegimeState;
   factor: number | null;
+  /** Percent (0 to 100, not a fraction) of eligible stocks closing above their 50-day average. */
   breadth: number | null;
   /** The plain-English label, e.g. "UPTREND, new trades OK". */
   label: string;
