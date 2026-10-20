@@ -1,4 +1,4 @@
-"""The swing product's HTTP routes: Today, a stock, positions, track record, settings, scans, status.
+"""The swing product's HTTP routes: Today, a stock, positions, track record, settings, status.
 
 These are the dashboard's routes for the rules-based swing engine (``swing_engine``). They read
 what the nightly job stored and the committed validation reports, and they never run a scan or
@@ -60,15 +60,15 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from sqlalchemy.exc import SQLAlchemyError
 from swing_engine import job, product_store
 from swing_engine import store as swing_bars
-from swing_engine.checklist import UNKNOWN, eligibility_checklist
+from swing_engine.checklist import dollar_volume_rule, eligibility_checklist
 from swing_engine.config import BreakoutParams, PullbackParams, RiskSettings, UniverseFilter
 from swing_engine.digest import DISCLAIMER, REGIME_LABEL, send_digest
 from swing_engine.indicators import compute_indicators
-from swing_engine.job import JobDeps, ProductStore
+from swing_engine.job import JobDeps, ProductStore, safe_reason
 from swing_engine.loader import SCAN_WINDOW_DAYS, load_scan_inputs
 from swing_engine.narrate import SETUP_LABEL
-from swing_engine.panel import Panel, build_panel, segments
-from swing_engine.positions import nightly_update, stored_action
+from swing_engine.panel import Panel, build_panel
+from swing_engine.positions import nightly_update, open_risk, rescaled, split_ratio, stored_action
 from swing_engine.regime import Regime
 from swing_engine.scan import ScanContext, build_context, default_setups
 from swing_engine.scheduler import scheduler_state
@@ -76,7 +76,12 @@ from swing_engine.settings import SwingSettings
 from swing_engine.tracking import live_stats
 from swing_engine.validation.prereg import PreregError, load_prereg
 from swing_engine.validation.protocol import FAMILIES
-from swing_engine.validation.run import VALIDATION_DIR, ReportError, _reports, load_verdicts
+from swing_engine.validation.run import (
+    VALIDATION_DIR,
+    ReportError,
+    family_reports,
+    load_verdicts,
+)
 
 from signal_service import swing_deps
 
@@ -107,7 +112,7 @@ ASSET_NAMES_TTL_S = 600.0
 ASSET_MISS_RELOAD_S = 60.0
 """A symbol missing from a map at least this old reloads it once (a listing added tonight)."""
 
-JOB_ID_WAIT_S = 15.0
+JOB_ID_WAIT_S = 60.0
 """How long "Run scan now" waits for the job's row (the calendar is fetched first)."""
 
 TELEGRAM_TEST_TEXT = (
@@ -140,7 +145,7 @@ class _SwingRoute(APIRoute):
             try:
                 return await handler(request)
             except _DB_ERRORS as exc:
-                reason = job._reason(exc)
+                reason = safe_reason(exc)
                 log.warning("swing.api.database_unreachable", path=request.url.path, error=reason)
                 return JSONResponse(
                     status_code=503, content={"detail": f"Can't reach the ATLAS database: {reason}"}
@@ -431,7 +436,7 @@ class PositionOut(_Out):
 
 
 class ScanRunOut(_Out):
-    job_id: str | None
+    job_id: str
 
 
 class TelegramTestOut(_Out):
@@ -536,12 +541,18 @@ class _Cache:
     context alone); the job built it from the stored settings, so the first read takes the
     settings' filter as its own. ``drop_job_context`` is set when the universe changed while a
     job was running: that job's context was built with the old filters and is not kept.
+
+    The cache never goes back in time: ``newest`` is the latest session any context was offered
+    for (a dropped one included), and a context for an earlier session is never cached. Advice
+    computed on an older session would be written over newer advice the job stored.
+    ``failed`` is the filter, time and reason of the last failed build.
     """
 
     ctx: ScanContext | None = None
     universe: UniverseFilter | None = None
-    failed: tuple[UniverseFilter, float] | None = None
+    failed: tuple[UniverseFilter, float, str] | None = None
     drop_job_context: bool = False
+    newest: pd.Timestamp | None = None
 
 
 _CACHE = _Cache()
@@ -549,13 +560,40 @@ _CACHE_LOCK = asyncio.Lock()
 
 
 def set_context(ctx: ScanContext, universe: UniverseFilter | None = None) -> None:
-    """Cache ``ctx`` (``JobDeps.on_context``); ``universe`` is the filter it was built with."""
+    """Cache ``ctx`` (``JobDeps.on_context``); ``universe`` is the filter it was built with.
+
+    A context for a session earlier than one already offered is ignored (see :class:`_Cache`).
+    """
+    _offer(ctx, universe)
+
+
+def _offer(ctx: ScanContext, universe: UniverseFilter | None) -> bool:
+    """Cache ``ctx`` unless it is older than the newest session seen; True when it was cached."""
     cache = _CACHE
+    session = pd.Timestamp(ctx.session)
     if universe is None and cache.drop_job_context:
+        # The job read the old filters. Its session is still the newest there is, so an older
+        # cached context (a lazy build from the scan before) goes too: the next read rebuilds.
         cache.drop_job_context = False
-        log.info("swing.api.context_dropped", session=str(ctx.session.date()))
-        return
-    cache.ctx, cache.universe, cache.failed = ctx, universe, None
+        cache.newest = session if cache.newest is None else max(cache.newest, session)
+        if cache.ctx is not None and pd.Timestamp(cache.ctx.session) < session:
+            cache.ctx, cache.universe = None, None
+        log.info("swing.api.context_dropped", session=str(session.date()))
+        return False
+    if cache.newest is not None and session < cache.newest:
+        log.info(
+            "swing.api.older_context_ignored",
+            session=str(session.date()),
+            newest=str(cache.newest.date()),
+        )
+        return False
+    cache.ctx, cache.universe, cache.failed, cache.newest = ctx, universe, None, session
+    return True
+
+
+def last_failure() -> str | None:
+    """Why the last context build failed (no secrets in it), or None."""
+    return None if _CACHE.failed is None else _CACHE.failed[2]
 
 
 def invalidate_context(*, during_job: bool = False) -> None:
@@ -599,11 +637,13 @@ async def cached_context() -> tuple[ScanContext, UniverseFilter] | None:
         try:
             ctx = await _build_context(wanted)
         except Exception as exc:
-            log.warning("swing.api.context_unavailable", error=job._reason(exc))
-            _CACHE.failed = (wanted, time.monotonic())
+            reason = safe_reason(exc)
+            log.warning("swing.api.context_unavailable", error=reason)
+            _CACHE.failed = (wanted, time.monotonic(), reason)
             return None
-        set_context(ctx, wanted)
-        return ctx, wanted
+        if _offer(ctx, wanted):
+            return ctx, wanted
+        return _hit(wanted)  # a newer session arrived while this one was built
 
 
 async def get_context() -> ScanContext | None:
@@ -627,7 +667,7 @@ async def warm_context() -> None:
     try:
         await get_context()
     except Exception as exc:
-        log.warning("swing.api.warm_up_failed", error=job._reason(exc))
+        log.warning("swing.api.warm_up_failed", error=safe_reason(exc))
 
 
 # --- asset names ------------------------------------------------------------------------------
@@ -706,7 +746,7 @@ def _families(repo: Path) -> dict[str, _Family]:
             kind = "not_tested" if failures == ["not yet tested"] else "research"
             text = f"Research only: {failures[0]}" if failures else "Research only"
         try:
-            reports = [doc for _, doc in _reports(repo, family)]
+            reports = family_reports(repo, family)
         except ReportError:
             reports = []
         report = reports[-1] if reports else None
@@ -831,6 +871,10 @@ def _idea_out(
     symbol, setup = str(row["symbol"]), str(row["setup"])
     trigger, stop = _num(row.get("trigger")), _num(row.get("stop"))
     sizing = row.get("sizing") or {}
+    family = families.get(setup)
+    # Live is the scan's flag and the family's verdict now: a setup whose verdict was withdrawn
+    # since the scan (its rules or files changed) shows its ideas as unproven.
+    live = bool(row.get("live")) and family is not None and family.verdict == "live"
     return {
         "id": ids.get((symbol, setup)),
         "symbol": symbol,
@@ -846,14 +890,14 @@ def _idea_out(
         "position_value": _num(sizing.get("position_value")),
         "rs_pct": _num(row.get("rs_pct")),
         "rank": _int(row.get("rank")) or 0,
-        "live": bool(row.get("live")),
+        "live": live,
         "watch_only": watch_only,
         "regime_warning": bool(row.get("regime_warning")),
         "overlaps": [str(s) for s in row.get("overlaps") or []],
         "already_held": symbol.upper() in held,
         "why": row.get("why"),
         "cancels": row.get("cancels"),
-        "track_record": _idea_record(families.get(setup)),
+        "track_record": _idea_record(family),
     }
 
 
@@ -866,12 +910,6 @@ async def _idea_ids(session: date) -> dict[tuple[str, str], str]:
 
 def _held(positions: Sequence[Mapping[str, Any]]) -> set[str]:
     return {str(p["symbol"]).upper() for p in positions}
-
-
-def _open_risk(pos: Mapping[str, Any]) -> float:
-    stop = pos.get("current_stop")
-    stop = pos["initial_stop"] if stop is None else stop
-    return float(pos["shares"]) * max(0.0, float(pos["entry_price"]) - float(stop))
 
 
 # --- the latest job ---------------------------------------------------------------------------
@@ -993,7 +1031,7 @@ async def today() -> dict[str, Any]:
             "capacity": {
                 "open_positions": len(positions),
                 "max_positions": settings.max_positions,
-                "open_risk_dollars": float(sum(_open_risk(p) for p in positions)),
+                "open_risk_dollars": float(sum(open_risk(p) for p in positions)),
                 "max_risk_dollars": settings.equity * settings.max_total_risk_pct,
             },
             "empty_reason": empty,
@@ -1056,32 +1094,8 @@ async def _stored_chart(
         )
     ind = compute_indicators(panel)
     chart = _chart(panel, {name: getattr(ind, name) for name in _LINES}, symbol)
-    return chart, _dollar_volume_item(panel, symbol, ctx.session, universe)
-
-
-def _dollar_volume_item(
-    panel: Panel, symbol: str, session: pd.Timestamp, universe: UniverseFilter
-) -> dict[str, Any]:
-    """The checklist's dollar-volume rule, counted as the engine does: the symbol's own bars in
-    its current segment, which must end on the session."""
-    window = universe.dollar_volume_window
-    median = float("nan")
-    segs = segments(panel.close[symbol], universe.max_gap_sessions)
-    if segs and segs[-1].index[-1] == session and len(segs[-1]) >= window:
-        seg = segs[-1]
-        dollars = (seg * panel.volume[symbol].reindex(seg.index)).to_numpy()[-window:]
-        median = float(pd.Series(dollars).rolling(window, min_periods=window).median().iloc[-1])
-    floor = universe.min_median_dollar_volume
-
-    def millions(x: float) -> str:
-        return UNKNOWN if math.isnan(x) else f"${x / 1e6:,.1f}M"
-
-    return {
-        "rule": f"{window}-day median dollar volume at least ${floor / 1e6:g}M",
-        "passed": bool(median >= floor),
-        "value": millions(median),
-        "threshold": millions(floor),
-    }
+    rule = dollar_volume_rule(dataclasses.replace(ctx, panel=panel), symbol, universe)
+    return chart, dataclasses.asdict(rule)
 
 
 def _levels(idea: Mapping[str, Any] | None, pos: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -1109,12 +1123,16 @@ async def stock(symbol: str) -> dict[str, Any]:
     if sym not in names:
         raise HTTPException(404, f"unknown symbol {sym}: it is not in the asset list")
     cached = await cached_context()
-    if cached is None:
-        raise HTTPException(
-            503, "No scan data is loaded yet: stock pages need a completed scan of the stored bars."
-        )
-    ctx, universe = cached
     scan = await store.latest_scan()
+    if cached is None:
+        failure = last_failure()
+        if scan is None or failure is None:
+            raise HTTPException(
+                503,
+                "No scan data is loaded yet: stock pages need a completed scan of the stored bars.",
+            )
+        raise HTTPException(503, f"Couldn't load scan data: {failure}")
+    ctx, universe = cached
     positions = await store.list_positions("open")
     pos = next((p for p in positions if str(p["symbol"]).upper() == sym), None)
 
@@ -1221,16 +1239,27 @@ async def _advise(pos: dict[str, Any], *, check_stop: bool = True) -> dict[str, 
 
     The position is judged on the context's session alone (as one never advised). Without a
     context, or for a symbol the cached panel lacks (the nightly job loads it), it is returned
-    unadvised: advice from no bars would read as "no price data".
+    unadvised: advice from no bars would read as "no price data". It is also left as it is when
+    it was advised for a later session than the context's.
     """
     ctx = await get_context()
     if ctx is None or str(pos["symbol"]) not in ctx.panel.close.columns:
+        return pos
+    last = pos.get("last_action_on")
+    if last is not None and ctx.session.date() < pd.Timestamp(last).date():
+        # The job advised it for a later session than the cache holds (it ran elsewhere): advice
+        # on the older session would overwrite that, and the next nightly would walk from it.
+        log.info("swing.api.advice_skipped", symbol=str(pos["symbol"]), cached=str(ctx.session))
         return pos
     update = nightly_update({**pos, "last_action_on": None}, ctx, check_stop=check_stop)
     if not update.fields:
         return pos
     saved: dict[str, Any] = await store.update_position(pos["id"], update.fields)
     return saved
+
+
+_CREATE_LOCK = asyncio.Lock()
+"""Serialises "is there an open position in this symbol?" and the insert (one API process)."""
 
 
 async def _get_position(position_id: uuid.UUID) -> dict[str, Any]:
@@ -1276,20 +1305,21 @@ async def create_position(body: PositionIn) -> dict[str, Any]:
         raise _invalid("initial_stop", "give the stop, or the idea the trade came from")
     if stop >= body.entry_price:
         raise _invalid("initial_stop", "the stop must be below the entry price", stop)
-    if any(str(p["symbol"]).upper() == symbol for p in await store.list_positions("open")):
-        raise HTTPException(409, f"you already have an open position in {symbol}")
-    created = await store.create_position(
-        {
-            "symbol": symbol,
-            "opened_on": body.opened_on,
-            "entry_price": body.entry_price,
-            "shares": body.shares,
-            "initial_stop": stop,
-            "current_stop": stop,
-            "idea_id": body.idea_id,
-            "notes": body.notes,
-        }
-    )
+    async with _CREATE_LOCK:  # one open position per symbol: the check and the insert together
+        if any(str(p["symbol"]).upper() == symbol for p in await store.list_positions("open")):
+            raise HTTPException(409, f"you already have an open position in {symbol}")
+        created = await store.create_position(
+            {
+                "symbol": symbol,
+                "opened_on": body.opened_on,
+                "entry_price": body.entry_price,
+                "shares": body.shares,
+                "initial_stop": stop,
+                "current_stop": stop,
+                "idea_id": body.idea_id,
+                "notes": body.notes,
+            }
+        )
     return await _position_response(await _advise(created))
 
 
@@ -1318,19 +1348,41 @@ async def close_position(position_id: uuid.UUID, body: CloseIn) -> dict[str, Any
         raise HTTPException(409, f"position {position_id} is already closed")
     if body.closed_on < pos["opened_on"]:
         raise _invalid("closed_on", "a position can't close before it opened", str(body.closed_on))
+    fields, exit_price = await _on_todays_scale(pos, body.closed_on, body.exit_price)
+    pos = {**pos, **fields}
     entry, stop = float(pos["entry_price"]), float(pos["initial_stop"])
-    r_multiple = (body.exit_price - entry) / (entry - stop) if entry > stop else None
+    r_multiple = (exit_price - entry) / (entry - stop) if entry > stop else None
     closed = await store.update_position(
         position_id,
         {
+            **fields,
             "status": "closed",
             "closed_on": body.closed_on,
-            "exit_price": body.exit_price,
+            "exit_price": exit_price,
             "exit_reason": body.exit_reason,
             "r_multiple": r_multiple,
         },
     )
     return await _position_response(closed)
+
+
+async def _on_todays_scale(
+    pos: Mapping[str, Any], closed_on: date, exit_price: float
+) -> tuple[dict[str, float], float]:
+    """The position's rescaled prices (empty when no split) and the exit price, both on the
+    cached panel's adjusted scale, so the R of a trade across a split is on one scale.
+
+    The same split check the nightly job applies (:func:`~swing_engine.positions.split_ratio`):
+    the entry against the adjusted close on ``opened_on`` and the exit against the one on
+    ``closed_on``. Without a context, or for a symbol the cached panel lacks, both stay as given.
+    """
+    ctx = await get_context()
+    if ctx is None or str(pos["symbol"]) not in ctx.panel.close.columns:
+        return {}, exit_price
+    ratio = split_ratio(pos, ctx)
+    fields = rescaled(pos, ratio) if ratio != 1.0 else {}
+    sold = {"symbol": pos["symbol"], "opened_on": closed_on, "entry_price": exit_price}
+    return fields, exit_price * split_ratio(sold, ctx)
 
 
 # --- routes: track record ---------------------------------------------------------------------
@@ -1439,7 +1491,7 @@ async def telegram_test() -> dict[str, Any]:
     """Send one fixed test message to the configured Telegram chat; never raises."""
     delivery = await send_digest(TELEGRAM_TEST_TEXT)
     detail = str(redact_secrets(delivery.detail or ""))[:_SECRET_DETAIL_CHARS]
-    return {"ok": bool(delivery.ok), "detail": detail}
+    return _json({"ok": bool(delivery.ok), "detail": detail})
 
 
 # --- routes: run scan now ---------------------------------------------------------------------
@@ -1461,11 +1513,9 @@ class _JobIdRecorder:
         return getattr(self._inner, name)
 
     async def start_job(self, kind: str, session_date: date | None) -> uuid.UUID:
-        try:
-            self.job_id = await self._inner.start_job(kind, session_date)
-            return self.job_id
-        finally:
-            self.started.set()
+        self.job_id = await self._inner.start_job(kind, session_date)
+        self.started.set()  # only once the run is recorded: a failure ends the task instead
+        return self.job_id
 
 
 async def _manual_job(deps: JobDeps) -> dict[str, Any]:
@@ -1485,7 +1535,7 @@ def _finished(task: asyncio.Task[Any]) -> None:
         return
     exc = task.exception()
     if exc is not None and not isinstance(exc, job.JobBusy):
-        log.warning("swing.api.manual_scan_failed", error=job._reason(exc))
+        log.warning("swing.api.manual_scan_failed", error=safe_reason(exc))
 
 
 @router.post(
@@ -1506,7 +1556,7 @@ async def run_scan_now() -> Any:
         deps = make_swing_deps()
     except Exception as exc:
         return JSONResponse(
-            status_code=503, content={"detail": f"Can't start a scan: {job._reason(exc)}"}
+            status_code=503, content={"detail": f"Can't start a scan: {safe_reason(exc)}"}
         )
     recorder = _JobIdRecorder(deps.store)
     task = asyncio.create_task(
@@ -1519,16 +1569,25 @@ async def run_scan_now() -> Any:
         await asyncio.wait({task, started}, timeout=JOB_ID_WAIT_S, return_when="FIRST_COMPLETED")
     finally:
         started.cancel()
-    if recorder.job_id is None and task.done() and not task.cancelled():
+    if recorder.job_id is not None:
+        return _json({"job_id": str(recorder.job_id)})
+    if task.done() and not task.cancelled():
         error = task.exception()
         if isinstance(error, job.JobBusy):
             return JSONResponse(status_code=409, content={"detail": "a scan is already running"})
-        if error is not None:
-            reason = job._reason(error)
-            return JSONResponse(
-                status_code=503, content={"detail": f"The scan could not start: {reason}"}
-            )
-    return {"job_id": None if recorder.job_id is None else str(recorder.job_id)}
+        reason = "it ended before recording its run" if error is None else safe_reason(error)
+        return JSONResponse(
+            status_code=503, content=_json({"detail": f"The scan could not start: {reason}"})
+        )
+    # Still not recorded after the wait (the calendar or the database is slow). It is left to
+    # run: stopping it mid-insert could leave a run marked running forever.
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": "The scan has not started yet (the calendar or the database is slow); "
+            "check the system status before running it again."
+        },
+    )
 
 
 # --- routes: status ---------------------------------------------------------------------------

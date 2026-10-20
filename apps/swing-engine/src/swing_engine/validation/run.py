@@ -305,6 +305,14 @@ def _reports(repo: Path, family: str) -> list[tuple[Path, dict[str, Any]]]:
     return sorted(found, key=lambda pair: int(pair[1]["run_index"]))
 
 
+def family_reports(repo: Path, family: str) -> list[dict[str, Any]]:
+    """Every out-of-sample report of ``family``, oldest run first.
+
+    Raises :class:`ReportError` (a ``ValueError``) naming the first unreadable file.
+    """
+    return [report for _, report in _reports(repo, family)]
+
+
 def latest_report(repo: Path, family: str) -> dict[str, Any] | None:
     """The family's report with the highest ``run_index``; None before its first run, and also
     when any of its reports cannot be read (never raises)."""

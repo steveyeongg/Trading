@@ -51,7 +51,7 @@ from atlas_shared.logging import get_logger
 
 from swing_engine.calendar import ET, TradingCalendar
 from swing_engine.job import SCAN_DELAY_MINUTES as SCAN_DELAY_MINUTES  # one constant, shared
-from swing_engine.job import JobBusy, JobDeps, JobKind, _reason, run_job
+from swing_engine.job import JobBusy, JobDeps, JobKind, run_job, safe_reason
 
 log = get_logger("swing.scheduler")
 
@@ -163,7 +163,7 @@ async def swing_scheduler(
     try:
         built = make_deps()
     except Exception as exc:
-        reason = _reason(exc)
+        reason = safe_reason(exc)
         log.warning("swing.scheduler.disabled", error=reason)
         mark_disabled(f"Automatic scans are off: {reason}")
         return
@@ -276,7 +276,7 @@ async def _run(deps: JobDeps, kind: JobKind) -> Literal["ok", "failed", "busy"]:
         log.info("swing.scheduler.skipped", kind=kind, reason="a scan is already running")
         return "busy"
     except Exception as exc:
-        log.warning("swing.scheduler.run_failed", kind=kind, error=_reason(exc))
+        log.warning("swing.scheduler.run_failed", kind=kind, error=safe_reason(exc))
         log.debug("swing.scheduler.run_failed_trace", kind=kind, exc_info=True)
         return "failed"
     status = run.get("status")
@@ -287,7 +287,7 @@ async def _run(deps: JobDeps, kind: JobKind) -> Literal["ok", "failed", "busy"]:
 async def _wait_to_retry(what: str, exc: Exception, deps: JobDeps, sleep: Sleep) -> None:
     """Record that ``what`` went wrong (the database could not be reached, an unexpected error),
     then wait :data:`CALENDAR_RETRY`."""
-    reason = _reason(exc)
+    reason = safe_reason(exc)
     minutes = int(CALENDAR_RETRY.total_seconds() // 60)
     log.warning("swing.scheduler.paused", what=what, error=reason, retry_minutes=minutes)
     log.debug("swing.scheduler.paused_trace", what=what, exc_info=True)

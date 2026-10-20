@@ -68,6 +68,8 @@ KINDS = synthetic_kinds(PANEL)
 SESSION = PANEL.dates()[450].date()  # Thu 23 Sep 2021: an uptrend with ideas from both setups
 NEXT = PANEL.dates()[451].date()
 CTX = build_context(PANEL, KINDS, SESSION)
+PREV = PANEL.dates()[449].date()  # the session before
+CTX_PREV = build_context(PANEL, KINDS, PREV)
 SETUPS = [SetupSpec(BreakoutParams(), live=True), SetupSpec(PullbackParams(), live=False)]
 RESULT = run_scan(PANEL, KINDS, SESSION, RiskSettings(), SETUPS, ctx=CTX)
 NOW = datetime(2021, 9, 23, 21, 0, tzinfo=UTC)
@@ -166,6 +168,7 @@ class FakeStore:
         self.positions: dict[str, dict[str, Any]] = {}
         self.writes: list[tuple[str, dict[str, Any]]] = []
         self.calls: list[str] = []
+        self.slow = False  # yield to the loop inside the reads and writes (race tests)
         for p in positions:
             self._add(dict(p))
 
@@ -208,6 +211,8 @@ class FakeStore:
 
     async def list_positions(self, status: str | None) -> list[dict[str, Any]]:
         self.calls.append(f"list_positions:{status}")
+        if self.slow:
+            await asyncio.sleep(0.01)
         return [dict(p) for p in self.positions.values() if status in (None, p["status"])]
 
     async def get_position(self, position_id: Any) -> dict[str, Any] | None:
@@ -218,6 +223,8 @@ class FakeStore:
         unknown = set(row) - set(_POSITION_WRITABLE)
         if unknown:
             raise ValueError(f"a position has no writable column(s) {sorted(unknown)}")
+        if self.slow:
+            await asyncio.sleep(0.01)
         return self._add(dict(row))
 
     async def update_position(self, position_id: Any, fields: Mapping[str, Any]) -> dict:
@@ -304,6 +311,8 @@ class Api:
         self.loads: list[tuple[date | None, UniverseFilter, list[str]]] = []
         self.panel = PANEL
         monkeypatch.setattr(swing_routes, "_CACHE", swing_routes._Cache())
+        monkeypatch.setattr(swing_routes, "_CACHE_LOCK", asyncio.Lock())
+        monkeypatch.setattr(swing_routes, "_CREATE_LOCK", asyncio.Lock())
         monkeypatch.setattr(swing_routes, "_ASSETS", swing_routes._AssetNames())
         monkeypatch.setattr(swing_routes, "store", _Forward(self, "store"))
         monkeypatch.setattr(swing_routes, "bars_store", _Forward(self, "bars"))
@@ -525,18 +534,21 @@ def test_position_validation_422(api, over, field):
 
 
 def test_close_position_computes_r(api):
-    pid = _add_position(api, entry=100.0, stop=95.0, opened=SESSION - timedelta(days=14))
+    opened = SESSION - timedelta(days=14)
+    entry = float(PANEL.close.at[pd.Timestamp(opened), "S13"])  # on the panel's price scale
+    pid = _add_position(api, entry=entry, stop=entry * 0.95, opened=opened)
 
     response = api.client.post(
-        f"/v1/positions/{pid}/close", json={"closed_on": SESSION.isoformat(), "exit_price": 112.5}
+        f"/v1/positions/{pid}/close",
+        json={"closed_on": SESSION.isoformat(), "exit_price": entry * 1.125},
     )
 
     assert response.status_code == 200, response.text
     out = response.json()
     assert out["status"] == "closed" and out["closed_on"] == SESSION.isoformat()
-    assert out["exit_price"] == 112.5
-    assert out["r_multiple"] == pytest.approx((112.5 - 100.0) / (100.0 - 95.0)) == 2.5
-    assert api.store.positions[pid]["r_multiple"] == 2.5
+    assert out["exit_price"] == pytest.approx(entry * 1.125)
+    assert out["r_multiple"] == pytest.approx((1.125 - 1.0) / (1.0 - 0.95)) == 2.5
+    assert api.store.positions[pid]["r_multiple"] == pytest.approx(2.5)
 
 
 def test_settings_put_rejects_zero_risk(api):
@@ -1258,7 +1270,7 @@ def test_the_track_record_uses_in_sample_stats_before_any_report(api):
     api.store = FakeStore(scan=_scan_row())
 
     breakout = api.get("/v1/track-record").json()["families"][0]
-    idea = next(i for i in _today(api)["ideas"] if i["setup"] == "breakout")
+    idea = next(i for i in _today(api)["unproven"] if i["setup"] == "breakout")
 
     assert breakout["insample"]["n"] == chosen["n"] and breakout["oos"] is None
     assert breakout["versions"] == [
@@ -1335,6 +1347,7 @@ class _ClosingClient:
         self.closed = closed
 
     async def aclose(self) -> None:
+        await asyncio.sleep(0.05)  # an HTTP client's close awaits its connections
         self.closed.append("closed")
 
 
@@ -1462,3 +1475,218 @@ def test_the_routes_are_mounted_on_the_api():
         "/v1/scan/run",
         "/v1/system/status",
     } <= paths
+
+
+# ---------------------------------------------------------------------------- fix round 1
+
+
+def _failed_report(repo: Path, family: str = "breakout") -> None:
+    folder = repo / "ml" / "validation" / family
+    folder.mkdir(parents=True, exist_ok=True)
+    doc = {"family": family, "version": f"{family}-v1", "run_index": 1,
+           "freeze_date": "2026-09-30", "regime_filter": {"helps": True},
+           "ranking": {"rs_helps": True},
+           "verdict": {"passed": False, "failures": ["profit factor 1.05 < 1.20"]}}  # fmt: skip
+    (folder / f"{family}-v1.report.json").write_text(json.dumps(doc))
+
+
+def test_an_idea_scanned_live_whose_family_is_no_longer_live_is_unproven(api):
+    """I1: the scan stored breakout ideas as Live; the family's verdict today is Research only
+    (its rules or files changed since). The current verdict decides where an idea is shown."""
+    assert any(i.live and i.setup == "breakout" for i in RESULT.ideas)  # premise
+    _failed_report(api.repo)
+    api.store = FakeStore(scan=_scan_row())
+    swing_routes.set_context(CTX, UniverseFilter())
+
+    j = _today(api)
+
+    assert j["ideas"] == []
+    breakouts = [i for i in j["unproven"] if i["setup"] == "breakout"]
+    assert breakouts and not any(i["live"] for i in breakouts)
+    for i in breakouts:
+        assert i["track_record"]["verdict"] == "research"
+        assert i["track_record"]["verdict_text"].startswith("Research only:")
+    page = _stock(api, breakouts[0]["symbol"])
+    assert page["idea"]["live"] is False
+    assert (
+        page["idea"]["track_record"]["verdict_text"] == "Research only: profit factor 1.05 < 1.20"
+    )
+
+
+def test_the_cache_never_goes_back_to_an_earlier_session(api):
+    """I2 (a): a context for an earlier session never replaces a later one."""
+    swing_routes.set_context(CTX)
+    swing_routes.set_context(CTX_PREV, UniverseFilter())
+    assert swing_routes._CACHE.ctx is CTX
+
+
+async def test_a_warm_up_that_finishes_after_the_job_hands_over_does_not_win(api, monkeypatch):
+    """I2 (a), the race: the warm-up read the S-1 scan, the job handed over S while it built."""
+    api.store = FakeStore(scan={**_scan_row(), "session": PREV})
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_loader(as_of, universe, extra_symbols=()):
+        started.set()
+        await release.wait()
+        return PANEL, KINDS, as_of
+
+    monkeypatch.setattr(swing_routes, "loader", slow_loader)
+    warm = asyncio.create_task(swing_routes.warm_context())
+    await started.wait()
+    swing_routes.set_context(CTX)  # the job, done with session S
+    release.set()
+    await warm
+
+    assert swing_routes._CACHE.ctx is CTX
+    assert await swing_routes.get_context() is CTX
+
+
+def test_a_universe_change_during_a_job_never_leaves_an_older_session_cached(api, monkeypatch):
+    """I2 (b), the probe: Settings change the universe while a job runs, a request builds from
+    the S-1 scan, then the job's S context (old filters) is dropped. S-1 must not stay."""
+    monkeypatch.setattr(swing_routes.job, "is_running", lambda: True)
+    api.store = FakeStore(scan={**_scan_row(), "session": PREV})
+    body = {**SwingSettings().model_dump(), "min_price": 15.0}
+    assert api.client.put("/v1/settings", json=body).status_code == 200
+    assert api.get("/v1/positions").status_code == 200  # a lazy build, from the S-1 scan
+    assert swing_routes._CACHE.ctx is not None and swing_routes._CACHE.ctx.session.date() == PREV
+
+    swing_routes.set_context(CTX)  # the job's S context, built with the old filters: dropped
+
+    assert swing_routes._CACHE.ctx is None  # S-1 cleared too
+    api.store.scan = _scan_row()  # the job saved S before it handed its context over
+    assert api.get("/v1/positions").status_code == 200
+    assert swing_routes._CACHE.ctx.session.date() == SESSION
+    assert [load[0] for load in api.loads] == [PREV, SESSION]
+
+
+async def test_a_build_older_than_a_dropped_job_context_is_not_cached(api, monkeypatch):
+    """I2 (b): the lazy build was still running when the job's newer context was dropped."""
+    monkeypatch.setattr(swing_routes.job, "is_running", lambda: True)
+    api.store = FakeStore(scan={**_scan_row(), "session": PREV})
+    swing_routes.invalidate_context(during_job=True)
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_loader(as_of, universe, extra_symbols=()):
+        started.set()
+        await release.wait()
+        return PANEL, KINDS, as_of
+
+    monkeypatch.setattr(swing_routes, "loader", slow_loader)
+    build = asyncio.create_task(swing_routes.get_context())
+    await started.wait()
+    swing_routes.set_context(CTX)  # dropped: built with the old filters
+    release.set()
+
+    assert await build is None and swing_routes._CACHE.ctx is None  # S-1 refused
+
+
+def test_a_stale_cached_context_never_overwrites_newer_advice(api):
+    """I2 (c): the job (run from the CLI) advised the position for S; the API's cache is still at
+    S-1. Editing the stop must not write S-1 advice over it, which the next nightly would walk
+    from with the stop checked (a false stop hit)."""
+    swing_routes.set_context(CTX_PREV, UniverseFilter())
+    pid = _add_position(
+        api, entry=100.0, stop=90.0, opened=PANEL.dates()[440].date(), last_action="hold",
+        last_action_text="hold, stop 90.00", last_action_on=SESSION,
+    )  # fmt: skip
+
+    out = api.client.patch(f"/v1/positions/{pid}", json={"current_stop": 91.0}).json()
+
+    assert out["last_action_on"] == SESSION.isoformat()
+    assert out["last_action_text"] == "hold, stop 90.00" and out["current_stop"] == 91.0
+    assert api.store.writes == [(pid, {"current_stop": 91.0})]
+
+
+def test_run_scan_now_reports_a_job_that_could_not_record_its_run(api, monkeypatch):
+    """M1: never 202 without a job id. A database down at ``start_job`` is a readable 503."""
+    log: list[str] = []
+
+    class DownStore:
+        async def start_job(self, kind: str, session_date: date | None) -> uuid.UUID:
+            raise ConnectionRefusedError("[Errno 61] Connect call failed ('127.0.0.1', 5432)")
+
+    async def fake_run(deps: JobDeps, kind: str) -> dict[str, Any]:
+        await deps.store.start_job(kind, SESSION)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(swing_routes, "make_swing_deps", lambda: _fake_deps(log, DownStore()))
+    monkeypatch.setattr(swing_routes, "run_job", fake_run)
+
+    response = api.client.post("/v1/scan/run")
+
+    assert response.status_code == 503, response.text
+    assert "Connect call failed" in response.json()["detail"]
+
+
+async def test_two_concurrent_creates_for_one_symbol_give_one_position(api):
+    """M2: the one-open-position-per-symbol check and the insert are one step."""
+    import httpx
+
+    api.store.slow = True
+    transport = httpx.ASGITransport(app=api.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://atlas.test") as client:
+        first, second = await asyncio.gather(
+            client.post("/v1/positions", json=_position_body(opened_on=NEXT.isoformat())),
+            client.post("/v1/positions", json=_position_body(opened_on=NEXT.isoformat())),
+        )
+
+    assert sorted([first.status_code, second.status_code]) == [201, 409]
+    assert len(api.store.positions) == 1
+
+
+def test_a_failed_context_build_says_why_on_the_stock_page(api, monkeypatch):
+    """M3: with a scan stored, a failed build is not "no scan data"; the reason is redacted."""
+
+    async def broken(*args: Any, **kwargs: Any) -> Any:
+        raise ConnectionRefusedError("connection to postgresql://atlas:hunter2@db:5432 refused")
+
+    monkeypatch.setattr(swing_routes, "loader", broken)
+    api.store = FakeStore(scan=_scan_row())
+
+    response = api.get("/v1/stocks/S13")
+
+    detail = response.json()["detail"]
+    assert response.status_code == 503 and detail.startswith("Couldn't load scan data: ")
+    assert "hunter2" not in detail and "refused" in detail
+
+
+def test_closing_a_position_bought_before_a_split_gives_r_on_one_scale(api):
+    """M4: a 4:1 split between the purchase and the close, not yet rescaled by the nightly job.
+    The user paid 4x today's adjusted prices and sold at today's price."""
+    swing_routes.set_context(CTX, UniverseFilter())
+    opened, closed = PANEL.dates()[440], PANEL.dates()[448]
+    adjusted = float(PANEL.close.at[opened, "S13"])
+    entry, stop = 4 * adjusted, 4 * adjusted * 0.9  # the prices before the split
+    exit_price = float(PANEL.close.at[closed, "S13"])  # after it
+    pid = _add_position(api, entry=entry, stop=stop, opened=opened.date(), shares=10.0)
+
+    out = api.client.post(
+        f"/v1/positions/{pid}/close",
+        json={"closed_on": closed.date().isoformat(), "exit_price": exit_price},
+    ).json()
+
+    assert out["r_multiple"] == pytest.approx((exit_price - adjusted) / (adjusted * 0.1))
+    assert out["entry_price"] == pytest.approx(adjusted) and out["shares"] == pytest.approx(40.0)
+    assert out["initial_stop"] == pytest.approx(adjusted * 0.9)
+    assert out["exit_price"] == pytest.approx(exit_price)
+
+
+def test_the_stock_pages_dollar_volume_item_is_the_checklists_rule_3():
+    """M5: the stock page's single dollar-volume item is the checklist's rule 3 itself."""
+    from swing_engine.checklist import dollar_volume_rule, eligibility_checklist
+
+    universe = UniverseFilter()
+    assert (
+        dollar_volume_rule(CTX, "S13", universe) == eligibility_checklist(CTX, "S13", universe)[2]
+    )
+
+
+def test_open_risk_is_one_shared_rule():
+    from swing_engine.positions import open_risk
+
+    assert open_risk({"shares": 10.0, "entry_price": 100.0, "initial_stop": 90.0,
+                      "current_stop": 95.0}) == 50.0  # fmt: skip
+    assert open_risk({"shares": 4.0, "entry_price": 50.0, "initial_stop": 40.0,
+                      "current_stop": 55.0}) == 0.0  # fmt: skip
+    assert not hasattr(job, "_open_risk") and not hasattr(swing_routes, "_open_risk")

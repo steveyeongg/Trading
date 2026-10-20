@@ -91,7 +91,7 @@ from swing_engine.ingest import (
 )
 from swing_engine.loader import load_scan_inputs
 from swing_engine.panel import Panel
-from swing_engine.positions import Action, PositionUpdate, current_stop, nightly_update
+from swing_engine.positions import Action, PositionUpdate, nightly_update, open_risk
 from swing_engine.scan import (
     BENCHMARK,
     Idea,
@@ -295,8 +295,10 @@ def format_job(run: Mapping[str, Any]) -> str:
 # --- the run ---------------------------------------------------------------------------
 
 
-def _reason(exc: BaseException) -> str:
-    """An exception as one short line for the job log and the notice, with no secret in it."""
+def safe_reason(exc: BaseException) -> str:
+    """An exception as one short line for a log, a notice or an API error, with no secret in it:
+    its first line, the Alpaca and Telegram secrets from the environment and any bot token or URL
+    credential masked, at most 300 characters."""
     lines = [line.strip() for line in str(exc).splitlines() if line.strip()]
     text = lines[0] if lines else type(exc).__name__
     for name in _SECRET_ENV_VARS:
@@ -358,13 +360,13 @@ class _Run:
             self.calendar = await self.deps.calendar()
             self.target = self.calendar.last_completed_session(self.now, SCAN_DELAY_MINUTES)
         except Exception as exc:
-            failure = _Failure("calendar", _reason(exc))
+            failure = _Failure("calendar", safe_reason(exc))
         self.job_id = await self.store.start_job(self.kind, self.target)
         if failure is None:
             try:
                 self.settings = await self.store.get_settings()
             except Exception as exc:
-                failure = _Failure("settings", _reason(exc))
+                failure = _Failure("settings", safe_reason(exc))
         if failure is None:
             steps = (
                 self._assets,
@@ -398,7 +400,7 @@ class _Run:
         try:
             info = await work()
         except Exception as exc:
-            reason = _reason(exc)
+            reason = safe_reason(exc)
             self.steps[name] = {"status": "failed", "error": reason}
             log.debug("swing.job.step_failed", step=name, exc_info=True)
             return _Failure(name, reason)
@@ -433,7 +435,7 @@ class _Run:
         try:
             await self.store.update_job_steps(self.job_id, copy.deepcopy(self.steps))
         except Exception as exc:
-            log.warning("swing.job.progress_not_saved", error=_reason(exc))
+            log.warning("swing.job.progress_not_saved", error=safe_reason(exc))
 
     def persist_soon(self) -> None:
         """Save the step log from a synchronous callback, after any save still in flight."""
@@ -538,7 +540,7 @@ class _Run:
             try:
                 self.deps.on_context(ctx)
             except Exception as exc:
-                log.warning("swing.job.context_hook_failed", error=_reason(exc))
+                log.warning("swing.job.context_hook_failed", error=safe_reason(exc))
         return {
             "status": "ok",
             "sessions": [s.isoformat() for s in sessions],
@@ -619,7 +621,7 @@ class _Run:
             detail = _redact(delivery.detail)
             await self.store.mark_digest(self.target, FAILURE, delivery.ok, detail or None)
         except Exception as exc:
-            log.warning("swing.job.failure_notice_failed", error=_reason(exc))
+            log.warning("swing.job.failure_notice_failed", error=safe_reason(exc))
 
 
 class _Progress:
@@ -713,7 +715,9 @@ def _told(idea: Idea, part: str, write: Callable[..., str], *args: Any) -> str |
     try:
         return write(*args)
     except Exception as exc:
-        log.warning("swing.job.narration_failed", symbol=idea.symbol, part=part, error=_reason(exc))
+        log.warning(
+            "swing.job.narration_failed", symbol=idea.symbol, part=part, error=safe_reason(exc)
+        )
         return None
 
 
@@ -732,15 +736,10 @@ def _sessions_to_scan(cal: TradingCalendar, last_scanned: date | None, target: d
     return cal.sessions_between(last_scanned, target) or [target]
 
 
-def _open_risk(pos: Mapping[str, Any]) -> float:
-    """What a position still has at stake if it were stopped out now (never negative)."""
-    return float(pos["shares"]) * max(0.0, float(pos["entry_price"]) - current_stop(pos))
-
-
 def _book(positions: Sequence[Mapping[str, Any]], session: date) -> list[tuple[str, float]]:
     """``(symbol, open risk)`` of the positions already opened on ``session``."""
     return [
-        (str(p["symbol"]), _open_risk(p))
+        (str(p["symbol"]), open_risk(p))
         for p in positions
         if pd.Timestamp(p["opened_on"]).date() <= session
     ]

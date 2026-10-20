@@ -104,13 +104,7 @@ def eligibility_checklist(
             _dollars(price),
             _dollars(universe.min_price),
         ),
-        CheckItem(
-            f"{universe.dollar_volume_window}-day median dollar volume at least "
-            f"${universe.min_median_dollar_volume / 1e6:g}M",
-            median_dv >= universe.min_median_dollar_volume,
-            _millions(median_dv),
-            _millions(universe.min_median_dollar_volume),
-        ),
+        _dollar_volume(universe, median_dv),
         _daily_range(universe, atr_pct, pct),
         CheckItem(
             f"At least {universe.min_history_sessions} sessions of history",
@@ -163,6 +157,26 @@ def eligibility_checklist(
         ),
         _pullback(pp, close, rsi2, ema20),
     ]
+
+
+def dollar_volume_rule(ctx: ScanContext, symbol: str, universe: UniverseFilter) -> CheckItem:
+    """Rule 3 alone, the dollar-volume floor, judged on ``ctx.panel`` and ``ctx.session``.
+
+    The stock page uses it for a stock the cached panel lacks (below the liquidity prefilter),
+    with a context whose panel holds that stock's own stored bars on the market's sessions.
+    """
+    _, median_dv = _segment_stats(ctx, symbol, universe)
+    return _dollar_volume(universe, median_dv)
+
+
+def _dollar_volume(universe: UniverseFilter, median_dv: float) -> CheckItem:
+    return CheckItem(
+        f"{universe.dollar_volume_window}-day median dollar volume at least "
+        f"${universe.min_median_dollar_volume / 1e6:g}M",
+        median_dv >= universe.min_median_dollar_volume,
+        _millions(median_dv),
+        _millions(universe.min_median_dollar_volume),
+    )
 
 
 def _daily_range(universe: UniverseFilter, atr_pct: float, pct: str) -> CheckItem:

@@ -196,6 +196,12 @@ def current_stop(pos: Mapping[str, Any]) -> float:
     return float(pos["initial_stop"] if stop is None else stop)
 
 
+def open_risk(pos: Mapping[str, Any]) -> float:
+    """What a position still has at stake if it were stopped out now: ``shares x max(0, entry -
+    current stop)``, never negative (a stop raised above the entry risks nothing)."""
+    return float(pos["shares"]) * max(0.0, float(pos["entry_price"]) - current_stop(pos))
+
+
 def split_ratio(pos: Mapping[str, Any], ctx: ScanContext) -> float:
     """The factor from the price the user paid to tonight's adjusted prices, 1.0 for no split.
 
@@ -268,8 +274,9 @@ def walk_action(
     """Tonight's action and the stop to keep, after every session since the last advice.
 
     The rules of :func:`position_action` run on each session after ``last_action_on`` (none when
-    the position was never advised) and then on ``ctx.session``, all read from ``ctx``. A stop hit on an earlier session ends the walk and is the action, its text led by the
-    day (``Fri 16 Oct: stop hit, exit (stop 95.00)``). A stop raised on an earlier session carries
+    the position was never advised) and then on ``ctx.session``, all read from ``ctx``. A stop
+    hit on an earlier session ends the walk and is the action, its text led by the day
+    (``Fri 16 Oct: stop hit, exit (stop 95.00)``). A stop raised on an earlier session carries
     forward: if tonight would only hold, the action is to raise the stop to it, and a max-hold or
     no-data action names it too. With nothing to walk this is :func:`position_action` at the
     session. A raised stop is kept to the cent; the returned stop is the one to save (the stop
