@@ -19,6 +19,7 @@ dependencies = [
     "journal-service",
     "alert-service",
     "execution-service",
+    "swing-engine",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "httpx>=0.27",
@@ -41,6 +42,7 @@ portfolio-service = { workspace = true }
 journal-service = { workspace = true }
 alert-service = { workspace = true }
 execution-service = { workspace = true }
+swing-engine = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

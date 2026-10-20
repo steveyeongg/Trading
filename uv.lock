@@ -2604,6 +2604,7 @@ dependencies = [
     { name = "quant-engine" },
     { name = "risk-engine" },
     { name = "scoring-engine" },
+    { name = "swing-engine" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -2627,6 +2628,7 @@ requires-dist = [
     { name = "quant-engine", editable = "apps/quant-engine" },
     { name = "risk-engine", editable = "apps/risk-engine" },
     { name = "scoring-engine", editable = "apps/scoring-engine" },
+    { name = "swing-engine", editable = "apps/swing-engine" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
 ]
 

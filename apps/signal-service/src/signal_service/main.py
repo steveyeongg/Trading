@@ -14,11 +14,20 @@ import os
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from atlas_shared import get_logger, get_settings, load_env, setup_logging
 from atlas_shared import metrics as mx
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from swing_engine.data.alpaca import AlpacaData
+from swing_engine.job import JobDeps, live_deps
+from swing_engine.scheduler import (
+    disabled_reason,
+    mark_disabled,
+    scheduler_enabled,
+    swing_scheduler,
+)
 
 from signal_service.alert_routes import router as alert_router
 from signal_service.auth_dep import router as auth_router
@@ -61,6 +70,22 @@ async def _monitor_loop() -> None:
         raise
 
 
+def _repo_root() -> Path:
+    """The checkout this file lives in (where ``ml/validation`` is), else the working directory.
+
+    The swing job reads the setups' committed validation reports from here; a wrong root would
+    silently mark every setup unproven, so it does not depend on where the API was started.
+    """
+    root = Path(__file__).resolve().parents[4]
+    return root if (root / "ml").is_dir() else Path.cwd()
+
+
+def _make_swing_deps() -> JobDeps:
+    """The real dependencies of the swing scheduler. Raises (e.g. no Alpaca keys) when it cannot
+    build them; the scheduler task catches that and records why, so the API starts anyway."""
+    return live_deps(AlpacaData(), _repo_root())
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Bridge `.env` → os.environ before anything reads it. Fixes the provider
@@ -82,6 +107,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         tasks.append(asyncio.create_task(_monitor_loop()))
     else:
         log.info("monitor.disabled", reason="auto-execution opt-in; set ATLAS_ENABLE_AUTO_EXECUTION=1 to enable")
+    # Evaluated here, after load_env(), so ATLAS_DISABLE_SCHEDULER=1 works from `.env` too. The
+    # deps are built inside the task: a failure there is the scheduler's, never the API's.
+    if scheduler_enabled():
+        tasks.append(asyncio.create_task(swing_scheduler(_make_swing_deps)))
+        log.info("swing.scheduler.enabled")
+    else:
+        reason = disabled_reason() or "Automatic scans are off."
+        mark_disabled(reason)
+        log.info("swing.scheduler.disabled", reason=reason)
     try:
         yield
     finally:
