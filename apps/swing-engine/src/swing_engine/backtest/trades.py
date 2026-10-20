@@ -147,6 +147,23 @@ def _known_dates(
     return known
 
 
+def known_date_for(
+    index: pd.DatetimeIndex, exit_date: date | None, exit_reason: ExitReason | None
+) -> date | None:
+    """When one trade's exit became knowable (see the module docstring), or None while it is open.
+
+    The scalar form of the rule :func:`simulate_candidates` applies to its ``known_date`` column
+    (it calls the same code), for forward tracking. ``index`` is the panel's session index and
+    ``exit_date`` one of its sessions.
+    """
+    if exit_date is None:
+        return None
+    reason = exit_reason.value if exit_reason is not None else None
+    known = _known_dates(index, _dates([exit_date]), [reason])
+    when: date = pd.Timestamp(known[0]).date()
+    return when
+
+
 def simulate_candidates(
     panel: Panel,
     ind: Indicators,
