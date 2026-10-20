@@ -2730,6 +2730,7 @@ name = "swing-engine"
 version = "0.1.0"
 source = { editable = "apps/swing-engine" }
 dependencies = [
+    { name = "alert-service" },
     { name = "asyncpg" },
     { name = "atlas-shared" },
     { name = "backtest-service" },
@@ -2742,6 +2743,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "alert-service", editable = "apps/alert-service" },
     { name = "asyncpg", specifier = ">=0.29" },
     { name = "atlas-shared", editable = "packages/shared-py" },
     { name = "backtest-service", editable = "apps/backtest-service" },

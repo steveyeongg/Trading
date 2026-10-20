@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Rules-based daily swing-trading engine for US stocks (scan, rank, backtest)."
 requires-python = ">=3.12"
 dependencies = [
+    "alert-service",
     "atlas-shared",
     "backtest-service",
     "httpx>=0.27",
@@ -15,6 +16,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
+alert-service = { workspace = true }
 atlas-shared = { workspace = true }
 backtest-service = { workspace = true }
 

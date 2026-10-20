@@ -26,10 +26,17 @@ class TelegramChannel:
 
     name = "telegram"
 
-    def __init__(self, token: str | None = None, chat_id: str | None = None):
+    def __init__(
+        self,
+        token: str | None = None,
+        chat_id: str | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ):
         # Overrides take precedence — used by tests to inject fake creds.
         self._token_override = token
         self._chat_override = chat_id
+        # Tests pass an ``httpx.MockTransport`` so nothing ever reaches api.telegram.org.
+        self._transport = transport
 
     def _token(self) -> str | None:
         return self._token_override or os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -50,16 +57,30 @@ class TelegramChannel:
         return bool(self._token() and self._chat_id())
 
     async def send(self, *, title: str, body: str, payload: dict[str, Any]) -> DeliveryResult:
-        token, chat_id = self._token(), self._chat_id()
-        if not (token and chat_id):
+        if not self.available:  # before format_alert, as before: an unconfigured channel is inert
             return DeliveryResult(ok=False, detail="telegram not configured")
         # BLUEPRINT §12.3 — `format_alert` already emits the full title + body
         # in the spec'd layout (emoji header, trade plan, invalidation,
         # disclaimer). Send the body verbatim; the title is the first line.
         _, text = format_alert(payload)
+        return await self._post(text)
+
+    async def send_text(self, text: str) -> DeliveryResult:
+        """Send ``text`` as one plain message (no alert payload, no ``format_alert`` layout).
+
+        Same path as :meth:`send`: not-configured is a result, not a raise, and any error detail
+        is scrubbed by ``redact_secrets`` before it is logged or returned. Telegram rejects a
+        message over 4,096 characters, so the caller keeps it under that.
+        """
+        return await self._post(text)
+
+    async def _post(self, text: str) -> DeliveryResult:
+        token, chat_id = self._token(), self._chat_id()
+        if not (token and chat_id):
+            return DeliveryResult(ok=False, detail="telegram not configured")
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=10.0, transport=self._transport) as client:
                 r = await client.post(url, json={"chat_id": chat_id, "text": text})
                 r.raise_for_status()
             return DeliveryResult(ok=True, detail="sent")
