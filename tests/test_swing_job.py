@@ -13,6 +13,9 @@ digest. These tests pin what the review asked about:
 * **A step fails** (Alpaca down): the job is ``failed`` at that step with a reason that carries no
   secret, the later steps don't run, the previous scan stays as it was, and the failure notice is
   sent at most once per session.
+* **The API stays up while the job computes.** The CPU-bound steps (the per-session context and
+  scan, the idea tracking and the position walk) run in a worker thread, so the event loop that
+  serves the dashboard is not frozen for tens of seconds.
 * The controller's rulings: the context is built once per session and reused, open risk is
   ``shares x max(0, entry - current stop)``, the asset list is refreshed weekly, unservable symbols
   don't fail the bars step, positions are split-adjusted before their action, raised stops are
@@ -31,6 +34,8 @@ import copy
 import io
 import itertools
 import math
+import threading
+import time as clock_time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import redirect_stdout
@@ -1211,6 +1216,88 @@ def test_format_job_names_extra_steps_and_reasons():
     assert any(
         line.split() == ["digest", "skipped", "(already", "sent)"] for line in skipped.splitlines()
     )
+
+
+# ---------------------------------------------------------------------------- the event loop stays free
+
+
+def _where(real: Callable[..., Any], seen: list[tuple[bool, bool]]) -> Callable[..., Any]:
+    """``real`` wrapped to note, per call, whether it ran on the event loop and on the main thread."""
+
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            asyncio.get_running_loop()
+            on_loop = True
+        except RuntimeError:  # no running loop in this thread
+            on_loop = False
+        seen.append((on_loop, threading.current_thread() is threading.main_thread()))
+        return real(*args, **kwargs)
+
+    return wrapper
+
+
+@pytest.mark.parametrize("name", ["build_context", "run_scan", "track_ideas", "nightly_update"])
+async def test_cpu_bound_steps_run_off_the_event_loop(h, name):
+    """Each of these takes seconds on a real universe; run inline they would freeze the API."""
+    seen: list[tuple[bool, bool]] = []
+    h.monkeypatch.setattr(job, name, _where(getattr(job, name), seen))
+    h.store = FakeProductStore(
+        scanned=[WED],
+        positions=[_position("S03", TARGET - timedelta(days=30), 100.0, 90.0)],
+    )
+
+    run = await run_job(h.deps(), "catchup")
+
+    assert run["status"] == "ok"
+    assert seen, f"{name} was never called"
+    assert seen == [(False, False)] * len(seen)  # no running loop there, and not the main thread
+
+
+async def test_the_event_loop_keeps_ticking_while_a_session_is_scanned(h):
+    """A blocking scan must not stop other coroutines (the API's requests) from running."""
+    real = job.run_scan
+    ticks: list[float] = []
+    stop = asyncio.Event()
+
+    def slow_scan(*args: Any, **kwargs: Any) -> Any:
+        clock_time.sleep(0.3)  # stands in for seconds of pandas work
+        return real(*args, **kwargs)
+
+    async def heartbeat() -> None:
+        while not stop.is_set():
+            ticks.append(clock_time.monotonic())
+            await asyncio.sleep(0.01)
+
+    h.monkeypatch.setattr(job, "run_scan", slow_scan)
+    beat = asyncio.create_task(heartbeat())
+    try:
+        run = await run_job(h.deps(), "nightly")
+    finally:
+        stop.set()
+        await beat
+
+    assert run["status"] == "ok"
+    gaps = [b - a for a, b in itertools.pairwise(ticks)]
+    assert len(ticks) > 10 and max(gaps) < 0.2  # a blocked loop would show one gap of >= 0.3 s
+
+
+async def test_the_context_hook_still_gets_the_target_context_on_the_loop(h):
+    """``on_context`` is the API's cache setter: same ctx object, called from the event loop."""
+    where: list[bool] = []
+
+    def hook(ctx: ScanContext) -> None:
+        try:
+            asyncio.get_running_loop()
+            where.append(True)
+        except RuntimeError:
+            where.append(False)
+        h.contexts.append(ctx)
+
+    built = h.spy("build_context")
+    await run_job(h.deps(on_context=hook), "nightly")
+
+    assert where == [True]
+    assert h.contexts == [built[-1][2]]
 
 
 def test_the_test_panel_scans_monday_19_october_in_an_uptrend():

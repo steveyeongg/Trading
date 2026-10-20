@@ -20,6 +20,7 @@ prefilter.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, time
 from typing import Any
@@ -383,7 +384,8 @@ async def load_daily_bars(
         params["symbols"] = list(dict.fromkeys(symbols))
     async with session_scope() as session:
         rows = (await session.execute(statement, params)).all()
-    return _bars_frame(rows)
+    # Turning ~a million rows into a frame is sync pandas work: keep it off the event loop.
+    return await asyncio.to_thread(_bars_frame, rows)
 
 
 async def _load_columns(

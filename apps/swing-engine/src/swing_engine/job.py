@@ -35,6 +35,11 @@ was. The user gets one failure notice per session at most (when the digest is on
 always safe: scans are upserts that keep the first ``published_at``, tracking is a pure function
 of the bars, and the digest goes out once per session.
 
+The CPU-bound work (the per-session context and scan, the idea tracking and the position walk,
+and the loader's panel build) runs in a worker thread, so the event loop that serves the API is
+not frozen for the tens of seconds a full universe takes. Everything that touches the stores, the
+network or ``on_context`` stays on the loop.
+
 Only one job runs at a time in a process: :func:`run_job` raises :class:`JobBusy` instead of
 waiting. Every outside dependency (Alpaca, the calendar, both stores, Telegram, the bar loader and
 the clock) comes in through :class:`JobDeps`, so the whole job runs on fakes in tests. Nothing here
@@ -61,7 +66,7 @@ from atlas_shared.logging import get_logger
 
 from swing_engine import product_store, store
 from swing_engine.calendar import ET, TradingCalendar
-from swing_engine.config import UniverseFilter
+from swing_engine.config import RiskSettings, UniverseFilter
 from swing_engine.data.alpaca import AlpacaData
 from swing_engine.data.assets import AssetKind
 from swing_engine.digest import format_digest, format_failure, send_digest
@@ -80,9 +85,10 @@ from swing_engine.ingest import (
 )
 from swing_engine.loader import load_scan_inputs
 from swing_engine.panel import Panel
-from swing_engine.positions import Action, current_stop, nightly_update
+from swing_engine.positions import Action, PositionUpdate, current_stop, nightly_update
 from swing_engine.scan import (
     BENCHMARK,
+    RankBy,
     ScanContext,
     ScanResult,
     SetupSpec,
@@ -489,27 +495,26 @@ class _Run:
         held = sorted({str(p["symbol"]) for p in positions})
         panel, kinds, _ = await self.deps.loader(target, universe, extra_symbols=held)
 
-        ctx: ScanContext | None = None
-        result: ScanResult | None = None
+        scanned: tuple[ScanContext, ScanResult] | None = None
         for session in sessions:
-            ctx = build_context(panel, kinds, session, universe)
-            result = run_scan(
+            scanned = await asyncio.to_thread(
+                _scan_session,
                 panel,
                 kinds,
                 session,
+                universe,
                 risk,
                 setups,
                 _book(positions, session),
-                universe=universe,
-                rank_by=rank_by,
-                ctx=ctx,
+                rank_by,
             )
             ideas_for = cal.next_session(session)
             saved_at = self.deps.now()  # the moment they are published, not the run's start
             await self.store.save_scan(
-                result, ideas_for, saved_at, not is_live(saved_at, ideas_for)
+                scanned[1], ideas_for, saved_at, not is_live(saved_at, ideas_for)
             )
-        assert ctx is not None and result is not None  # sessions always ends with the target
+        assert scanned is not None  # sessions always ends with the target
+        ctx, result = scanned
         self.tonight = _Tonight(cal, sessions, setups, ctx, result)
         if self.deps.on_context is not None:
             try:
@@ -528,7 +533,9 @@ class _Run:
         assert self.tonight is not None
         ideas = await self.store.trackable_ideas()
         delisted = _inactive(await self.deps.bars_store.load_assets())
-        rows = track_ideas(ideas, self.tonight.ctx, delisted, self.deps.repo)
+        rows = await asyncio.to_thread(
+            track_ideas, ideas, self.tonight.ctx, delisted, self.deps.repo
+        )
         # price_scale says how the published levels were rescaled; it is not a stored column.
         await self.store.update_idea_tracks(
             [{k: v for k, v in row.items() if k != "price_scale"} for row in rows]
@@ -542,7 +549,7 @@ class _Run:
     async def _positions(self) -> dict[str, Any]:
         assert self.tonight is not None and self.target is not None
         positions = await self.store.list_positions("open")
-        updates = [nightly_update(pos, self.tonight.ctx) for pos in positions]
+        updates = await asyncio.to_thread(_walk_positions, positions, self.tonight.ctx)
         for pos, update in zip(positions, updates, strict=True):
             if update.fields:
                 await self.store.update_position(pos["id"], update.fields)
@@ -629,6 +636,39 @@ def _ingest_info(mode: str, result: IngestResult) -> dict[str, Any]:
         "refetched": list(result.refetched),
         "failed": list(result.failed),
     }
+
+
+def _scan_session(
+    panel: Panel,
+    kinds: Mapping[str, AssetKind],
+    session: date,
+    universe: UniverseFilter,
+    risk: RiskSettings,
+    setups: Sequence[SetupSpec],
+    book: Sequence[tuple[str, float]],
+    rank_by: RankBy,
+) -> tuple[ScanContext, ScanResult]:
+    """One session's context and scan: pure pandas work, run in a worker thread."""
+    ctx = build_context(panel, kinds, session, universe)
+    result = run_scan(
+        panel,
+        kinds,
+        session,
+        risk,
+        setups,
+        book,
+        universe=universe,
+        rank_by=rank_by,
+        ctx=ctx,
+    )
+    return ctx, result
+
+
+def _walk_positions(
+    positions: Sequence[Mapping[str, Any]], ctx: ScanContext
+) -> list[PositionUpdate]:
+    """Tonight's update for each open position (no store access), run in a worker thread."""
+    return [nightly_update(pos, ctx) for pos in positions]
 
 
 def _sessions_to_scan(cal: TradingCalendar, last_scanned: date | None, target: date) -> list[date]:

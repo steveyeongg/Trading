@@ -15,10 +15,12 @@ synthetic universe of 40 trending stocks plus SPY (``synthetic_universe_panel``)
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import io
 import json
-from contextlib import redirect_stdout
+import threading
+from contextlib import asynccontextmanager, redirect_stdout
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -843,3 +845,57 @@ def test_format_scan_watch_only_section_shows_zero_shares():
     assert "DOWNTREND" in head and "No ideas" in head and "TSLA" not in head
     row = next(line for line in tail.splitlines() if " TSLA " in line).split()
     assert row[:8] == ["1", "TSLA", "pullback", "200.00", "190.00", "0", "0", "88"]
+
+
+def _ran_off_the_loop(real, seen):
+    """``real`` wrapped to note whether each call ran with an event loop running in its thread."""
+
+    def wrapper(*args, **kwargs):
+        try:
+            asyncio.get_running_loop()
+            on_loop = True
+        except RuntimeError:  # no running loop in this thread
+            on_loop = False
+        seen.append((on_loop, threading.current_thread() is threading.main_thread()))
+        return real(*args, **kwargs)
+
+    return wrapper
+
+
+async def test_the_loader_builds_the_panel_off_the_event_loop(monkeypatch):
+    """The pivot of ~550 sessions x thousands of symbols is seconds of pandas: not on the loop
+    that serves the API while the nightly job loads its bars."""
+    from swing_engine import loader
+
+    _FakeStore(monkeypatch)
+    seen: list[tuple[bool, bool]] = []
+    monkeypatch.setattr(loader, "build_panel", _ran_off_the_loop(loader.build_panel, seen))
+
+    panel, _, session = await loader.load_scan_inputs(AS_OF, UniverseFilter())
+
+    assert session == AS_OF and panel.dates()[-1] == D
+    assert seen == [(False, False)]
+
+
+async def test_the_store_builds_the_bar_frame_off_the_event_loop(monkeypatch):
+    """Turning a million database rows into a frame is sync pandas work after the query's await."""
+    seen: list[tuple[bool, bool]] = []
+    monkeypatch.setattr(store, "_bars_frame", _ran_off_the_loop(store._bars_frame, seen))
+
+    class _Result:
+        def all(self):
+            return []
+
+    class _Session:
+        async def execute(self, *_args, **_kwargs):
+            return _Result()
+
+    @asynccontextmanager
+    async def fake_session_scope():
+        yield _Session()
+
+    monkeypatch.setattr(store, "session_scope", fake_session_scope)
+
+    frame = await store.load_daily_bars(["SPY"], AS_OF - timedelta(days=5), AS_OF)
+
+    assert frame.empty and seen == [(False, False)]

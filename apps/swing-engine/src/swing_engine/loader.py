@@ -3,11 +3,14 @@
 :func:`load_scan_inputs` reads the database only (never the network): the asset kinds, then the
 adjusted and raw daily bars of the liquid stocks plus SPY for a window ending on the scan session,
 built into a :class:`~swing_engine.panel.Panel`. The window is long enough for every rolling
-calculation the scan makes (a 252-session relative strength needs about a year of rows).
+calculation the scan makes (a 252-session relative strength needs about a year of rows). The
+pivot into the panel is seconds of pandas work on a full universe, so it runs in a worker thread
+and the event loop (the API's requests) stays free.
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 from datetime import date, timedelta
 
@@ -58,4 +61,5 @@ async def load_scan_inputs(
             f"no daily bars stored for {start} to {as_of}: run `python -m swing_engine backfill`"
         )
     raw = await store.load_daily_bars(symbols, start, as_of, resolution=store.RAW_DAILY)
-    return build_panel(bars, raw_bars=raw), _kinds(assets), as_of
+    panel = await asyncio.to_thread(build_panel, bars, raw_bars=raw)
+    return panel, _kinds(assets), as_of
