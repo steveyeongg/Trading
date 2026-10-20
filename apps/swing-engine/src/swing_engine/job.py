@@ -1,8 +1,10 @@
 """The nightly job: after each close, bring the data up to date, scan, track, advise, tell the user.
 
 :func:`run_job` is the one orchestrator behind the after-close schedule, the startup catch-up, the
-"Run scan now" button and ``python -m swing_engine job``. Its target is the last completed
-session (the close plus the 16 minutes Alpaca's free plan holds SIP data back). It runs
+"Run scan now" button and ``python -m swing_engine job``. Its target is the last session whose
+close is at least :data:`SCAN_DELAY_MINUTES` (45) ago, the nightly's own time: Alpaca's free plan
+serves the bar 16 minutes after the close, but a run before the scan time (a manual or catch-up
+run at 16:20) must not publish or digest tonight on bars that are not settled yet. It runs
 :data:`STEPS` in order and records each in the job's ``swing_job_runs`` row as it goes:
 
 1. ``assets``: re-fetch Alpaca's active and inactive asset lists when the last run that refreshed
@@ -21,12 +23,16 @@ session (the close plus the 16 minutes Alpaca's free plan holds SIP data back). 
    handed to ``JobDeps.on_context`` (the API's cache). A session's book holds only the positions
    opened by then. The ideas of a session are for the next one; they are ``reconstructed`` when
    that session had already opened at the moment they are saved (a catch-up after the Mac slept,
-   or a slow run), so they never count toward the live record.
+   or a slow run), so they never count toward the live record. Each idea is stored with its
+   narration (``why`` it was picked and what ``cancels`` it, :mod:`swing_engine.narrate`, with
+   the setup's pre-registered parameters) in the scan payload, so the dashboard's Today page
+   never needs a context; an idea the templates cannot narrate is stored with nulls.
 4. ``tracking``: every pending or open idea, watch-only ones included, re-simulated to the target.
 5. ``positions``: :func:`~swing_engine.positions.nightly_update` for each open position: split
    adjustment, then the rules walked over every session since its last advice, so a stop hit on
-   a missed day is reported instead of tonight's hold. A position already advised for the target
-   keeps its stored action, so running a session twice says the same thing.
+   a missed day is reported instead of tonight's hold (a position never advised is judged on the
+   target alone). A position already advised for the target keeps its stored action, so running
+   a session twice says the same thing.
 6. ``digest``: one Telegram digest per session, only when the user has it on.
 
 A failed step records ``{"status": "failed", "error": <reason>}`` (first line only, secrets
@@ -64,9 +70,9 @@ import pandas as pd
 from alert_service.channels.base import DeliveryResult, redact_secrets
 from atlas_shared.logging import get_logger
 
-from swing_engine import product_store, store
+from swing_engine import narrate, product_store, store
 from swing_engine.calendar import ET, TradingCalendar
-from swing_engine.config import RiskSettings, UniverseFilter
+from swing_engine.config import RiskSettings, SetupParams, UniverseFilter
 from swing_engine.data.alpaca import AlpacaData
 from swing_engine.data.assets import AssetKind
 from swing_engine.digest import format_digest, format_failure, send_digest
@@ -88,6 +94,7 @@ from swing_engine.panel import Panel
 from swing_engine.positions import Action, PositionUpdate, current_stop, nightly_update
 from swing_engine.scan import (
     BENCHMARK,
+    Idea,
     RankBy,
     ScanContext,
     ScanResult,
@@ -98,6 +105,7 @@ from swing_engine.scan import (
 )
 from swing_engine.settings import SwingSettings
 from swing_engine.tracking import is_live, track_ideas
+from swing_engine.validation.protocol import DEFAULT_PARAMS
 from swing_engine.validation.run import ranking_choice
 
 log = get_logger("swing.job")
@@ -108,8 +116,11 @@ STEPS = ("assets", "bars", "scan", "tracking", "positions", "digest")
 JobKind = Literal["nightly", "catchup", "manual"]
 _KINDS = ("nightly", "catchup", "manual")
 
-SETTLE_MINUTES = 16
-"""A session is complete this long after its close (Alpaca's free plan delays SIP data 15)."""
+SCAN_DELAY_MINUTES = 45
+"""A session is scanned this long after its close: the nightly runs then, and the job's target is
+the last session this long past its close, so every run reads settled bars. Alpaca's free plan
+serves the day's bar 16 minutes after the close; the rest is margin for late corrections. The
+scheduler uses this same constant."""
 
 ASSET_REFRESH_EVERY = timedelta(days=7)
 """How old the last asset-list refresh may be before the job fetches the lists again."""
@@ -130,7 +141,12 @@ class ProductStore(Protocol):
     async def get_settings(self) -> SwingSettings: ...
 
     async def save_scan(
-        self, scan: ScanResult, target_session: date, published_at: datetime, reconstructed: bool
+        self,
+        scan: ScanResult,
+        target_session: date,
+        published_at: datetime,
+        reconstructed: bool,
+        narration: product_store.Narration | None = None,
     ) -> None: ...
 
     async def latest_scan(self) -> dict[str, Any] | None: ...
@@ -340,7 +356,7 @@ class _Run:
         failure: _Failure | None = None
         try:
             self.calendar = await self.deps.calendar()
-            self.target = self.calendar.last_completed_session(self.now, SETTLE_MINUTES)
+            self.target = self.calendar.last_completed_session(self.now, SCAN_DELAY_MINUTES)
         except Exception as exc:
             failure = _Failure("calendar", _reason(exc))
         self.job_id = await self.store.start_job(self.kind, self.target)
@@ -497,7 +513,8 @@ class _Run:
 
         scanned: tuple[ScanContext, ScanResult] | None = None
         for session in sessions:
-            scanned = await asyncio.to_thread(
+            ideas_for = cal.next_session(session)
+            ctx, result, narration = await asyncio.to_thread(
                 _scan_session,
                 panel,
                 kinds,
@@ -507,11 +524,12 @@ class _Run:
                 setups,
                 _book(positions, session),
                 rank_by,
+                ideas_for,
             )
-            ideas_for = cal.next_session(session)
+            scanned = ctx, result
             saved_at = self.deps.now()  # the moment they are published, not the run's start
             await self.store.save_scan(
-                scanned[1], ideas_for, saved_at, not is_live(saved_at, ideas_for)
+                result, ideas_for, saved_at, not is_live(saved_at, ideas_for), narration=narration
             )
         assert scanned is not None  # sessions always ends with the target
         ctx, result = scanned
@@ -647,8 +665,9 @@ def _scan_session(
     setups: Sequence[SetupSpec],
     book: Sequence[tuple[str, float]],
     rank_by: RankBy,
-) -> tuple[ScanContext, ScanResult]:
-    """One session's context and scan: pure pandas work, run in a worker thread."""
+    ideas_for: date,
+) -> tuple[ScanContext, ScanResult, dict[tuple[str, str], dict[str, str | None]]]:
+    """One session's context, scan and narration: pure pandas work, run in a worker thread."""
     ctx = build_context(panel, kinds, session, universe)
     result = run_scan(
         panel,
@@ -661,7 +680,41 @@ def _scan_session(
         rank_by=rank_by,
         ctx=ctx,
     )
-    return ctx, result
+    return ctx, result, _narration(result, ctx, ideas_for, setups)
+
+
+def _family(params: SetupParams) -> str | None:
+    """The setup family ``params`` belong to (``breakout``, ``pullback``), or None."""
+    return next((f for f, d in DEFAULT_PARAMS.items() if type(params) is type(d)), None)
+
+
+def _narration(
+    result: ScanResult, ctx: ScanContext, ideas_for: date, setups: Sequence[SetupSpec]
+) -> dict[tuple[str, str], dict[str, str | None]]:
+    """``why`` and ``cancels`` for every idea and watch-only idea, keyed ``(symbol, setup)``.
+
+    Each uses the parameters its setup was scanned with (the pre-registered ones). Narration is
+    copy, never the trade decision: a template that fails leaves that text None and is logged.
+    """
+    params = {_family(spec.params): spec.params for spec in setups}
+    out: dict[tuple[str, str], dict[str, str | None]] = {}
+    for idea in (*result.ideas, *result.watch_only):
+        p = params.get(idea.setup)
+        cancels = None if p is None else _told(idea, "cancels", narrate.cancels, idea, ideas_for, p)
+        out[(idea.symbol, idea.setup)] = {
+            "why": _told(idea, "why", narrate.why, idea, ctx, p),
+            "cancels": cancels,
+        }
+    return out
+
+
+def _told(idea: Idea, part: str, write: Callable[..., str], *args: Any) -> str | None:
+    """``write(*args)``, or None (logged) when the template cannot be filled for ``idea``."""
+    try:
+        return write(*args)
+    except Exception as exc:
+        log.warning("swing.job.narration_failed", symbol=idea.symbol, part=part, error=_reason(exc))
+        return None
 
 
 def _walk_positions(

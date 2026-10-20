@@ -44,12 +44,15 @@ position, built on :func:`position_action`:
 * A position bought before a split is first rescaled to the adjusted prices the bars use
   (:func:`split_ratio`, :func:`rescaled`); the bars are restated after every split, the price the
   user paid is not, and without this a 4:1 split reads as a stop hit.
-* The rules are then walked over every session since the position was last advised (from the day
-  it was opened when it never was), oldest first, all from tonight's context
-  (:func:`walk_action`). A stop hit on a day the job did not run (the Mac slept, or a run failed)
-  is the action, led by that day, instead of tonight's hold; a stop raised on such a day carries
-  into tonight and is told even when tonight would only hold. Raised stops are kept to the cent,
-  the stop the user is told.
+* The rules are then walked over every session since the position was last advised, oldest
+  first, all from tonight's context (:func:`walk_action`). A stop hit on a day the job did not run
+  (the Mac slept, or a run failed) is the action, led by that day, instead of tonight's hold; a
+  stop raised on such a day carries into tonight and is told even when tonight would only hold.
+  Raised stops are kept to the cent, the stop the user is told.
+* A position never advised (``last_action_on`` None, a trade just recorded) is judged on
+  tonight's session alone, with no walk back to ``opened_on``: the user records the stop as it is
+  today, and testing it against the lows since the open would report stop hits from before ATLAS
+  knew of the position.
 """
 
 from __future__ import annotations
@@ -242,14 +245,16 @@ def _to_the_cent(action: Action) -> Action:
 
 
 def _unadvised_sessions(pos: Mapping[str, Any], ctx: ScanContext) -> list[pd.Timestamp]:
-    """The context's sessions before tonight that the position has not been advised for yet."""
+    """The context's sessions before tonight that the position has not been advised for yet.
+
+    None for a position never advised: it is judged on tonight alone (see the module docstring).
+    """
+    last = pos.get("last_action_on")
+    if last is None:
+        return []
     d = pd.Timestamp(ctx.session).normalize()
     days = pd.DatetimeIndex(ctx.panel.close.index)
-    last = pos.get("last_action_on")
-    if last is not None:
-        after = days > pd.Timestamp(last).normalize()
-    else:
-        after = days >= pd.Timestamp(pos["opened_on"]).normalize()
+    after = days > pd.Timestamp(last).normalize()
     return [s for s in days[after] if s < d]
 
 
@@ -258,9 +263,8 @@ def walk_action(
 ) -> tuple[Action, float]:
     """Tonight's action and the stop to keep, after every session since the last advice.
 
-    The rules of :func:`position_action` run on each session after ``last_action_on`` (or from
-    ``opened_on`` when the position was never advised) and then on ``ctx.session``, all read from
-    ``ctx``. A stop hit on an earlier session ends the walk and is the action, its text led by the
+    The rules of :func:`position_action` run on each session after ``last_action_on`` (none when
+    the position was never advised) and then on ``ctx.session``, all read from ``ctx``. A stop hit on an earlier session ends the walk and is the action, its text led by the
     day (``Fri 16 Oct: stop hit, exit (stop 95.00)``). A stop raised on an earlier session carries
     forward: if tonight would only hold, the action is to raise the stop to it, and a max-hold or
     no-data action names it too. With nothing to walk this is :func:`position_action` at the

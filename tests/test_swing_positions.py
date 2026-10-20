@@ -599,10 +599,10 @@ def test_with_a_real_atr_the_nightly_stop_is_never_above_the_model_stop():
 #
 # ``nightly_update`` is what the job stores for each open position after a close: the position is
 # rescaled first if a split happened since it was bought, then the rules above are walked over every
-# session since it was last advised (``last_action_on``, or from ``opened_on``), so a stop hit on a
-# day the Mac slept through is reported instead of tonight's hold. A position already advised for
-# this session is left as it is: a second run of the same session must say the same thing, not
-# test tonight's low against the stop the first run raised.
+# session since it was last advised (``last_action_on``; a position never advised is judged on the
+# scan day alone), so a stop hit on a day the Mac slept through is reported instead of tonight's
+# hold. A position already advised for this session is left as it is: a second run of the same
+# session must say the same thing, not test tonight's low against the stop the first run raised.
 
 
 def test_the_raise_text_is_the_one_position_action_uses():
@@ -671,10 +671,19 @@ def test_the_walk_starts_after_the_last_advice_not_on_it():
     assert act.kind is ActionKind.HOLD  # day 2 was already advised
 
 
-def test_a_position_never_advised_is_walked_from_its_open_day():
+def test_a_position_never_advised_is_judged_on_the_scan_day_only():
+    """Ruling (Task 8): no walk back to ``opened_on``. The user records the stop as it is today,
+    so testing it against the lows since the open would report a stop hit (Wed 3 Jan here) from
+    before ATLAS knew of the position. The walk starts once it has been advised."""
     bars = [_bar(100), _bar(100, low=94.0), _bar(100), _bar(100)]
-    act, _ = _walked(bars)
-    assert act.text == "Wed 3 Jan: stop hit, exit (stop 95.00)"
+    act, stop = _walked(bars)
+    assert act == Action("pos-1", "ABC", ActionKind.HOLD, 95.0, "hold, stop 95.00")
+    assert stop == 95.0
+
+
+def test_a_never_advised_position_still_meets_the_stop_on_the_scan_day():
+    act, _ = _walked([_bar(100), _bar(100), _bar(100, low=94.0)])
+    assert act == Action("pos-1", "ABC", ActionKind.STOP_HIT, 95.0, "stop hit, exit (stop 95.00)")
 
 
 def test_a_stop_raised_on_an_earlier_day_carries_and_is_told_even_if_tonight_holds():

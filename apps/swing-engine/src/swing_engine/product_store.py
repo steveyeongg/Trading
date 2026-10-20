@@ -368,6 +368,26 @@ async def put_settings(settings: SwingSettings) -> SwingSettings:
 # --- scans and ideas -------------------------------------------------------------------
 
 
+Narration = Mapping[tuple[str, str], Mapping[str, str | None]]
+"""Per ``(symbol, setup)``, the idea's ``why`` and ``cancels`` text (:mod:`swing_engine.narrate`)."""
+
+_NARRATION_KEYS = ("why", "cancels")
+
+
+def scan_payload(scan: ScanResult, narration: Narration | None = None) -> dict[str, Any]:
+    """The JSON payload stored with a scan: :func:`~swing_engine.scan.scan_to_dict`, plus, when
+    ``narration`` is given, ``why`` and ``cancels`` on every idea and watch-only idea (None for an
+    idea it does not cover), so a reader of the stored scan needs no ``ScanContext`` for them."""
+    payload = scan_to_dict(scan)
+    if narration is None:
+        return payload
+    for key in ("ideas", "watch_only"):
+        for row in payload[key]:
+            text = narration.get((str(row["symbol"]), str(row["setup"]))) or {}
+            row.update({k: text.get(k) for k in _NARRATION_KEYS})
+    return payload
+
+
 def _idea_params(
     scan: ScanResult,
     target_session: date,
@@ -401,7 +421,11 @@ def _idea_params(
 
 
 async def save_scan(
-    scan: ScanResult, target_session: date, published_at: datetime, reconstructed: bool
+    scan: ScanResult,
+    target_session: date,
+    published_at: datetime,
+    reconstructed: bool,
+    narration: Narration | None = None,
 ) -> None:
     """Store a scan and its ideas (the ranked ones and the watch-only ones) in one transaction.
 
@@ -409,7 +433,8 @@ async def save_scan(
     again updates the scan and refreshes each idea's sizing, rank and live flag, but keeps the
     first ``published_at`` and ``reconstructed`` (and any tracking already written), so a repeat
     run, a manual run or a catch-up leaves one set of ideas per ``(session, symbol, setup)``.
-    ``published_at`` must be timezone-aware.
+    ``published_at`` must be timezone-aware. ``narration`` goes into the payload only
+    (:func:`scan_payload`).
     """
     if published_at.tzinfo is None:
         raise ValueError("published_at must be timezone-aware")
@@ -420,7 +445,7 @@ async def save_scan(
         "breadth": _num(scan.breadth),
         "universe_size": int(scan.universe_size),
         "reconstructed": reconstructed,
-        "payload": _dumps(scan_to_dict(scan)),
+        "payload": _dumps(scan_payload(scan, narration)),
     }
     rows = [
         _idea_params(scan, target_session, published_at, reconstructed, idea, watch_only=parked)

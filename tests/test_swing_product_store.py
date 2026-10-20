@@ -434,6 +434,41 @@ async def test_save_scan_writes_ideas_and_watch_only_with_flags_and_one_payload(
         assert r["published_at"] == FIRST_PUBLISH and r["reconstructed"] is True
 
 
+async def test_save_scan_stores_the_narration_with_each_idea_in_the_payload(fake_db):
+    """PR13: the job narrates each idea at save time (it holds the context and the
+    pre-registered params) so Today reads ``why``/``cancels`` from the stored scan."""
+    first, second, parked = _idea("ZZTEST1"), _idea("ZZTEST2", "pullback"), _idea("ZZTEST3")
+    scan = _scan([first, second], [parked])
+    narration = {
+        ("ZZTEST1", "breakout"): {"why": "ZZTEST1 is in a long-term uptrend.", "cancels": "No."},
+        ("ZZTEST3", "breakout"): {"why": "ZZTEST3 is parked.", "cancels": None},
+    }
+    await save_scan(scan, TARGET, FIRST_PUBLISH, reconstructed=False, narration=narration)
+
+    payload = json.loads(fake_db.calls[0][1]["payload"])
+    assert [(r["symbol"], r["why"], r["cancels"]) for r in payload["ideas"]] == [
+        ("ZZTEST1", "ZZTEST1 is in a long-term uptrend.", "No."),
+        ("ZZTEST2", None, None),  # not narrated: null, never a missing key
+    ]
+    assert [(r["why"], r["cancels"]) for r in payload["watch_only"]] == [
+        ("ZZTEST3 is parked.", None)
+    ]
+    plain = {
+        **payload,
+        **{
+            key: [{k: v for k, v in r.items() if k not in ("why", "cancels")} for r in payload[key]]
+            for key in ("ideas", "watch_only")
+        },
+    }
+    assert plain == scan_to_dict(scan)
+
+
+def test_scan_payload_without_narration_is_the_plain_scan():
+    scan = _scan([_idea("ZZTEST1")])
+    assert product_store.scan_payload(scan) == scan_to_dict(scan)
+    assert "why" not in product_store.scan_payload(scan)["ideas"][0]
+
+
 async def test_save_scan_with_no_ideas_still_stores_the_scan(fake_db):
     await save_scan(_scan([]), TARGET, FIRST_PUBLISH, reconstructed=False)
     assert [s for s, _ in fake_db.calls] == [_UPSERT_SCAN_SQL]

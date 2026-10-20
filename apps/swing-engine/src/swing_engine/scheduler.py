@@ -50,12 +50,10 @@ from typing import Any, Literal
 from atlas_shared.logging import get_logger
 
 from swing_engine.calendar import ET, TradingCalendar
+from swing_engine.job import SCAN_DELAY_MINUTES as SCAN_DELAY_MINUTES  # one constant, shared
 from swing_engine.job import JobBusy, JobDeps, JobKind, _reason, run_job
 
 log = get_logger("swing.scheduler")
-
-SCAN_DELAY_MINUTES = 45
-"""A session is scanned this long after its close (the job needs the final SIP bars)."""
 
 MAX_SLEEP_S = 300.0
 """The longest single sleep, so a clock jump (the Mac waking) is noticed within this long."""

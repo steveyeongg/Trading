@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import dataclasses
 import io
 import itertools
 import math
@@ -49,7 +50,7 @@ import pandas as pd
 import pytest
 import swing_engine.__main__ as cli
 from alert_service.channels.base import DeliveryResult
-from swing_engine import job, product_store, store
+from swing_engine import job, narrate, product_store, scheduler, store
 from swing_engine.calendar import Session, TradingCalendar
 from swing_engine.config import BreakoutParams, PullbackParams, UniverseFilter
 from swing_engine.digest import format_failure, send_digest
@@ -155,7 +156,9 @@ class FakeProductStore:
     async def get_settings(self) -> SwingSettings:
         return self.settings
 
-    async def save_scan(self, scan, target_session, published_at, reconstructed) -> None:
+    async def save_scan(
+        self, scan, target_session, published_at, reconstructed, narration=None
+    ) -> None:
         if published_at.tzinfo is None:
             raise ValueError("published_at must be timezone-aware")
         self.saved_sessions.append(scan.session)
@@ -164,7 +167,7 @@ class FakeProductStore:
             "session": scan.session,
             "target_session": target_session,
             "reconstructed": first,
-            "payload": scan_to_dict(scan),
+            "payload": product_store.scan_payload(scan, narration),  # as the real store writes it
         }
         for ideas, parked in ((scan.ideas, False), (scan.watch_only, True)):
             for idea in ideas:
@@ -1304,3 +1307,103 @@ def test_the_test_panel_scans_monday_19_october_in_an_uptrend():
     assert CTX.session.date() == TARGET and math.isfinite(_close("SPY", TARGET))
     assert Regime(CTX.regime.loc[CTX.session]) is Regime.UPTREND
     assert [d.date() for d in PANEL.dates()[448:452]] == [THU, FRI, TARGET, NEXT]
+
+
+# ---------------------------------------------------------------------------- Task 8 rulings
+
+
+def _narrated(idea: Any, ctx: ScanContext, target: date) -> dict[str, str]:
+    params = {"breakout": BreakoutParams(), "pullback": PullbackParams()}[idea.setup]
+    return {"why": narrate.why(idea, ctx, params), "cancels": narrate.cancels(idea, target, params)}
+
+
+async def test_each_stored_idea_carries_why_it_was_picked_and_what_cancels_it(h):
+    """PR13: Today reads the narration from the stored scan, so it never needs a ScanContext. The
+    job writes it at save time, with the target session's context and the pre-registered params
+    (the code defaults in this empty repo)."""
+    scans = h.spy("run_scan")
+
+    await run_job(h.deps(), "nightly")
+
+    (_, _, result), *_ = scans
+    ctx = h.contexts[0]
+    payload = h.store.scans[TARGET]["payload"]
+    assert result.ideas and result.watch_only == [], "premise: an uptrend scan with ideas"
+    for row, idea in zip(payload["ideas"], result.ideas, strict=True):
+        assert (row["symbol"], row["setup"]) == (idea.symbol, idea.setup)
+        assert {"why": row["why"], "cancels": row["cancels"]} == _narrated(idea, ctx, NEXT)
+        assert row["why"].startswith(idea.symbol) and "Tue 20 Oct" in row["cancels"]
+    stripped = {
+        **payload,
+        "ideas": [
+            {k: v for k, v in row.items() if k not in ("why", "cancels")}
+            for row in payload["ideas"]
+        ],
+    }
+    assert stripped == scan_to_dict(result)  # nothing else about the payload changed
+
+
+async def test_watch_only_ideas_are_narrated_too(h):
+    """A stock page for a watch-only name (downtrend) still says why it was flagged."""
+    h.panel = _downtrend(PANEL)
+    scans = h.spy("run_scan")
+
+    await run_job(h.deps(), "nightly")
+
+    (_, _, result), *_ = scans
+    payload = h.store.scans[TARGET]["payload"]
+    assert result.watch_only, "premise: a downtrend parks the gated setups' ideas"
+    for row, idea in zip(payload["watch_only"], result.watch_only, strict=True):
+        assert {"why": row["why"], "cancels": row["cancels"]} == _narrated(
+            idea, h.contexts[0], NEXT
+        )
+
+
+async def test_an_idea_that_cannot_be_narrated_is_stored_without_narration(h):
+    """Narration is copy, not the trade decision: a template that fails leaves null, never a
+    failed scan."""
+
+    def broken(*args: Any, **kwargs: Any) -> str:
+        raise ZeroDivisionError("float division by zero")
+
+    h.monkeypatch.setattr(narrate, "why", broken)
+    run = await run_job(h.deps(), "nightly")
+
+    assert run["status"] == "ok"
+    rows = h.store.scans[TARGET]["payload"]["ideas"]
+    assert rows and all(row["why"] is None and row["cancels"] for row in rows)
+
+
+async def test_the_target_waits_for_the_scan_delay_not_the_feed_delay(h):
+    """A run between close + 16 min (the bars exist) and close + 45 min (the nightly's time) must
+    not publish or digest tonight's session on bars that are not settled yet."""
+    assert job.SCAN_DELAY_MINUTES == scheduler.SCAN_DELAY_MINUTES == 45  # one shared constant
+
+    early = await run_job(h.deps(now=datetime(2026, 10, 19, 16, 30, tzinfo=ET)), "manual")
+    assert early["session"] == FRI and h.store.saved_sessions == [FRI]
+    assert "ideas for Mon 19 Oct" in h.sent[-1]
+
+    due = await run_job(h.deps(now=datetime(2026, 10, 19, 16, 45, tzinfo=ET)), "manual")
+    assert due["session"] == TARGET and h.store.saved_sessions == [FRI, TARGET]
+
+
+async def test_a_never_advised_position_is_judged_on_the_target_session_only(h):
+    """Ruling: a position the job has never advised is evaluated at the target session only. The
+    user records the stop as it is today; testing it against the lows since the open would
+    report stop hits from before ATLAS knew of the position."""
+    symbol, stop = _dip_on(FRI, [TARGET])
+    opened = _opened(20)
+    pos = _position(symbol, opened, _close(symbol, opened), stop=stop, trail_atr=50.0)
+    walked = position_action(
+        {"id": "x", **pos}, dataclasses.replace(CTX, session=pd.Timestamp(FRI))
+    )
+    assert walked.kind is ActionKind.STOP_HIT, "premise: a walk from the open would hit on Friday"
+    tonight = position_action({"id": "x", **pos}, CTX)
+    assert tonight.kind is ActionKind.HOLD, "premise: Monday alone holds"
+    h.store = FakeProductStore(positions=[pos])
+
+    await run_job(h.deps(), "nightly")
+
+    row = _only_position(h.store)
+    assert (row["last_action"], row["last_action_text"]) == ("hold", tonight.text)
+    assert row["last_action_on"] == TARGET and row["current_stop"] == stop
