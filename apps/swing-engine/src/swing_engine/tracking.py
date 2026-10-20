@@ -9,6 +9,18 @@ kept between runs: the result is a pure function of the idea and the bars so far
 every night (or twice a night) gives the same rows, and a trade that has closed reads the same
 from any later session. The live track record therefore builds up with no effort from the user.
 
+**Split safety.** An idea's ``trigger`` and ``stop`` are in the price scale of the day it was
+published, but the bars are adjusted for every split and dividend since, and the whole history is
+restated each time one happens (``adjustment=all``). After a 4:1 split the stored trigger of 100
+sits over bars trading near 25, and a trade that really filled would read as ``not_triggered``.
+The ATR is restated by exactly the factor the prices are (its window ends on the signal date, which
+no later event reaches inside), so the ratio of the ATR on the signal date now to the ``atr14``
+stored with the idea is the factor to bring the published levels to the present scale. It is
+applied when it differs from 1 by more than :data:`SCALE_TOLERANCE` (half a percent, so a
+dividend-sized restatement leaves the published levels alone), and every row reports the factor
+applied as ``price_scale``. Prices in a row are on the current adjusted scale; ``r_multiple`` is
+scale-free.
+
 An idea counts as *live* only if it was published before the open of its target session
 (:func:`is_live`). One published after the fact (a catch-up scan after the Mac was asleep) is
 *reconstructed*: it is tracked like any other, but :func:`live_stats` keeps its record apart from
@@ -41,6 +53,10 @@ log = get_logger("swing.tracking")
 _ET = ZoneInfo("America/New_York")
 _OPEN = time(9, 30)
 
+SCALE_TOLERANCE = 0.005
+"""A restatement of history smaller than this (0.5%) is a dividend, not a split: the idea's
+published levels are used as they are."""
+
 
 def is_live(published_at: datetime, target_session: date) -> bool:
     """True iff ``published_at`` is before 09:30 New York time on ``target_session``.
@@ -59,8 +75,13 @@ def _float(value: float | None) -> float | None:
     return None if value is None else float(value)
 
 
-def _row(idea_id: Any, outcome: TradeOutcome | None, known: date | None) -> dict[str, Any]:
-    """The tracking columns of one idea; ``outcome=None`` is an idea with nothing to track yet."""
+def _row(
+    idea_id: Any, outcome: TradeOutcome | None, known: date | None, scale: float = 1.0
+) -> dict[str, Any]:
+    """The tracking columns of one idea; ``outcome=None`` is an idea with nothing to track yet.
+
+    ``scale`` is the factor applied to the published levels (1.0 when none was).
+    """
     if outcome is None:
         return {
             "id": idea_id,
@@ -73,6 +94,7 @@ def _row(idea_id: Any, outcome: TradeOutcome | None, known: date | None) -> dict
             "known_date": None,
             "r_multiple": None,
             "current_stop": None,
+            "price_scale": 1.0,
         }
     return {
         "id": idea_id,
@@ -85,7 +107,25 @@ def _row(idea_id: Any, outcome: TradeOutcome | None, known: date | None) -> dict
         "known_date": known,
         "r_multiple": _float(outcome.r_multiple),
         "current_stop": _float(outcome.current_stop),
+        "price_scale": scale,
     }
+
+
+def _price_scale(idea: Mapping[str, Any], atr_now: float) -> float:
+    """The factor from the idea's published price scale to the present adjusted one.
+
+    ``atr_now / idea["atr14"]``, snapped to exactly 1.0 when within :data:`SCALE_TOLERANCE` of it.
+    NaN when it cannot be worked out: no stored ATR, or a stored or present ATR that is missing,
+    not finite or not positive.
+    """
+    stored = idea.get("atr14")
+    if stored is None:
+        return math.nan
+    stored = float(stored)
+    if not (math.isfinite(stored) and stored > 0.0 and math.isfinite(atr_now) and atr_now > 0.0):
+        return math.nan
+    factor = atr_now / stored
+    return factor if abs(factor - 1.0) > SCALE_TOLERANCE else 1.0
 
 
 def track_ideas(
@@ -96,12 +136,16 @@ def track_ideas(
 ) -> list[dict[str, Any]]:
     """Where each published idea stands as of ``ctx.session``: one row per idea, in input order.
 
-    An idea needs ``id, session, symbol, setup, version, trigger, stop`` (``session`` is its
-    signal date). Each row has the idea's ``id`` and the tracking columns ``track_status``
-    (a :class:`~swing_engine.execution.TrackStatus` value), ``entry_date, entry_price, exit_date,
+    An idea needs ``id, session, symbol, setup, version, trigger, stop, atr14`` (``session`` is
+    its signal date; ``trigger``, ``stop`` and ``atr14`` are as published). Each row has the
+    idea's ``id`` and the tracking columns ``track_status`` (a
+    :class:`~swing_engine.execution.TrackStatus` value), ``entry_date, entry_price, exit_date,
     exit_price, exit_reason``, ``known_date`` (when the exit became knowable; see
     :func:`~swing_engine.backtest.trades.known_date_for`), ``r_multiple`` and ``current_stop``;
-    a field that does not apply yet is None. The input is not changed.
+    a field that does not apply yet is None. It also has ``price_scale``, the factor the
+    published levels were multiplied by to match today's adjusted prices (see the module
+    docstring; 1.0 when none was applied, and for every idea left ``pending``). Prices are on the
+    current adjusted scale. The input is not changed.
 
     ``delisted`` is the set of symbols whose asset status is inactive: an open trade in one
     closes as DELISTED at its last priced close. ``repo`` is where the pre-registered parameters
@@ -110,8 +154,9 @@ def track_ideas(
     Bars are the panel's: every symbol's frame keeps its NaN rows, because ``simulate_trade``
     finds a halt or a segment break from them. Each symbol's frame is built once however many
     ideas it has. An idea that cannot be tracked (its symbol is not in the panel or has no bar
-    on the signal date, the signal date is not a panel session, or the idea is not one the model
-    accepts) stays ``pending`` and is logged, and never stops the others.
+    on the signal date, the signal date is not a panel session, its price scale cannot be worked
+    out, or the idea is not one the model accepts) stays ``pending`` and is logged, and never
+    stops the others.
     """
     bars = PanelBars(ctx.panel, ctx.ind)
     frames: dict[int, pd.DataFrame] = {}
@@ -126,6 +171,11 @@ def track_ideas(
             log.debug("tracking.no_bar", id=str(idea_id), symbol=symbol, session=str(signal.date()))
             rows.append(_row(idea_id, None, None))
             continue
+        scale = _price_scale(idea, float(bars.atr[at, col]))
+        if not math.isfinite(scale):
+            log.debug("tracking.no_scale", id=str(idea_id), symbol=symbol, atr14=idea.get("atr14"))
+            rows.append(_row(idea_id, None, None))
+            continue
         if col not in frames:
             frames[col] = bars.frame(col)
         try:
@@ -133,8 +183,8 @@ def track_ideas(
             outcome = simulate_trade(
                 frames[col],
                 signal,
-                float(idea["trigger"]),
-                float(idea["stop"]),
+                float(idea["trigger"]) * scale,
+                float(idea["stop"]) * scale,
                 params.trail_atr,
                 params.max_hold,
                 ExecutionParams(),
@@ -145,7 +195,7 @@ def track_ideas(
             rows.append(_row(idea_id, None, None))
             continue
         known = known_date_for(bars.index, outcome.exit_date, outcome.exit_reason)
-        rows.append(_row(idea_id, outcome, known))
+        rows.append(_row(idea_id, outcome, known, scale))
     return rows
 
 

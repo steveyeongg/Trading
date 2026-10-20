@@ -68,7 +68,9 @@ TRACK_KEYS = {
     "known_date",
     "r_multiple",
     "current_stop",
+    "price_scale",
 }
+NO_TRADE = TRACK_KEYS - {"id", "track_status", "price_scale"}  # None until there is a fill
 
 
 # ------------------------------------------------------------------------------- is_live
@@ -157,6 +159,7 @@ def _idea(
     *,
     trigger: float = 100.0,
     stop: float = 96.0,
+    atr14: float = ATR,
     setup: str = "breakout",
     version: str = "breakout-v1",
     **extra: Any,
@@ -169,6 +172,7 @@ def _idea(
         "version": version,
         "trigger": trigger,
         "stop": stop,
+        "atr14": atr14,
         "watch_only": False,
         "reconstructed": False,
         **extra,
@@ -304,9 +308,8 @@ def test_ideas_that_never_filled_carry_no_trade(tmp_path):
     for idea_id, status in (("ntr", "not_triggered"), ("gap", "skipped_gap"), ("pnd", "pending")):
         row = rows[idea_id]
         assert row["track_status"] == status
-        assert {k: v for k, v in row.items() if k not in ("id", "track_status")} == dict.fromkeys(
-            TRACK_KEYS - {"id", "track_status"}
-        )
+        assert row["price_scale"] == 1.0
+        assert {k: row[k] for k in NO_TRADE} == dict.fromkeys(NO_TRADE)
 
 
 def test_a_segment_break_closes_the_idea_delisted_and_is_known_11_sessions_later(tmp_path):
@@ -365,7 +368,8 @@ def test_an_idea_with_nothing_to_track_stays_pending_and_never_raises(tmp_path):
         row = rows[idea["id"]]
         assert row["track_status"] == "pending"
         assert set(row) == TRACK_KEYS
-        assert all(v is None for k, v in row.items() if k not in ("id", "track_status"))
+        assert row["price_scale"] == 1.0
+        assert {k: row[k] for k in NO_TRADE} == dict.fromkeys(NO_TRADE)
     assert rows["stp"]["track_status"] == "closed"  # the good idea beside them is unaffected
 
 
@@ -411,6 +415,134 @@ def test_tracking_does_not_change_its_inputs_and_is_idempotent(tmp_path):
     assert _by_id(reversed_rows) == _by_id(first)
 
 
+# ----------------------------------------------------- splits and the published price scale
+
+
+def _rescaled(ctx: ScanContext, factor: float) -> ScanContext:
+    """The context after the whole price history was re-adjusted by ``factor`` (bars and ATR).
+
+    A 4:1 split after the signal date makes the data provider restate every earlier price at a
+    quarter, so the adjusted panel the nightly job reads is the old one times 0.25.
+    """
+    p = ctx.panel
+    panel = dataclasses.replace(
+        p, open=p.open * factor, high=p.high * factor, low=p.low * factor, close=p.close * factor
+    )
+    ind = dataclasses.replace(ctx.ind, atr14=ctx.ind.atr14 * factor)
+    return dataclasses.replace(ctx, panel=panel, ind=ind)
+
+
+def test_a_split_after_the_signal_date_does_not_hide_a_real_fill(tmp_path):
+    """The incident: ideas are published in the price scale of their day, and a 4:1 split later
+    restates all history at 0.25. Re-simulating the stored trigger of 100 against bars now
+    trading near 25 reported a trade that really filled as ``not_triggered`` (or left it
+    open at a stop that could never be hit). The published levels are rescaled by the ratio of
+    the ATR now to the ATR stored with the idea."""
+    ctx, ideas = _book()
+    plain = _track(ctx, ideas, tmp_path)
+    split_ctx = _rescaled(ctx, 0.25)
+    split = _track(split_ctx, ideas, tmp_path)  # the ideas still carry their old-scale levels
+
+    # Without the rescale the stop-out would have been missed: the model sees a 100 trigger over
+    # bars that never get above 26.
+    stp = next(i for i in ideas if i["id"] == "stp")
+    assert _direct(split_ctx, stp, BreakoutParams(), set()).status is TrackStatus.NOT_TRIGGERED
+
+    assert split.keys() == plain.keys()
+    for idea_id, want in plain.items():
+        got = split[idea_id]
+        assert got["price_scale"] == pytest.approx(0.25), idea_id
+        for key in ("track_status", "entry_date", "exit_date", "exit_reason", "known_date"):
+            assert got[key] == want[key], (idea_id, key)
+        for key in ("entry_price", "exit_price", "current_stop"):  # on the current scale
+            if want[key] is None:
+                assert got[key] is None, (idea_id, key)
+            else:
+                assert got[key] == pytest.approx(0.25 * want[key]), (idea_id, key)
+        if want["r_multiple"] is None:
+            assert got["r_multiple"] is None
+        else:
+            assert got["r_multiple"] == pytest.approx(want["r_multiple"]), idea_id  # scale-free
+
+    stp_row = split["stp"]
+    assert stp_row["track_status"] == "closed"
+    assert stp_row["entry_price"] == pytest.approx(ENTRY / 4)
+    assert stp_row["exit_price"] == pytest.approx(96.0 * (1 - SLIP) / 4)
+    assert stp_row["r_multiple"] == pytest.approx((96.0 * (1 - SLIP) - ENTRY) / RISK)
+    assert split["opn"]["current_stop"] == pytest.approx(100.0 / 4)
+
+
+def test_a_reverse_split_rescales_upward(tmp_path):
+    ctx, ideas = _book()
+    plain = _track(ctx, ideas, tmp_path)
+    split = _track(_rescaled(ctx, 8.0), ideas, tmp_path)  # a 1:8 reverse split
+    for idea_id, want in plain.items():
+        got = split[idea_id]
+        assert got["price_scale"] == pytest.approx(8.0), idea_id
+        assert got["track_status"] == want["track_status"], idea_id
+        assert got["r_multiple"] == pytest.approx(want["r_multiple"]), idea_id
+    assert split["stp"]["entry_price"] == pytest.approx(8.0 * ENTRY)
+
+
+def test_a_dividend_sized_adjustment_leaves_the_levels_alone(tmp_path):
+    ctx, ideas = _book()
+    plain = _track(ctx, ideas, tmp_path)
+    shifted = _track(_rescaled(ctx, 0.997), ideas, tmp_path)  # history restated 0.3% lower
+    for idea_id, want in plain.items():
+        assert shifted[idea_id]["price_scale"] == 1.0, idea_id  # not 0.997: nothing was applied
+        assert shifted[idea_id]["track_status"] == want["track_status"], idea_id
+    stp = shifted["stp"]  # the published 96 stop is used as published
+    assert stp["entry_price"] == pytest.approx(ENTRY)
+    assert stp["exit_price"] == pytest.approx(96.0 * (1 - SLIP))
+    assert stp["r_multiple"] == pytest.approx(plain["stp"]["r_multiple"])
+
+
+@pytest.mark.parametrize(
+    ("factor", "applied"), [(0.9951, 1.0), (1.0049, 1.0), (0.9949, 0.9949), (1.0051, 1.0051)]
+)
+def test_the_rescale_threshold_is_half_a_percent(tmp_path, factor, applied):
+    ctx, ideas = _book()
+    row = _track(_rescaled(ctx, factor), ideas, tmp_path)["stp"]
+    assert row["price_scale"] == pytest.approx(applied)
+    if applied == 1.0:
+        assert row["price_scale"] == 1.0  # exactly 1.0, not the factor that was ignored
+
+
+def test_an_idea_without_a_usable_scale_stays_pending(tmp_path):
+    ctx, ideas = _book()
+    stp = ideas[0]
+    unusable = [
+        {**stp, "id": "zero-atr", "atr14": 0.0},
+        {**stp, "id": "none-atr", "atr14": None},
+        {**stp, "id": "nan-atr", "atr14": math.nan},
+        {**stp, "id": "inf-atr", "atr14": math.inf},
+        {**stp, "id": "negative-atr", "atr14": -2.0},
+    ]
+    no_key = {k: v for k, v in stp.items() if k != "atr14"}
+    no_key["id"] = "no-atr-key"
+    atr = ctx.ind.atr14.copy()
+    atr.at[INDEX[1], "NTR"] = math.nan  # the ATR now is missing on NTR's signal date
+    missing_now = dataclasses.replace(ctx, ind=dataclasses.replace(ctx.ind, atr14=atr))
+
+    rows = _track(missing_now, [*unusable, no_key, stp, ideas[3]], tmp_path)
+    for idea_id in [*(i["id"] for i in unusable), "no-atr-key", "ntr"]:
+        row = rows[idea_id]
+        assert row["track_status"] == "pending", idea_id
+        assert row["price_scale"] == 1.0, idea_id
+        assert {k: row[k] for k in NO_TRADE} == dict.fromkeys(NO_TRADE), idea_id
+    # The same idea with a usable ATR on both sides is still tracked.
+    assert rows["stp"]["track_status"] == "closed"
+
+
+def test_a_rejected_idea_reports_no_scale_was_applied(tmp_path):
+    ctx, ideas = _book()
+    # The levels are rescaled, but the stop is still above the (rescaled) entry fill: refused.
+    bad = {**ideas[0], "id": "bad", "stop": 101.0}
+    row = _track(_rescaled(ctx, 0.25), [bad], tmp_path)["bad"]
+    assert row["track_status"] == "pending"
+    assert row["price_scale"] == 1.0
+
+
 # -------------------------------------------------------------------- a synthetic universe
 
 
@@ -437,6 +569,7 @@ def universe() -> tuple[ScanContext, list[dict[str, Any]], pd.DataFrame]:
                     "version": row.version,
                     "trigger": float(row.trigger),
                     "stop": float(row.stop),
+                    "atr14": float(row.atr14),
                     "watch_only": False,
                     "reconstructed": False,
                 }
@@ -691,3 +824,4 @@ def test_the_status_values_are_the_track_status_enum_values(tmp_path):
     assert all(row["entry_date"] is None or type(row["entry_date"]) is date for row in rows)
     assert all(row["known_date"] is None or type(row["known_date"]) is date for row in rows)
     assert all(row["entry_price"] is None or type(row["entry_price"]) is float for row in rows)
+    assert all(type(row["price_scale"]) is float and row["price_scale"] == 1.0 for row in rows)
