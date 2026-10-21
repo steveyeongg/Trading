@@ -66,7 +66,15 @@ from swing_engine.job import JobDeps, ProductStore, safe_reason
 from swing_engine.loader import SCAN_WINDOW_DAYS
 from swing_engine.narrate import SETUP_LABEL
 from swing_engine.panel import Panel, build_panel
-from swing_engine.positions import nightly_update, open_risk, rescaled, split_ratio, stored_action
+from swing_engine.positions import (
+    exit_params,
+    nightly_update,
+    open_risk,
+    rescaled,
+    resolve_exit_rules,
+    split_ratio,
+    stored_action,
+)
 from swing_engine.regime import Regime
 from swing_engine.scan import ScanContext, default_setups
 from swing_engine.scheduler import scheduler_state
@@ -947,7 +955,10 @@ async def _advise(pos: dict[str, Any], *, check_stop: bool = True) -> dict[str, 
         # on the older session would overwrite that, and the next nightly would walk from it.
         log.info("swing.api.advice_skipped", symbol=str(pos["symbol"]), cached=str(ctx.session))
         return pos
-    update = nightly_update({**pos, "last_action_on": None}, ctx, check_stop=check_stop)
+    ruled, max_hold = await resolve_exit_rules(pos, store.get_idea, repo_root())
+    update = nightly_update(
+        {**ruled, "last_action_on": None}, ctx, max_hold, check_stop=check_stop
+    )
     if not update.fields:
         return pos
     saved: dict[str, Any] = await store.update_position(pos["id"], update.fields)
@@ -984,11 +995,16 @@ async def positions(
     responses={409: {"model": DetailOut}},
 )
 async def create_position(body: PositionIn) -> dict[str, Any]:
-    """Record a trade the user placed, then advise it at once on the cached context."""
+    """Record a trade the user placed, then advise it at once on the cached context.
+
+    The position is saved with the ``trail_atr`` its exit rules follow: the linked idea's setup's
+    pre-registered one, or the breakout family's when no idea is linked
+    (:func:`~swing_engine.positions.exit_params`)."""
     symbol = _symbol(body.symbol)
     if symbol not in await _asset_names(symbol):
         raise _invalid("symbol", f"unknown symbol {symbol}: it is not in the asset list", symbol)
     stop = body.initial_stop
+    idea = None
     if body.idea_id is not None:
         idea = await store.get_idea(body.idea_id)
         if idea is None:
@@ -997,6 +1013,9 @@ async def create_position(body: PositionIn) -> dict[str, Any]:
             raise _invalid("idea_id", f"that idea is for {idea['symbol']}, not {symbol}")
         if stop is None:
             stop = as_float(idea.get("stop"))
+    # The trail the idea was narrated and is tracked with: its setup's pre-registered one, or the
+    # breakout family's for a trade recorded without an idea (never the code's default).
+    trail_atr = exit_params(idea, repo_root()).trail_atr
     if stop is None:
         raise _invalid("initial_stop", "give the stop, or the idea the trade came from")
     if stop >= body.entry_price:
@@ -1012,6 +1031,7 @@ async def create_position(body: PositionIn) -> dict[str, Any]:
                 "shares": body.shares,
                 "initial_stop": stop,
                 "current_stop": stop,
+                "trail_atr": trail_atr,
                 "idea_id": body.idea_id,
                 "notes": body.notes,
             }

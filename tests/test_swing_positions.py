@@ -23,31 +23,37 @@ that a position's trail and the backtest's trail are the same line.
 from __future__ import annotations
 
 import dataclasses
+import json
 import math
 import uuid
 from datetime import date
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import pytest
-from swing_engine.config import ExecutionParams
+from swing_engine.config import BreakoutParams, ExecutionParams
 from swing_engine.execution import ExitReason, TrackStatus, simulate_trade
 from swing_engine.indicators import Indicators, compute_indicators
 from swing_engine.panel import Panel
 from swing_engine.positions import (
     Action,
     ActionKind,
+    exit_params,
     nightly_update,
     position_action,
     raise_stop_text,
     rescaled,
+    resolve_exit_rules,
     split_ratio,
     walk_action,
+    with_exit_rules,
 )
 from swing_engine.scan import ScanContext
 from swing_engine.testing import make_bars, trend_series
 
+REPO = Path(__file__).resolve().parents[1]
 START = "2024-01-02"
 ATR = 2.0
 
@@ -425,12 +431,45 @@ def test_trail_atr_comes_from_the_position():
     assert tight.stop == 106.0 and tight.kind is ActionKind.RAISE_STOP  # 110 - 2 * 2
 
 
-def test_missing_trail_atr_defaults_to_three():
-    closes = [100.0, 104.0, 110.0]
-    act = position_action(_pos(0, stop=95.0, trail_atr=None), _ctx_closes(closes))
-    assert act.kind is ActionKind.RAISE_STOP
-    assert act.stop == 104.0  # 110 - 3 * 2
-    assert act.text == "raise stop to 104.00 (trail)"
+def test_a_position_without_a_trail_is_refused_not_given_the_code_default():
+    """The incident: positions trailed at the code default of 3.0 ATR while the sealed
+    pre-registrations, the idea's narration and forward tracking all said 3.5. A row with no
+    ``trail_atr`` is resolved through the pre-registered lookup before it gets here; a
+    ``BreakoutParams()`` fallback here would silently bring the 3.0 back."""
+    with pytest.raises(ValueError, match="no trail_atr"):
+        position_action(_pos(0, stop=95.0, trail_atr=None), _ctx_closes([100.0, 104.0, 110.0]))
+
+
+def test_exit_rules_come_from_the_committed_preregistrations():
+    """A linked idea takes its own setup and version's sealed parameters; an unlinked trade takes
+    the breakout family's as tonight's scan runs it. Both preregs seal ``trail_atr`` 3.5."""
+    breakout = json.loads((REPO / "ml/validation/breakout/breakout-v1.prereg.json").read_text())
+    pullback = json.loads((REPO / "ml/validation/pullback/pullback-v1.prereg.json").read_text())
+    linked = exit_params({"setup": "pullback", "version": "pullback-v1"}, REPO)
+    assert linked.trail_atr == pullback["params"]["trail_atr"] == 3.5
+    assert linked.max_hold == pullback["params"]["max_hold"]
+    unlinked = exit_params(None, REPO)
+    assert isinstance(unlinked, BreakoutParams) and unlinked.version == "breakout-v1"
+    assert unlinked.trail_atr == breakout["params"]["trail_atr"] == 3.5
+    assert unlinked.trail_atr != BreakoutParams().trail_atr  # premise: the default differs
+
+
+def test_with_exit_rules_keeps_a_stored_trail_and_fills_a_missing_one():
+    params = dataclasses.replace(BreakoutParams(), trail_atr=3.5)
+    assert with_exit_rules(_pos(0, trail_atr=None), params)["trail_atr"] == 3.5
+    assert with_exit_rules(_pos(0, trail_atr=2.0), params)["trail_atr"] == 2.0
+
+
+async def test_resolve_exit_rules_reads_the_linked_idea_or_falls_back_to_breakout():
+    ideas = {"idea-1": {"setup": "pullback", "version": "pullback-v1"}}
+
+    async def get_idea(idea_id: Any) -> dict[str, Any] | None:
+        return ideas.get(str(idea_id))
+
+    linked, hold = await resolve_exit_rules(_pos(0, trail_atr=None, idea_id="idea-1"), get_idea, REPO)
+    assert linked["trail_atr"] == 3.5 and hold == 30
+    gone, _ = await resolve_exit_rules(_pos(0, trail_atr=None, idea_id="gone"), get_idea, REPO)
+    assert gone["trail_atr"] == exit_params(None, REPO).trail_atr
 
 
 def test_a_raise_of_less_than_a_cent_is_a_hold():

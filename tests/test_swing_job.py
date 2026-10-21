@@ -66,6 +66,7 @@ from swing_engine.settings import SwingSettings
 from swing_engine.testing import synthetic_kinds, synthetic_universe_panel
 
 ET = ZoneInfo("America/New_York")
+DEFAULT_TRAIL = BreakoutParams().trail_atr  # what an empty repo's (unvalidated) breakout uses
 TARGET = date(2026, 10, 19)  # Mon 19 Oct 2026
 NEXT = date(2026, 10, 20)
 THU, FRI, WED = date(2026, 10, 15), date(2026, 10, 16), date(2026, 10, 14)
@@ -210,6 +211,9 @@ class FakeProductStore:
         by_id = {str(r["id"]): r for r in self.ideas.values()}
         for row in rows:
             by_id[str(row["id"])].update({k: v for k, v in row.items() if k != "id"})
+
+    async def get_idea(self, idea_id) -> dict[str, Any] | None:
+        return next((dict(r) for r in self.ideas.values() if str(r["id"]) == str(idea_id)), None)
 
     async def list_positions(self, status: str | None) -> list[dict[str, Any]]:
         return [dict(p) for p in self.positions.values() if status in (None, p["status"])]
@@ -532,7 +536,7 @@ async def test_raise_stop_action_updates_position_stop(h):
     opened = CAL.sessions_between(TARGET - timedelta(days=40), TARGET)[0]
     entry = _close(symbol, opened)
     pos = _position(symbol, opened, entry, stop=round(entry * 0.7, 2), last_action_on=FRI)
-    expected = position_action({"id": "x", **pos}, CTX)
+    expected = position_action({"id": "x", "trail_atr": DEFAULT_TRAIL, **pos}, CTX)
     assert expected.kind is ActionKind.RAISE_STOP, "premise: the trail rises tonight"
     assert expected.stop is not None and expected.stop != round(expected.stop, 2), "premise"
     h.store = FakeProductStore(positions=[pos])
@@ -550,6 +554,29 @@ async def test_raise_stop_action_updates_position_stop(h):
     )
     assert row["initial_stop"] == pos["initial_stop"] and row["entry_price"] == entry
     assert f"• {symbol} {expected.text}" in h.sent[0]
+
+
+async def test_a_position_saved_without_a_trail_follows_its_setups_preregistered_trail(h):
+    """Trailing-stop parity: a row saved before ``trail_atr`` was stored (NULL) is advised with
+    the pre-registered trail of the idea it came from, or the breakout family's when it has none,
+    read from the real committed preregs (3.5), never the code default of 3.0."""
+    h.repo = Path(__file__).resolve().parents[1]
+    unlinked = _position("S03", TARGET - timedelta(days=30), 100.0, 90.0)
+    linked = _position("S04", TARGET - timedelta(days=30), 100.0, 90.0, idea_id="idea-1")
+    h.store = FakeProductStore(positions=[unlinked, linked])
+    h.store.ideas[(FRI, "S04", "pullback")] = {
+        "id": "idea-1", "symbol": "S04", "setup": "pullback", "version": "pullback-v1",
+        "session": FRI, "track_status": "closed",
+    }  # fmt: skip
+    walked = h.spy("nightly_update")
+
+    run = await run_job(h.deps(), "nightly")
+
+    assert run["steps"]["positions"]["status"] == "ok"
+    assert sorted((args[0]["symbol"], args[0]["trail_atr"], args[2]) for args, _, _ in walked) == [
+        ("S03", 3.5, 30),
+        ("S04", 3.5, 30),
+    ]
 
 
 # ---------------------------------------------------------------------------- the context (PR2)
@@ -863,7 +890,7 @@ async def test_a_stop_hit_on_a_missed_session_is_reported_not_hidden_by_tonights
     pos = _position(
         symbol, opened, _close(symbol, opened), stop=stop, trail_atr=50.0, last_action_on=WED
     )
-    tonight_alone = position_action({"id": "x", **pos}, CTX)
+    tonight_alone = position_action({"id": "x", "trail_atr": DEFAULT_TRAIL, **pos}, CTX)
     assert tonight_alone.kind is not ActionKind.STOP_HIT, "premise: Monday alone looks fine"
     h.store = FakeProductStore(scanned=[WED], positions=[pos])
 
@@ -1398,7 +1425,7 @@ async def test_a_never_advised_position_is_judged_on_the_target_session_only(h):
         {"id": "x", **pos}, dataclasses.replace(CTX, session=pd.Timestamp(FRI))
     )
     assert walked.kind is ActionKind.STOP_HIT, "premise: a walk from the open would hit on Friday"
-    tonight = position_action({"id": "x", **pos}, CTX)
+    tonight = position_action({"id": "x", "trail_atr": DEFAULT_TRAIL, **pos}, CTX)
     assert tonight.kind is ActionKind.HOLD, "premise: Monday alone holds"
     h.store = FakeProductStore(positions=[pos])
 

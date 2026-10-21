@@ -28,7 +28,9 @@ run at 16:20) must not publish or digest tonight on bars that are not settled ye
    the setup's pre-registered parameters) in the scan payload, so the dashboard's Today page
    never needs a context; an idea the templates cannot narrate is stored with nulls.
 4. ``tracking``: every pending or open idea, watch-only ones included, re-simulated to the target.
-5. ``positions``: :func:`~swing_engine.positions.nightly_update` for each open position: split
+5. ``positions``: :func:`~swing_engine.positions.nightly_update` for each open position, with
+   the pre-registered trail and longest hold of the setup it came from
+   (:func:`~swing_engine.positions.resolve_exit_rules`): split
    adjustment, then the rules walked over every session since its last advice, so a stop hit on
    a missed day is reported instead of tonight's hold (a position never advised is judged on the
    target alone). A position already advised for the target keeps its stored action, so running
@@ -91,7 +93,13 @@ from swing_engine.ingest import (
 )
 from swing_engine.loader import load_scan_inputs
 from swing_engine.panel import Panel
-from swing_engine.positions import Action, PositionUpdate, nightly_update, open_risk
+from swing_engine.positions import (
+    Action,
+    PositionUpdate,
+    nightly_update,
+    open_risk,
+    resolve_exit_rules,
+)
 from swing_engine.scan import (
     BENCHMARK,
     Idea,
@@ -170,6 +178,8 @@ class ProductStore(Protocol):
     async def update_job_steps(self, job_id: uuid.UUID | str, steps: Any) -> None: ...
 
     async def latest_job(self) -> dict[str, Any] | None: ...
+
+    async def get_idea(self, idea_id: uuid.UUID | str) -> dict[str, Any] | None: ...
 
     async def last_step_ok(self, step: str) -> datetime | None: ...
 
@@ -569,7 +579,11 @@ class _Run:
     async def _positions(self) -> dict[str, Any]:
         assert self.tonight is not None and self.target is not None
         positions = await self.store.list_positions("open")
-        updates = await asyncio.to_thread(_walk_positions, positions, self.tonight.ctx)
+        # Each position's pre-registered exit rules (a row saved without a trail resolves here).
+        rules = [
+            await resolve_exit_rules(pos, self.store.get_idea, self.deps.repo) for pos in positions
+        ]
+        updates = await asyncio.to_thread(_walk_positions, rules, self.tonight.ctx)
         for pos, update in zip(positions, updates, strict=True):
             if update.fields:
                 await self.store.update_position(pos["id"], update.fields)
@@ -722,10 +736,11 @@ def _told(idea: Idea, part: str, write: Callable[..., str], *args: Any) -> str |
 
 
 def _walk_positions(
-    positions: Sequence[Mapping[str, Any]], ctx: ScanContext
+    positions: Sequence[tuple[Mapping[str, Any], int]], ctx: ScanContext
 ) -> list[PositionUpdate]:
-    """Tonight's update for each open position (no store access), run in a worker thread."""
-    return [nightly_update(pos, ctx) for pos in positions]
+    """Tonight's update for each open position with its exit rules (``(position with its
+    trail_atr, max_hold)``), with no store access; run in a worker thread."""
+    return [nightly_update(pos, ctx, max_hold) for pos, max_hold in positions]
 
 
 def _sessions_to_scan(cal: TradingCalendar, last_scanned: date | None, target: date) -> list[date]:

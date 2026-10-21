@@ -1046,7 +1046,8 @@ def test_creating_a_position_advises_it_at_once_on_the_cached_context(api):
     out = response.json()
     expected = nightly_update(
         {"id": out["id"], "symbol": "S13", "opened_on": opened, "entry_price": entry,
-         "shares": 10.0, "initial_stop": stop, "current_stop": stop},
+         "shares": 10.0, "initial_stop": stop, "current_stop": stop,
+         "trail_atr": BreakoutParams().trail_atr},  # the empty repo: breakout's code defaults
         CTX,
     )  # fmt: skip
     assert out["last_action"] == expected.action.kind.value
@@ -1099,6 +1100,59 @@ def test_a_position_from_an_idea_takes_its_stop(api):
     assert response.status_code == 422 and "idea_id" in str(response.json()["detail"])
 
 
+def test_a_position_from_an_idea_stores_the_preregistered_trail(api):
+    """Trailing-stop parity (the incident): positions trailed at ``BreakoutParams()``'s 3.0 ATR
+    while the sealed pre-registrations, the narration and tracking used 3.5. A create linked to
+    an idea stores the trail of that idea's setup and version, read from the real committed
+    preregs; one with no idea stores the breakout family's pre-registered trail."""
+    api.repo = REPO
+    swing_context.set_context(CTX, UniverseFilter())
+    api.store = FakeStore(scan=_scan_row())
+    idea = next(r for r in api.store.ideas if r["setup"] == "pullback")
+    assert idea["version"] == "pullback-v1"  # premise: a version with a committed prereg
+    body = {"symbol": idea["symbol"], "opened_on": NEXT.isoformat(),
+            "entry_price": idea["trigger"] + 0.05, "shares": 5, "idea_id": str(idea["id"])}  # fmt: skip
+
+    out = api.client.post("/v1/positions", json=body).json()
+
+    assert api.store.positions[out["id"]]["trail_atr"] == 3.5
+    unlinked = api.client.post("/v1/positions", json=_position_body(symbol="S01")).json()
+    assert api.store.positions[unlinked["id"]]["trail_atr"] == 3.5
+    assert BreakoutParams().trail_atr == 3.0  # premise: the code default is not what is stored
+
+
+def test_the_trail_told_stored_and_tracked_for_one_idea_is_the_same(api, monkeypatch):
+    """One idea, three modules: the trail ``narrate.cancels`` tells the user (as the job stores
+    it, with ``default_setups``' parameters), the ``trail_atr`` of the position the user records
+    from it, and the trail ``track_ideas`` simulates it with are one number."""
+    from swing_engine import tracking
+    from swing_engine.scan import default_setups
+
+    api.repo = REPO
+    swing_context.set_context(CTX, UniverseFilter())
+    setups = default_setups(REPO)
+    result = run_scan(PANEL, KINDS, SESSION, RiskSettings(), setups, ctx=CTX)
+    idea = next(i for i in result.ideas if i.setup == "breakout")
+    told = job._narration(result, CTX, NEXT, setups)[(idea.symbol, "breakout")]["cancels"]
+    api.store = FakeStore(scan=_scan_row(result), ideas=_idea_rows(result))
+    row = next(r for r in api.store.ideas if (r["symbol"], r["setup"]) == (idea.symbol, "breakout"))
+    body = {"symbol": idea.symbol, "opened_on": NEXT.isoformat(),
+            "entry_price": idea.trigger + 0.05, "shares": 5, "idea_id": str(row["id"])}  # fmt: skip
+    stored = api.store.positions[api.client.post("/v1/positions", json=body).json()["id"]]
+    trails: list[float] = []
+
+    def spy(frame: Any, signal: Any, trigger: float, stop: float, trail: float, *a: Any, **k: Any):
+        trails.append(trail)
+        return real(frame, signal, trigger, stop, trail, *a, **k)
+
+    real = tracking.simulate_trade
+    monkeypatch.setattr(tracking, "simulate_trade", spy)
+    tracking.track_ideas([row], CTX, set(), REPO)
+
+    assert told is not None and f"trails {stored['trail_atr']:.1f} ATR" in told
+    assert stored["trail_atr"] == trails[0] == 3.5
+
+
 def test_one_open_position_per_symbol(api):
     _add_position(api, entry=100.0, stop=95.0, opened=SESSION)
     response = api.client.post("/v1/positions", json=_position_body())
@@ -1141,7 +1195,8 @@ def test_patch_validates_and_re_advises_an_edited_stop_without_testing_todays_lo
     low = float(PANEL.low.at[pd.Timestamp(SESSION), "S13"])
     close = float(PANEL.close.at[pd.Timestamp(SESSION), "S13"])
     new_stop = round((low + close) / 2, 2)
-    edited = {**api.store.positions[pid], "current_stop": new_stop, "last_action_on": None}
+    edited = {**api.store.positions[pid], "current_stop": new_stop, "last_action_on": None,
+              "trail_atr": BreakoutParams().trail_atr}  # fmt: skip
     assert position_action(edited, CTX).kind is ActionKind.STOP_HIT  # premise: today's low
 
     for bad in ({"current_stop": 0}, {"shares": 0}, {"shares": -1}, {"status": "closed"}):

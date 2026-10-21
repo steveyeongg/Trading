@@ -24,11 +24,13 @@ The rules run in this order at ``d = ctx.session`` and the first that applies wi
 5. **The chandelier trail**: the highest close since the open (the open day and ``d`` included)
    minus ``trail_atr`` times the ATR14 on ``d``, never lower than the current stop. It is the
    formula execution applies each night (:func:`~swing_engine.execution._ratchet`), so a user who
-   follows every raise holds the stop the backtests assume, to the cent, while the ATR is steady.
-   It reads tonight's ATR only, where the backtest also keeps every earlier night's candidate and
-   moves the trail on the entry session, so after the ATR has risen the user's trail can sit under
-   the backtest's, never over it. A raise of at least one cent is ``RAISE_STOP``; a missing ATR
-   leaves the trail where it was.
+   follows every raise holds the stop the backtests assume while the ATR is steady, to within a
+   cent: a raise under a cent is not announced (the stop can sit up to a cent under the model's),
+   and an announced raise is rounded to the cent (it can sit up to half a cent over it). It reads
+   tonight's ATR only, where the backtest also keeps every earlier night's candidate and moves the
+   trail on the entry session, so after the ATR has risen the user's trail can sit under the
+   backtest's, never over it by more than that half cent. A raise of at least one cent is
+   ``RAISE_STOP``; a missing ATR leaves the trail where it was.
 6. Otherwise ``HOLD`` at the current stop.
 
 ``Action.stop`` is the stop to have working after tonight: the new trail for ``RAISE_STOP``, the
@@ -53,27 +55,37 @@ position, built on :func:`position_action`:
   tonight's session alone, with no walk back to ``opened_on``: the user records the stop as it is
   today, and testing it against the lows since the open would report stop hits from before ATLAS
   knew of the position.
+
+**The exit rules** (``trail_atr`` and the longest hold) are the pre-registered parameters of the
+setup the trade came from, the ones its idea was narrated and is forward-tracked with, never the
+code's defaults (:func:`exit_params`). A trade linked to an idea takes that idea's setup and
+version (:func:`~swing_engine.validation.run.params_for`); one recorded without an idea takes the
+breakout family's (:data:`UNLINKED_FAMILY`), as :func:`~swing_engine.scan.default_setups` reads
+them. A position is saved with its ``trail_atr``; an older row saved without one is resolved by
+the same lookup (:func:`resolve_exit_rules`), and :func:`position_action` refuses a position that
+has none rather than guess.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import math
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import date
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
-from swing_engine.config import BreakoutParams
+from swing_engine.config import BreakoutParams, SetupParams
 from swing_engine.execution import _ratchet
 from swing_engine.narrate import day_label
-from swing_engine.scan import ScanContext
+from swing_engine.scan import ScanContext, default_setups
 
-DEFAULT_TRAIL_ATR = BreakoutParams().trail_atr
-"""The chandelier multiple for a position saved without one (the breakout setup's)."""
+UNLINKED_FAMILY = "breakout"
+"""The setup family whose pre-registered exit rules a trade recorded without an idea follows."""
 
 MIN_RAISE = 0.01
 """A trail must clear the current stop by at least a cent to be worth telling the user about."""
@@ -107,6 +119,47 @@ class Action:
     text: str
 
 
+def exit_params(idea: Mapping[str, Any] | None, repo: Path) -> SetupParams:
+    """The pre-registered setup parameters whose ``trail_atr`` and ``max_hold`` a trade follows.
+
+    ``idea`` is the stored idea the trade came from (its ``setup`` and ``version``), read from
+    ``repo``'s ``ml/validation`` with :func:`~swing_engine.validation.run.params_for`. With no
+    idea it is the :data:`UNLINKED_FAMILY` (breakout) setup as :func:`default_setups` runs it
+    tonight: the parameters of its latest pre-registered version, its defaults before any.
+    """
+    if idea is not None:
+        # Imported here: the validation harness builds on the scan, which this module also uses.
+        from swing_engine.validation.run import params_for
+
+        return params_for(str(idea["setup"]), idea.get("version"), repo)
+    for spec in default_setups(repo):
+        if isinstance(spec.params, BreakoutParams):
+            return spec.params
+    raise LookupError(f"no {UNLINKED_FAMILY} setup in default_setups")  # pragma: no cover
+
+
+def with_exit_rules(pos: Mapping[str, Any], params: SetupParams) -> dict[str, Any]:
+    """``pos`` with its ``trail_atr``: the stored one, or ``params``' when it was saved without."""
+    trail = pos.get("trail_atr")
+    return {**pos, "trail_atr": params.trail_atr if trail is None else float(trail)}
+
+
+async def resolve_exit_rules(
+    pos: Mapping[str, Any],
+    get_idea: Callable[[Any], Awaitable[Mapping[str, Any] | None]],
+    repo: Path,
+) -> tuple[dict[str, Any], int]:
+    """``pos`` with its ``trail_atr`` filled in (:func:`with_exit_rules`) and its ``max_hold``.
+
+    Both come from :func:`exit_params` of the idea the position is linked to (``idea_id``, read
+    with ``get_idea``), or of the unlinked family when it has none or the idea is gone.
+    """
+    idea_id = pos.get("idea_id")
+    idea = None if idea_id is None else await get_idea(idea_id)
+    params = exit_params(idea, repo)
+    return with_exit_rules(pos, params), int(params.max_hold)
+
+
 def raise_stop_text(stop: float) -> str:
     """The instruction for a raised trailing stop, as the user is told it."""
     return f"raise stop to {stop:.2f} (trail)"
@@ -132,8 +185,9 @@ def position_action(
     """The action for one position as of ``ctx.session``, by the rules in the module docstring.
 
     ``pos`` is a row from ``product_store.list_positions``: ``id, symbol, opened_on,
-    initial_stop, current_stop`` and ``trail_atr`` (None means the default of 3.0). Prices are
-    on the adjusted scale the panel uses. ``check_stop=False`` skips rule 3 for a stop the user
+    initial_stop, current_stop`` and ``trail_atr``, which must be set (a row saved without one is
+    resolved first, :func:`resolve_exit_rules`; ``ValueError`` otherwise). Prices are on the
+    adjusted scale the panel uses. ``check_stop=False`` skips rule 3 for a stop the user
     set after the session's close (an edit tonight): it was not working during the session, so
     the session's low says nothing about it.
     """
@@ -144,7 +198,11 @@ def position_action(
     current = pos.get("current_stop")
     stop = float(pos["initial_stop"] if current is None else current)
     trail_atr = pos.get("trail_atr")
-    trail = DEFAULT_TRAIL_ATR if trail_atr is None else float(trail_atr)
+    if trail_atr is None:
+        raise ValueError(
+            f"position {position_id} has no trail_atr: resolve its pre-registered exit rules first"
+        )
+    trail = float(trail_atr)
 
     def act(kind: ActionKind, at: float | None, text: str) -> Action:
         return Action(position_id, symbol, kind, at, text)
