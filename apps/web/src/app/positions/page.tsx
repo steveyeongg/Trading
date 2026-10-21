@@ -3,10 +3,11 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { Suspense, useEffect, useMemo, useState, type FormEvent } from 'react';
+import { Suspense, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { ClosePositionForm } from '@/components/ClosePositionForm';
 import { LoadFailure } from '@/components/LoadFailure';
-import { Field, PositionForm } from '@/components/PositionForm';
+import { Field } from '@/components/Field';
+import { PositionForm } from '@/components/PositionForm';
 import { SectionHeading } from '@/components/SectionHeading';
 import { Term } from '@/components/Term';
 import {
@@ -16,28 +17,33 @@ import {
   NO_OPEN_POSITIONS_TEXT,
   POSITIONS_INTRO_TEXT,
   POSITIONS_LOADING_TEXT,
+  SECTION_NOT_LOADED_TEXT,
   STOP_EDIT_HINT,
   STOP_INVALID_TEXT,
-  STOP_SAVED_TEXT,
   STOP_UNCHANGED_TEXT,
+  closedStatusText,
   exitReasonLabel,
+  newStopLabel,
+  recordedStatusText,
+  stopSavedStatusText,
 } from '@/lib/copy';
 import { errorText } from '@/lib/error-text';
-import { price, r, sessionDate } from '@/lib/format';
+import { price, r, sessionDate, sessionDateYear } from '@/lib/format';
+import { INPUT_CLASS, PRIMARY_BUTTON_CLASS, SECONDARY_BUTTON_CLASS } from '@/lib/form-styles';
 import {
-  INPUT_CLASS,
-  PRIMARY_BUTTON_CLASS,
-  SECONDARY_BUTTON_CLASS,
   actionTone,
+  openRowsWithJustClosed,
   parseAmount,
-  plainNumber,
   rTone,
+  type JustClosed,
 } from '@/lib/position-utils';
 import { isUnreachable, swingApi } from '@/lib/swing-api';
 import type { PositionFilter, PositionOut } from '@/lib/swing-types';
 
 const REFRESH_MS = 5 * 60_000; // positions change once a night, or when the user acts
 const HIGHLIGHT_MS = 6_000; // how long a new (or pointed-at) row stays highlighted
+
+const STOP_TOLERANCE = 1e-6; // two stops closer than this are the same stop
 
 const quantity = new Intl.NumberFormat('en-US', { maximumFractionDigits: 4 });
 
@@ -87,8 +93,17 @@ function StopEditor({
   onCancel: () => void;
 }) {
   const current = position.current_stop ?? position.initial_stop;
-  const [value, setValue] = useState(() => plainNumber(current));
+  // The box holds the stop exactly as stored (not rounded), so saving without a change never
+  // moves it; the label shows it as a price.
+  const [value, setValue] = useState(() => String(current));
   const [submitted, setSubmitted] = useState(false);
+
+  // The Edit stop button is gone, so focus goes to the box (selected, ready to type over).
+  const inputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    inputRef.current?.focus();
+    inputRef.current?.select();
+  }, []);
 
   const save = useMutation<PositionOut, unknown, number>({
     mutationFn: (stop) => swingApi.updatePosition(position.id, { current_stop: stop }),
@@ -99,7 +114,7 @@ function StopEditor({
   const problem =
     amount === null || amount <= 0
       ? STOP_INVALID_TEXT
-      : amount === current
+      : Math.abs(amount - current) < STOP_TOLERANCE
         ? STOP_UNCHANGED_TEXT
         : undefined;
 
@@ -111,13 +126,14 @@ function StopEditor({
   };
 
   return (
-    <form onSubmit={submit} noValidate aria-label={`Edit the stop for ${position.symbol}`}>
+    <form onSubmit={submit} noValidate aria-label={`Edit stop for ${position.symbol}`}>
       <div className="flex flex-wrap items-start gap-2">
-        <div className="w-40">
-          <Field label="New stop" error={submitted ? problem : undefined}>
+        <div className="w-48">
+          <Field label={newStopLabel(price(current))} error={submitted ? problem : undefined}>
             {(a) => (
               <input
                 {...a}
+                ref={inputRef}
                 type="number"
                 inputMode="decimal"
                 step="any"
@@ -178,6 +194,18 @@ function OpenPositionRows({
 }) {
   const [mode, setMode] = useState<Mode>('idle');
   const [stopSaved, setStopSaved] = useState(false);
+  // Closing a form removes the button that opened it (or the form itself), so focus is handed
+  // back: to that button after Cancel, to the "Stop saved" line after a save.
+  const editRef = useRef<HTMLButtonElement>(null);
+  const closeRef = useRef<HTMLButtonElement>(null);
+  const savedRef = useRef<HTMLSpanElement>(null);
+  const [focusNext, setFocusNext] = useState<'edit' | 'close' | 'saved' | null>(null);
+  useEffect(() => {
+    if (mode !== 'idle' || focusNext === null) return;
+    const target = { edit: editRef, close: closeRef, saved: savedRef }[focusNext];
+    target.current?.focus();
+    setFocusNext(null);
+  }, [mode, focusNext]);
   const stop = position.current_stop ?? position.initial_stop;
   const raised = stop !== position.initial_stop;
 
@@ -235,32 +263,37 @@ function OpenPositionRows({
             {mode === 'idle' && (
               <div className="flex flex-wrap items-center gap-2">
                 <button
+                  ref={editRef}
                   type="button"
                   onClick={() => {
                     setStopSaved(false);
                     setMode('stop');
                   }}
-                  aria-label={`Edit the stop for ${position.symbol}`}
+                  aria-label={`Edit stop for ${position.symbol}`}
                   className={SECONDARY_BUTTON_CLASS}
                 >
                   Edit stop
                 </button>
                 <button
+                  ref={closeRef}
                   type="button"
                   onClick={() => {
                     setStopSaved(false);
                     setMode('close');
                   }}
-                  aria-label={`Close the position in ${position.symbol}`}
+                  aria-label={`Close position in ${position.symbol}`}
                   className={SECONDARY_BUTTON_CLASS}
                 >
                   Close position
                 </button>
-                {stopSaved && (
-                  <span role="status" className="text-sm text-ink-muted">
-                    {STOP_SAVED_TEXT}
-                  </span>
-                )}
+                <span
+                  ref={savedRef}
+                  role="status"
+                  tabIndex={-1}
+                  className="text-sm text-ink-muted outline-none focus-visible:ring-1 focus-visible:ring-accent"
+                >
+                  {stopSaved ? stopSavedStatusText(position.symbol) : ''}
+                </span>
               </div>
             )}
             {mode === 'stop' && (
@@ -268,10 +301,14 @@ function OpenPositionRows({
                 position={position}
                 onSaved={() => {
                   setStopSaved(true);
+                  setFocusNext('saved');
                   setMode('idle');
                   onChanged();
                 }}
-                onCancel={() => setMode('idle')}
+                onCancel={() => {
+                  setFocusNext('edit');
+                  setMode('idle');
+                }}
               />
             )}
             {mode === 'close' && (
@@ -279,7 +316,10 @@ function OpenPositionRows({
                 position={position}
                 onClosed={onClosed}
                 onDone={() => onDone(position.id)}
-                onCancel={() => setMode('idle')}
+                onCancel={() => {
+                  setFocusNext('close');
+                  setMode('idle');
+                }}
               />
             )}
           </div>
@@ -393,8 +433,8 @@ function ClosedTable({ rows }: { rows: PositionOut[] }) {
               <td className={TD}>
                 <StockCell position={p} />
               </td>
-              <td className={`${TD} whitespace-nowrap`}>{sessionDate(p.opened_on)}</td>
-              <td className={`${TD} whitespace-nowrap`}>{sessionDate(p.closed_on)}</td>
+              <td className={`${TD} whitespace-nowrap`}>{sessionDateYear(p.opened_on)}</td>
+              <td className={`${TD} whitespace-nowrap`}>{sessionDateYear(p.closed_on)}</td>
               <td className={`${TD} text-right tabular-nums`}>{price(p.entry_price)}</td>
               <td className={`${TD} text-right tabular-nums`}>{price(p.exit_price)}</td>
               <td className={`${TD} text-right font-medium tabular-nums ${rTone(p.r_multiple)}`}>
@@ -428,6 +468,25 @@ function PositionsView() {
     if (newSymbol !== '') setFormOpen(true);
   }, [newSymbol]);
 
+  // What was just done ("Recorded MSFT", "Closed MSFT: +1.8R"). The form or the row the user was
+  // in is gone by then, so focus moves to this line, which also announces it.
+  const [status, setStatus] = useState<{ text: string; n: number } | null>(null);
+  const statusRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (status !== null) statusRef.current?.focus();
+  }, [status]);
+  const say = (text: string) => setStatus({ text, n: Date.now() });
+
+  // After Cancel, focus goes back to the button that opened the form.
+  const addRef = useRef<HTMLButtonElement>(null);
+  const [focusAdd, setFocusAdd] = useState(false);
+  useEffect(() => {
+    if (!formOpen && focusAdd) {
+      addRef.current?.focus();
+      setFocusAdd(false);
+    }
+  }, [formOpen, focusAdd]);
+
   // The row to point at: a new position, or the one a "you already have one" answer is about.
   // `n` makes pointing at the same row twice scroll twice.
   const [highlight, setHighlight] = useState<{ id: string; n: number } | null>(null);
@@ -444,28 +503,24 @@ function PositionsView() {
   // Positions just closed in this visit. Each stays in the open table, showing its result in R,
   // until the user presses Done (`done`), even if a refetch has already dropped it from the open
   // list.
-  const [justClosed, setJustClosed] = useState<
-    Record<string, { position: PositionOut; done: boolean }>
-  >({});
+  // `index` is the row's place in the table when it was closed, so it goes back in the same place.
+  const [justClosed, setJustClosed] = useState<Record<string, JustClosed>>({});
 
   const refresh = (keys: readonly (readonly string[])[]) =>
     Promise.all(keys.map((queryKey) => queryClient.invalidateQueries({ queryKey })));
   const refreshAll = () =>
     refresh([['positions', 'open'], ['positions', 'closed'], ['today']]);
 
-  const openRows = useMemo(() => {
-    const list = openData ?? [];
-    const listed = new Set(list.map((p) => p.id));
-    const kept = Object.values(justClosed)
-      .filter((c) => !listed.has(c.position.id))
-      .map((c) => c.position);
-    return [...list, ...kept].filter((p) => justClosed[p.id]?.done !== true);
-  }, [openData, justClosed]);
+  const openRows = useMemo(
+    () => openRowsWithJustClosed(openData ?? [], justClosed),
+    [openData, justClosed],
+  );
   // The heading counts open positions, not the ones just closed that are still showing a result.
   const openCount = openRows.filter((p) => justClosed[p.id] === undefined).length;
   const closedRows = useMemo(() => newestClosedFirst(closed.data ?? []), [closed.data]);
 
   const leaveForm = () => {
+    setFocusAdd(true);
     setFormOpen(false);
     if (newSymbol !== '' || ideaParam !== '') router.replace('/positions');
   };
@@ -480,7 +535,15 @@ function PositionsView() {
           <p className="mt-1 max-w-2xl text-sm text-ink-muted">{POSITIONS_INTRO_TEXT}</p>
         </div>
         {!formOpen && (
-          <button type="button" onClick={() => setFormOpen(true)} className={PRIMARY_BUTTON_CLASS}>
+          <button
+            ref={addRef}
+            type="button"
+            onClick={() => {
+              setStatus(null);
+              setFormOpen(true);
+            }}
+            className={PRIMARY_BUTTON_CLASS}
+          >
             Add a position
           </button>
         )}
@@ -507,18 +570,33 @@ function PositionsView() {
           onShowExisting={(id) => setHighlight({ id, n: Date.now() })}
           onCreated={(created) => {
             setFormOpen(false);
+            say(recordedStatusText(created.symbol));
             router.replace('/positions');
             void refreshAll().then(() => setHighlight({ id: created.id, n: Date.now() }));
           }}
         />
       )}
 
+      {/* Empty (and hidden) until there is something to say. */}
+      <div
+        ref={statusRef}
+        role="status"
+        tabIndex={-1}
+        className="rounded-lg border border-line bg-bg-surface px-4 py-3 text-sm text-ink outline-none focus-visible:ring-1 focus-visible:ring-accent empty:hidden"
+      >
+        {status?.text}
+      </div>
+
       <section aria-labelledby="open-heading" className="space-y-3">
         <SectionHeading id="open-heading">
           {`OPEN POSITIONS${openData !== undefined ? ` (${openCount})` : ''}`}
         </SectionHeading>
         {openData === undefined ? (
-          open.isPending && <p className="text-sm text-ink-muted">{POSITIONS_LOADING_TEXT}</p>
+          open.isPending ? (
+            <p className="text-sm text-ink-muted">{POSITIONS_LOADING_TEXT}</p>
+          ) : (
+            <p className="text-sm text-ink-muted">{SECTION_NOT_LOADED_TEXT}</p>
+          )
         ) : openRows.length === 0 ? (
           <p className={EMPTY_CLASS}>{NO_OPEN_POSITIONS_TEXT}</p>
         ) : (
@@ -527,17 +605,19 @@ function PositionsView() {
             highlightId={highlight?.id ?? null}
             onChanged={() => void refreshAll()}
             onClosed={(closedNow) => {
+              const index = openRows.findIndex((p) => p.id === closedNow.id);
               setJustClosed((all) => ({
                 ...all,
-                [closedNow.id]: { position: closedNow, done: false },
+                [closedNow.id]: { position: closedNow, done: false, index: Math.max(0, index) },
               }));
-              void refresh([['positions', 'closed'], ['today']]);
+              // The open list drops the row now; it stays on screen (from `justClosed`) until Done.
+              void refreshAll();
             }}
             onDone={(id) => {
-              setJustClosed((all) => {
-                const entry = all[id];
-                return entry === undefined ? all : { ...all, [id]: { ...entry, done: true } };
-              });
+              const entry = justClosed[id];
+              if (entry === undefined) return;
+              setJustClosed((all) => ({ ...all, [id]: { ...entry, done: true } }));
+              say(closedStatusText(entry.position.symbol, r(entry.position.r_multiple)));
               void refreshAll();
             }}
           />
@@ -549,7 +629,11 @@ function PositionsView() {
           {`CLOSED TRADES${closed.data !== undefined ? ` (${closedRows.length})` : ''}`}
         </SectionHeading>
         {closed.data === undefined ? (
-          closed.isPending && <p className="text-sm text-ink-muted">{POSITIONS_LOADING_TEXT}</p>
+          closed.isPending ? (
+            <p className="text-sm text-ink-muted">{POSITIONS_LOADING_TEXT}</p>
+          ) : (
+            <p className="text-sm text-ink-muted">{SECTION_NOT_LOADED_TEXT}</p>
+          )
         ) : closedRows.length === 0 ? (
           <p className={EMPTY_CLASS}>{NO_CLOSED_POSITIONS_TEXT}</p>
         ) : (

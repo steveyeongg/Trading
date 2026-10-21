@@ -57,13 +57,29 @@ export function r(x: number | null | undefined): string {
   return `${x > 0 ? '+' : '-'}${size}R`;
 }
 
-// The weekday, day and month of a date, in the form "Mon 19 Oct".
+// The weekday, day and month of a date, in the form "Mon 19 Oct" (and with the year).
 const calendarDay = new Intl.DateTimeFormat('en-US', {
   weekday: 'short',
   day: 'numeric',
   month: 'short',
+  year: 'numeric',
   timeZone: 'UTC',
 });
+
+/** The parts of a session date "YYYY-MM-DD", or null when it is not a real calendar date. */
+function calendarParts(
+  iso: string | null | undefined,
+): { weekday: string; day: string; month: string; year: string } | null {
+  const match = typeof iso === 'string' ? /^(\d{4})-(\d{2})-(\d{2})/.exec(iso) : null;
+  if (match === null) return null;
+  const [year, month, day] = [Number(match[1]), Number(match[2]), Number(match[3])];
+  const date = new Date(Date.UTC(year, month - 1, day));
+  const real =
+    date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
+  if (!real) return null; // 2026-02-30 and the like
+  const part = Object.fromEntries(calendarDay.formatToParts(date).map((p) => [p.type, p.value]));
+  return { weekday: part.weekday, day: part.day, month: part.month, year: part.year };
+}
 
 /**
  * A session date "YYYY-MM-DD" as "Mon 19 Oct". It is a calendar date: the digits are used as they
@@ -71,15 +87,14 @@ const calendarDay = new Intl.DateTimeFormat('en-US', {
  * New York).
  */
 export function sessionDate(iso: string | null | undefined): string {
-  const match = typeof iso === 'string' ? /^(\d{4})-(\d{2})-(\d{2})/.exec(iso) : null;
-  if (match === null) return DASH;
-  const [year, month, day] = [Number(match[1]), Number(match[2]), Number(match[3])];
-  const date = new Date(Date.UTC(year, month - 1, day));
-  const real =
-    date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
-  if (!real) return DASH; // 2026-02-30 and the like
-  const part = Object.fromEntries(calendarDay.formatToParts(date).map((p) => [p.type, p.value]));
-  return `${part.weekday} ${part.day} ${part.month}`;
+  const parts = calendarParts(iso);
+  return parts === null ? DASH : `${parts.weekday} ${parts.day} ${parts.month}`;
+}
+
+/** Like `sessionDate`, with the year: "Mon 19 Oct 2026" (for a history that spans years). */
+export function sessionDateYear(iso: string | null | undefined): string {
+  const parts = calendarParts(iso);
+  return parts === null ? DASH : `${parts.weekday} ${parts.day} ${parts.month} ${parts.year}`;
 }
 
 const newYork = new Intl.DateTimeFormat('en-US', {

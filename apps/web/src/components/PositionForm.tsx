@@ -2,10 +2,12 @@
 
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from 'react';
+import { Field } from '@/components/Field';
 import { SectionHeading } from '@/components/SectionHeading';
 import { ApiError } from '@/lib/api';
 import {
   ADD_FORM_NOTE,
+  BOUGHT_DATE_FUTURE_TEXT,
   BOUGHT_DATE_REQUIRED_TEXT,
   FILL_INVALID_TEXT,
   IDEA_LOADING_TEXT,
@@ -23,57 +25,14 @@ import {
 } from '@/lib/copy';
 import { errorText } from '@/lib/error-text';
 import { money, pct, price, todayET } from '@/lib/format';
-import {
-  INPUT_CLASS,
-  PRIMARY_BUTTON_CLASS,
-  SECONDARY_BUTTON_CLASS,
-  parseAmount,
-  plainNumber,
-} from '@/lib/position-utils';
+import { INPUT_CLASS, PRIMARY_BUTTON_CLASS, SECONDARY_BUTTON_CLASS } from '@/lib/form-styles';
+import { parseAmount, plainNumber } from '@/lib/position-utils';
 import { swingApi } from '@/lib/swing-api';
 import type { IdeaOut, PositionIn, PositionOut } from '@/lib/swing-types';
 
 // The server's own pattern for a symbol (`swing_routes._SYMBOL`).
 const SYMBOL_PATTERN = /^[A-Za-z0-9.-]{1,16}$/;
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
-
-/** What a field hands its input so the label, the error and the input are tied together. */
-export interface FieldA11y {
-  id: string;
-  'aria-invalid': boolean;
-  'aria-describedby': string | undefined;
-}
-
-/** A labelled form field; the input comes from `children` (called with the ids to put on it). */
-export function Field({
-  label,
-  error,
-  children,
-}: {
-  label: string;
-  error?: string | undefined;
-  children: (a11y: FieldA11y) => ReactNode;
-}) {
-  const id = useId();
-  const errorId = `${id}-error`;
-  return (
-    <div className="min-w-0">
-      <label htmlFor={id} className="mb-1 block text-xs text-ink-muted">
-        {label}
-      </label>
-      {children({
-        id,
-        'aria-invalid': error !== undefined,
-        'aria-describedby': error !== undefined ? errorId : undefined,
-      })}
-      {error !== undefined && (
-        <p id={errorId} role="alert" className="mt-1 text-xs text-bear">
-          {error}
-        </p>
-      )}
-    </div>
-  );
-}
 
 interface Values {
   symbol: string;
@@ -94,11 +53,15 @@ interface Errors {
 const clean = (symbol: string) => symbol.trim().toUpperCase();
 
 /**
- * The checks made before anything is sent: shares > 0, fill > 0, stop > 0 and below the fill.
+ * The checks made before anything is sent: a real date that is not after `today` (New York's),
+ * shares > 0, fill > 0, stop > 0 and below the fill.
  * `numbers` is set only when all three amounts are good, so the risk preview and the request can
  * use them without checking again.
  */
-function check(v: Values): {
+function check(
+  v: Values,
+  today: string,
+): {
   errors: Errors;
   numbers: { fill: number; shares: number; stop: number } | null;
 } {
@@ -107,6 +70,7 @@ function check(v: Values): {
   if (symbol === '') errors.symbol = SYMBOL_REQUIRED_TEXT;
   else if (!SYMBOL_PATTERN.test(symbol)) errors.symbol = SYMBOL_INVALID_TEXT;
   if (!DATE_PATTERN.test(v.openedOn)) errors.openedOn = BOUGHT_DATE_REQUIRED_TEXT;
+  else if (v.openedOn > today) errors.openedOn = BOUGHT_DATE_FUTURE_TEXT;
 
   const fill = parseAmount(v.fill);
   const shares = parseAmount(v.shares);
@@ -158,6 +122,14 @@ export function PositionForm({
   }));
   const [submitted, setSubmitted] = useState(false);
 
+  // The button that opened the form is gone, so put focus in the form: on the symbol, or, when the
+  // symbol came with the link, on the fill price (the one thing the user must supply).
+  const symbolRef = useRef<HTMLInputElement>(null);
+  const fillRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    (clean(initialSymbol) === '' ? symbolRef : fillRef).current?.focus();
+  }, [initialSymbol]); // the page re-creates the form (a new key) when the link's symbol changes
+
   // --- the idea this trade came from ---
   const wantIdea = clean(initialSymbol) !== '' && ideaId !== null;
   const stock = useQuery({
@@ -196,7 +168,8 @@ export function PositionForm({
     onSuccess: (created) => onCreated(created),
   });
 
-  const { errors, numbers } = check(values);
+  const today = todayET();
+  const { errors, numbers } = check(values, today);
   const shown: Errors = submitted ? errors : {};
   const preview =
     numbers === null
@@ -267,6 +240,7 @@ export function PositionForm({
           {(a) => (
             <input
               {...a}
+              ref={symbolRef}
               type="text"
               value={values.symbol}
               onChange={(e) => change('symbol')(e.target.value.toUpperCase())}
@@ -284,6 +258,7 @@ export function PositionForm({
             <input
               {...a}
               type="date"
+              max={today}
               value={values.openedOn}
               onChange={(e) => change('openedOn')(e.target.value)}
               className={INPUT_CLASS}
@@ -294,6 +269,7 @@ export function PositionForm({
           {(a) => (
             <input
               {...a}
+              ref={fillRef}
               type="number"
               inputMode="decimal"
               step="any"

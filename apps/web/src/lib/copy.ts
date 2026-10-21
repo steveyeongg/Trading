@@ -48,9 +48,17 @@ export const NO_CLOSED_POSITIONS_TEXT = 'No closed trades yet.';
 /** A position the nightly check has not looked at yet (the Latest action cell would be empty). */
 export const NO_ACTION_YET_TEXT = 'Not checked yet: ATLAS checks it after the next scan.';
 
+/** What a section says under its heading when its list could not be loaded (the reason is above). */
+export const SECTION_NOT_LOADED_TEXT = 'Not loaded: see the message above.';
+
 /** By the stop input on an open position. */
 export const STOP_EDIT_HINT = 'ATLAS re-checks this position with your new stop right away.';
-export const STOP_SAVED_TEXT = 'Stop updated.';
+export const newStopLabel = (currentStop: string) => `New stop (now ${currentStop})`;
+
+// What the page announces (and moves focus to) after an action, so focus never drops to the body.
+export const recordedStatusText = (symbol: string) => `Recorded ${symbol}`;
+export const stopSavedStatusText = (symbol: string) => `Stop saved for ${symbol}`;
+export const closedStatusText = (symbol: string, result: string) => `Closed ${symbol}: ${result}`;
 
 // The add form.
 export const ADD_FORM_NOTE =
@@ -72,12 +80,14 @@ export const SHOW_EXISTING_POSITION_TEXT = 'Show that position';
 export const SYMBOL_REQUIRED_TEXT = 'Enter the stock symbol';
 export const SYMBOL_INVALID_TEXT = 'Use letters, numbers, "." or "-" only, up to 16 characters';
 export const BOUGHT_DATE_REQUIRED_TEXT = 'Enter the date you bought';
+export const BOUGHT_DATE_FUTURE_TEXT = "Bought on can't be after today (New York date)";
 export const FILL_INVALID_TEXT = 'Fill price must be more than 0';
 export const SHARES_INVALID_TEXT = 'Shares must be more than 0';
 export const STOP_INVALID_TEXT = 'Enter your stop price: it must be more than 0';
 export const STOP_NOT_BELOW_FILL_TEXT = 'The stop must be below your fill price';
 export const STOP_UNCHANGED_TEXT = "That's already your current stop";
 export const SOLD_DATE_REQUIRED_TEXT = 'Enter the date you sold';
+export const SOLD_DATE_FUTURE_TEXT = "Sold on can't be after today (New York date)";
 export const SOLD_BEFORE_BOUGHT_TEXT = 'Sold on must be on or after the buy date';
 export const EXIT_INVALID_TEXT = 'Exit price must be more than 0';
 

@@ -1,17 +1,8 @@
 import Link from 'next/link';
 import { SectionHeading } from '@/components/SectionHeading';
 import { plural } from '@/lib/copy';
+import { actionTone } from '@/lib/position-utils';
 import type { ActionOut } from '@/lib/swing-types';
-
-// An action's colour by its kind. A kind this build does not know keeps the plain colour and shows
-// the server's text as given.
-const KIND_TONE: Record<string, string> = {
-  stop_hit: 'font-medium text-bear',
-  max_hold: 'text-warn',
-  no_data: 'text-warn',
-  raise_stop: 'text-ink',
-  hold: 'text-ink-muted',
-};
 
 export const NO_POSITIONS_HINT = "Record a trade from any idea's stock page.";
 
@@ -51,7 +42,7 @@ export function PositionActionsCard({
               <Link
                 href="/positions"
                 className={`flex flex-wrap items-baseline gap-x-3 gap-y-0.5 py-1.5 text-sm hover:bg-bg-subtle ${
-                  KIND_TONE[action.kind] ?? 'text-ink'
+                  actionTone(action.kind)
                 }`}
               >
                 <span className="font-mono font-semibold">{action.symbol}</span>
