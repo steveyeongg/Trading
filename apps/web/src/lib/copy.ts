@@ -36,3 +36,68 @@ export function checklistSummaryText(symbol: string, total: number, failed: numb
   if (failed === 0) return `${symbol} passes the universe rules but no setup triggered tonight.`;
   return `${symbol} doesn't qualify tonight: ${failed} ${plural(failed, 'rule')} failed.`;
 }
+
+// --- Positions page ---------------------------------------------------------------------------
+
+export const POSITIONS_LOADING_TEXT = 'Loading your positions…';
+export const POSITIONS_INTRO_TEXT =
+  'Record trades you placed yourself with your broker. Each night ATLAS checks them and tells you what to do next. It never places or changes an order.';
+export const NO_OPEN_POSITIONS_TEXT =
+  "No open positions. Record a trade from any idea's stock page, or use Add a position.";
+export const NO_CLOSED_POSITIONS_TEXT = 'No closed trades yet.';
+/** A position the nightly check has not looked at yet (the Latest action cell would be empty). */
+export const NO_ACTION_YET_TEXT = 'Not checked yet: ATLAS checks it after the next scan.';
+
+/** By the stop input on an open position. */
+export const STOP_EDIT_HINT = 'ATLAS re-checks this position with your new stop right away.';
+export const STOP_SAVED_TEXT = 'Stop updated.';
+
+// The add form.
+export const ADD_FORM_NOTE =
+  'Enter the trade as you made it: your real fill price, shares and the stop you set.';
+export const ideaLineText = (setupLabel: string, buyAbove: string) =>
+  `From tonight's ${setupLabel} idea: buy above ${buyAbove}`;
+export const fillPlaceholderText = (buyAbove: string | null) =>
+  buyAbove === null ? 'your actual fill' : `your actual fill, e.g. ${buyAbove}`;
+export const IDEA_LOADING_TEXT = "Loading tonight's idea…";
+export const IDEA_MISMATCH_TEXT =
+  "That idea isn't in tonight's scan any more, so enter your stop and shares yourself.";
+export const IDEA_LOAD_FAILED_TEXT =
+  "Couldn't load that idea, so enter your stop and shares yourself.";
+export const riskPreviewText = (risk: string, below: string) =>
+  `Risk ${risk} · stop ${below} below your fill`;
+export const SHOW_EXISTING_POSITION_TEXT = 'Show that position';
+
+// Field checks, before anything is sent.
+export const SYMBOL_REQUIRED_TEXT = 'Enter the stock symbol';
+export const SYMBOL_INVALID_TEXT = 'Use letters, numbers, "." or "-" only, up to 16 characters';
+export const BOUGHT_DATE_REQUIRED_TEXT = 'Enter the date you bought';
+export const FILL_INVALID_TEXT = 'Fill price must be more than 0';
+export const SHARES_INVALID_TEXT = 'Shares must be more than 0';
+export const STOP_INVALID_TEXT = 'Enter your stop price: it must be more than 0';
+export const STOP_NOT_BELOW_FILL_TEXT = 'The stop must be below your fill price';
+export const STOP_UNCHANGED_TEXT = "That's already your current stop";
+export const SOLD_DATE_REQUIRED_TEXT = 'Enter the date you sold';
+export const SOLD_BEFORE_BOUGHT_TEXT = 'Sold on must be on or after the buy date';
+export const EXIT_INVALID_TEXT = 'Exit price must be more than 0';
+
+// The close form.
+export const CLOSE_FORM_NOTE =
+  'Record the sale you made with your broker. ATLAS does not sell anything.';
+export const closedResultText = (symbol: string, exitPrice: string) =>
+  `Closed ${symbol} at ${exitPrice}`;
+
+/** The exit reasons the close form offers (all optional). `value` is what is stored. */
+export const EXIT_REASONS = [
+  { value: 'stop', label: 'Stop hit' },
+  { value: 'trail', label: 'Trail stop' },
+  { value: 'max_hold', label: 'Max hold' },
+  { value: 'took_profit', label: 'Took profit' },
+  { value: 'other', label: 'Other' },
+] as const;
+
+/** A stored exit reason in words; a value this build does not know is shown as it was stored. */
+export function exitReasonLabel(reason: string | null): string {
+  if (reason === null || reason.trim() === '') return '—';
+  return EXIT_REASONS.find((o) => o.value === reason)?.label ?? reason;
+}

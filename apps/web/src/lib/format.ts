@@ -103,3 +103,20 @@ export function dateTimeET(iso: string | null | undefined): string {
   const part = Object.fromEntries(newYork.formatToParts(when).map((p) => [p.type, p.value]));
   return `${part.weekday} ${part.hour}:${part.minute}${part.dayPeriod.toLowerCase()} ET`;
 }
+
+const newYorkDay = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/New_York',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+});
+
+/**
+ * The calendar date in New York right now (or at `now`), as "YYYY-MM-DD". Trades are dated by the
+ * New York session they happened in, so a form's "today" default comes from here and never from
+ * the browser's own local date (in Kuala Lumpur the two differ for half of every day).
+ */
+export function todayET(now: Date = new Date()): string {
+  const part = Object.fromEntries(newYorkDay.formatToParts(now).map((p) => [p.type, p.value]));
+  return `${part.year}-${part.month}-${part.day}`;
+}
