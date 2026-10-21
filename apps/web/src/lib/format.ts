@@ -3,7 +3,8 @@
 
 const DASH = '—';
 
-const isNum = (x: unknown): x is number => typeof x === 'number' && Number.isFinite(x);
+/** True for a finite number; false for null, undefined, NaN and the infinities. */
+export const isNum = (x: unknown): x is number => typeof x === 'number' && Number.isFinite(x);
 
 // A negative number that rounds to zero prints as "-0"; drop the sign.
 const dropNegativeZero = (s: string) => s.replace(/^-(?=\$?0(?:\.0+)?%?$)/, '');

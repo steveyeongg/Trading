@@ -4,6 +4,8 @@ import { SetupEquityChart } from '@/components/SetupEquityChart';
 import { Term } from '@/components/Term';
 import {
   COLUMN_SUBTITLES,
+  COMBINED_ROW_LABEL,
+  FAILED_HEADING,
   NO_VERSIONS_TEXT,
   PORTFOLIO_CAPTION_TEXT,
   RESULTS_CAPTION_NOTE,
@@ -21,10 +23,18 @@ import {
   stillOpenText,
   versionText,
 } from '@/lib/copy';
-import { count, pct, ratio, r, sessionDateYear, sessions, signedNumber } from '@/lib/format';
+import {
+  count,
+  isNum,
+  pct,
+  r,
+  ratio,
+  sessionDateYear,
+  sessions,
+  signedNumber,
+} from '@/lib/format';
 import type { FamilyOut, PortfolioStatsOut, StatsOut, VersionOut } from '@/lib/swing-types';
 import {
-  isFiniteNumber,
   recordColumns,
   verdictBadge,
   verdictNote,
@@ -58,7 +68,7 @@ function VerdictBadge({ verdict, text }: { verdict: string; text: string }) {
 // --- the results table ---------------------------------------------------------------------------------
 
 interface RowSpec {
-  label: string;
+  label: ReactNode;
   cell: (stats: StatsOut) => ReactNode;
 }
 
@@ -69,7 +79,7 @@ const ROWS: readonly RowSpec[] = [
     cell: (s) => (
       <>
         {count(s.n)}
-        {isFiniteNumber(s.n_distinct) && (
+        {isNum(s.n_distinct) && (
           <span className="block text-xs text-ink-muted">{`(${count(s.n_distinct)} distinct)`}</span>
         )}
       </>
@@ -78,8 +88,8 @@ const ROWS: readonly RowSpec[] = [
   { label: 'Win rate', cell: (s) => pct(s.win_rate) },
   { label: 'Avg win', cell: (s) => r(s.avg_win_r) },
   { label: 'Avg loss', cell: (s) => r(s.avg_loss_r) },
-  { label: 'Expectancy', cell: (s) => r(s.expectancy_r, 2) },
-  { label: 'Profit factor', cell: (s) => ratio(s.profit_factor) },
+  { label: <Term k="EXPECTANCY">Expectancy</Term>, cell: (s) => r(s.expectancy_r, 2) },
+  { label: <Term k="PROFIT_FACTOR">Profit factor</Term>, cell: (s) => ratio(s.profit_factor) },
   { label: 'Avg hold', cell: (s) => sessions(s.avg_hold) },
 ];
 
@@ -100,58 +110,57 @@ function ColumnHeader({ column }: { column: RecordColumn }) {
  * says why in one cell that spans its rows ("Not run yet", "No closed live ideas yet"), so a dash
  * is never left to be guessed at. It scrolls sideways inside its own box on a phone.
  */
-function ResultsTable({ columns }: { columns: RecordColumn[] }) {
+function ResultsTable({ columns, captionId }: { columns: RecordColumn[]; captionId: string }) {
   return (
-    <div className={TABLE_BOX}>
-      <table className="w-full min-w-[40rem] border-collapse text-sm">
-        <caption className="caption-top text-left text-xs text-ink-muted">
-          {/* Sticks to the left edge while the table scrolls sideways, and is never wider than the
-              screen, so the sentence stays readable on a phone. */}
-          <div className="sticky left-0 w-[calc(100vw-6rem)] max-w-3xl px-3 py-2">
-            {RESULTS_CAPTION_PREFIX} <Term k="R">R</Term> {RESULTS_CAPTION_SUFFIX}{' '}
-            {RESULTS_CAPTION_NOTE}
-          </div>
-        </caption>
-        <thead>
-          <tr className="border-t border-line text-left text-xs uppercase tracking-wider text-ink-muted">
-            <th scope="col" className={TH}>
-              <span className="sr-only">Measure</span>
-            </th>
-            {columns.map((column) => (
-              <ColumnHeader key={column.key} column={column} />
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {ROWS.map((row, rowIndex) => (
-            <tr key={row.label} className="border-t border-line">
-              <th scope="row" className={`${TD} text-left font-normal text-ink-muted`}>
-                {row.label}
+    <>
+      {/* The caption is a line of its own above the scrolling box (the table is named by it
+          through aria-labelledby), so it is as wide as the card and never scrolls out of sight. */}
+      <p id={captionId} className="text-xs text-ink-muted">
+        {RESULTS_CAPTION_PREFIX} <Term k="R">R</Term> {RESULTS_CAPTION_SUFFIX} {RESULTS_CAPTION_NOTE}
+      </p>
+      <div className={TABLE_BOX}>
+        <table aria-labelledby={captionId} className="w-full min-w-[40rem] border-collapse text-sm">
+          <thead>
+            <tr className="text-left text-xs uppercase tracking-wider text-ink-muted">
+              <th scope="col" className={TH}>
+                <span className="sr-only">Measure</span>
               </th>
-              {columns.map((column) => {
-                if (column.emptyText !== null || column.stats === null) {
-                  // One cell for the whole column, drawn in its first row.
-                  return rowIndex === 0 ? (
-                    <td
-                      key={column.key}
-                      rowSpan={ROWS.length}
-                      className="border-l border-line px-3 py-2.5 text-center align-middle text-xs text-ink-muted"
-                    >
-                      {column.emptyText}
-                    </td>
-                  ) : null;
-                }
-                return (
-                  <td key={column.key} className={NUMBER_TD}>
-                    {row.cell(column.stats)}
-                  </td>
-                );
-              })}
+              {columns.map((column) => (
+                <ColumnHeader key={column.key} column={column} />
+              ))}
             </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+          </thead>
+          <tbody>
+            {ROWS.map((row, rowIndex) => (
+              <tr key={rowIndex} className="border-t border-line">
+                <th scope="row" className={`${TD} text-left font-normal text-ink-muted`}>
+                  {row.label}
+                </th>
+                {columns.map((column) => {
+                  if (column.emptyText !== null || column.stats === null) {
+                    // One cell for the whole column, drawn in its first row.
+                    return rowIndex === 0 ? (
+                      <td
+                        key={column.key}
+                        rowSpan={ROWS.length}
+                        className="border-l border-line px-3 py-2.5 text-center align-middle text-xs text-ink-muted"
+                      >
+                        {column.emptyText}
+                      </td>
+                    ) : null;
+                  }
+                  return (
+                    <td key={column.key} className={NUMBER_TD}>
+                      {row.cell(column.stats)}
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </>
   );
 }
 
@@ -161,7 +170,7 @@ function ResultsNotes({ family }: { family: FamilyOut }) {
     { name: 'Live', stats: family.live },
     { name: 'Reconstructed', stats: family.reconstructed },
   ].flatMap(({ name, stats }) =>
-    isFiniteNumber(stats?.open) ? [`${name}: ${stillOpenText(count(stats.open))}`] : [],
+    isNum(stats?.open) && stats.open > 0 ? [`${name}: ${stillOpenText(count(stats.open))}`] : [],
   );
   const distinct = family.oos_distinct;
   return (
@@ -213,16 +222,16 @@ function PortfolioTable({ family }: { family: FamilyOut }) {
               <span className="sr-only">Account</span>
             </th>
             <th scope="col" className={`${TH} text-right`}>
-              CAGR
+              <Term k="CAGR">CAGR</Term>
             </th>
             <th scope="col" className={`${TH} text-right`}>
-              Max drawdown
+              <Term k="MAX_DRAWDOWN">Max drawdown</Term>
             </th>
             <th scope="col" className={`${TH} text-right`}>
-              Sharpe
+              <Term k="SHARPE">Sharpe</Term>
             </th>
             <th scope="col" className={`${TH} text-right`}>
-              Exposure
+              <Term k="EXPOSURE">Exposure</Term>
             </th>
             <th scope="col" className={`${TH} text-right`}>
               Trades
@@ -232,6 +241,9 @@ function PortfolioTable({ family }: { family: FamilyOut }) {
         <tbody>
           <PortfolioRow label="Strategy" stats={portfolio.strategy} showTrades />
           <PortfolioRow label={SPY_ROW_LABEL} stats={portfolio.spy} showTrades={false} />
+          {portfolio.combined !== null && (
+            <PortfolioRow label={COMBINED_ROW_LABEL} stats={portfolio.combined} showTrades />
+          )}
         </tbody>
       </table>
     </div>
@@ -243,18 +255,18 @@ function PortfolioTable({ family }: { family: FamilyOut }) {
 /** The random-entry comparison; nothing at all when the report has no baseline. */
 function RandomEntry({ family }: { family: FamilyOut }) {
   const { baseline } = family;
-  if (baseline === null || baseline === undefined || !isFiniteNumber(baseline.median)) return null;
+  if (baseline === null || baseline === undefined || !isNum(baseline.median)) return null;
   const expectancy = family.oos?.expectancy_r;
   return (
     <div className="space-y-1 text-sm">
       <p className="text-ink">
         {randomEntryText(
           signedNumber(baseline.median),
-          isFiniteNumber(baseline.p5) ? signedNumber(baseline.p5) : null,
-          isFiniteNumber(baseline.p95) ? signedNumber(baseline.p95) : null,
+          isNum(baseline.p5) ? signedNumber(baseline.p5) : null,
+          isNum(baseline.p95) ? signedNumber(baseline.p95) : null,
         )}
       </p>
-      {isFiniteNumber(expectancy) && (
+      {isNum(expectancy) && (
         <p className="text-ink-muted">
           {randomCompareText(r(expectancy, 2), expectancy > baseline.median)}
         </p>
@@ -286,6 +298,28 @@ function VersionList({ versions }: { versions: VersionOut[] }) {
         </li>
       ))}
     </ul>
+  );
+}
+
+/** Every condition the setup failed, as the validation wrote them (the badge names the first). */
+function FailedList({ id, failures }: { id: string; failures: string[] }) {
+  if (failures.length === 0) return null;
+  return (
+    <div className="text-sm">
+      <p id={id} className="font-medium text-ink">
+        {FAILED_HEADING}
+      </p>
+      <ul
+        aria-labelledby={id}
+        className="mt-1 list-disc space-y-0.5 pl-5 text-ink-muted marker:text-warn"
+      >
+        {failures.map((failure) => (
+          <li key={failure} className="break-words">
+            {failure}
+          </li>
+        ))}
+      </ul>
+    </div>
   );
 }
 
@@ -329,13 +363,14 @@ export function SetupRecordCard({ family }: { family: FamilyOut }) {
           <VerdictBadge verdict={family.verdict} text={family.verdict_text} />
         </div>
         {note !== null && <p className="text-sm text-ink-muted">{note}</p>}
+        <FailedList id={`${family.family}-failed`} failures={family.failures ?? []} />
       </header>
 
       <Warnings warnings={family.warnings} />
 
       <div className="space-y-2">
         <h3 className={SECTION_HEADING_CLASS}>{SECTION_RESULTS_TEXT}</h3>
-        <ResultsTable columns={columns} />
+        <ResultsTable columns={columns} captionId={`${family.family}-results-caption`} />
         <ResultsNotes family={family} />
       </div>
 
@@ -345,9 +380,9 @@ export function SetupRecordCard({ family }: { family: FamilyOut }) {
           <SetupEquityChart strategy={family.equity.strategy} spy={family.equity.spy} />
         </div>
         {/* With no simulation at all, the chart's "No equity series" line is the whole story. */}
-        {(family.portfolio.strategy !== null || family.portfolio.spy !== null) && (
-          <PortfolioTable family={family} />
-        )}
+        {(family.portfolio.strategy !== null ||
+          family.portfolio.spy !== null ||
+          family.portfolio.combined !== null) && <PortfolioTable family={family} />}
         {family.portfolio.combined_note !== null && (
           <p className="text-xs text-ink-muted">{combinedNoteText(family.portfolio.combined_note)}</p>
         )}

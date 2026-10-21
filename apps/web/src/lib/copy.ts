@@ -122,6 +122,8 @@ export const TRACK_RECORD_EMPTY_TEXT = 'No setups to show yet.';
 
 // The verdict badge, and what the verdict means for the ideas on Today.
 export const VERDICT_LIVE_LABEL = 'Live';
+/** Heads the list of every condition a Research-only setup failed. */
+export const FAILED_HEADING = 'Failed:';
 export const VERDICT_NOT_TESTED_LABEL = 'Not yet tested';
 export const VERDICT_LIVE_NOTE = 'Passed testing: its ideas appear under Trade ideas on Today.';
 export const VERDICT_UNPROVEN_NOTE =
@@ -163,7 +165,8 @@ export const equityDescriptionText = (parts: string[]) =>
   `Weekly account value, out-of-sample and simulated. ${parts.join(' ')}`;
 export const PORTFOLIO_CAPTION_TEXT = 'Out-of-sample account simulation, strategy against SPY';
 export const SPY_ROW_LABEL = 'SPY (buy and hold)';
-export const combinedNoteText = (note: string) => `Combined with the other setup: ${note}`;
+export const COMBINED_ROW_LABEL = 'Combined';
+export const combinedNoteText = (note: string) => `Combined portfolio: ${note}`;
 
 // The random-entry comparison. The numbers arrive signed ("+0.09") and the copy adds the R.
 export function randomEntryText(median: string, p5: string | null, p95: string | null): string {

@@ -14,13 +14,8 @@ import {
   equityDescriptionText,
 } from './copy';
 import { ascending, isDay } from './daily-chart-data';
-import { money } from './format';
+import { isNum, money } from './format';
 import type { FamilyOut, PointOut, StatsOut } from './swing-types';
-
-const isNum = (x: unknown): x is number => typeof x === 'number' && Number.isFinite(x);
-
-/** True for a number that arrived; false for null, undefined and NaN. */
-export const isFiniteNumber = isNum;
 
 // --- the verdict badge -----------------------------------------------------------------------------
 

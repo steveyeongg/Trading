@@ -10,13 +10,29 @@ import {
   type ReactNode,
 } from 'react';
 
-export type TermKey = 'R' | 'ATR' | 'RS';
+export type TermKey =
+  | 'R'
+  | 'ATR'
+  | 'RS'
+  | 'EXPECTANCY'
+  | 'PROFIT_FACTOR'
+  | 'CAGR'
+  | 'MAX_DRAWDOWN'
+  | 'SHARPE'
+  | 'EXPOSURE';
 
 // Plain-English definitions for the jargon the dashboard cannot avoid.
 export const TERM_TEXT: Record<TermKey, string> = {
   R: 'R = the amount you risk on the trade (buy price minus stop). +2R means you made twice what you risked.',
   ATR: "ATR = the stock's average daily price range over the last 14 days.",
   RS: "Relative strength: how this stock's past-year performance ranks against all US stocks in the universe (99 = strongest).",
+  // The Track record page's measures.
+  EXPECTANCY: 'Average result per trade, in R.',
+  PROFIT_FACTOR: 'Total gains divided by total losses; above 1 means gains outweighed losses.',
+  CAGR: 'Compound annual growth rate of the simulated account.',
+  MAX_DRAWDOWN: 'Largest fall from a peak in the simulated account.',
+  SHARPE: 'Return per unit of volatility (annualised); higher is steadier.',
+  EXPOSURE: 'Share of days the simulated account held at least one position.',
 };
 
 // `useLayoutEffect` warns when a page is rendered on the server; there the effect would do nothing.

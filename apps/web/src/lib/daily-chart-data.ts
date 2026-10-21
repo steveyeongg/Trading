@@ -5,9 +5,8 @@
 
 import type { CandlestickData, HistogramData, LineData, Time } from 'lightweight-charts';
 import { CHART_COLORS } from './chart-colors';
+import { isNum } from './format';
 import type { BarOut, LevelsOut, LinesOut, PointOut } from './swing-types';
-
-const isNum = (x: unknown): x is number => typeof x === 'number' && Number.isFinite(x);
 
 // "YYYY-MM-DD" is a business day to the chart. The string is passed on untouched: it never goes
 // through a JS Date, whose timezone could move it a day.
