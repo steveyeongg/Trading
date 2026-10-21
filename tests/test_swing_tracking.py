@@ -352,7 +352,9 @@ def test_known_date_for_matches_the_backtests_rule():
     assert known_date_for(index, INDEX[35].date(), ExitReason.DELISTED) == INDEX[N - 1].date()
 
 
-def test_an_idea_with_nothing_to_track_stays_pending_and_never_raises(tmp_path):
+def test_an_idea_with_nothing_to_track_gets_no_row_and_never_raises(tmp_path):
+    """No row, not a row of Nones: a row would overwrite what tracking stored for the idea on an
+    earlier night (an open trade's entry) whenever tonight's panel lacks it."""
     ctx, ideas = _book()
     stp = ideas[0]
     bad = [
@@ -364,13 +366,9 @@ def test_an_idea_with_nothing_to_track_stays_pending_and_never_raises(tmp_path):
         {**stp, "id": "bad-setup", "setup": "swing-ish"},  # not a known family
     ]
     rows = _track(ctx, [*bad, stp], tmp_path)
-    for idea in bad:
-        row = rows[idea["id"]]
-        assert row["track_status"] == "pending"
-        assert set(row) == TRACK_KEYS
-        assert row["price_scale"] == 1.0
-        assert {k: row[k] for k in NO_TRADE} == dict.fromkeys(NO_TRADE)
+    assert set(rows) == {"stp"}  # none of the bad ones has a row
     assert rows["stp"]["track_status"] == "closed"  # the good idea beside them is unaffected
+    assert set(rows["stp"]) == TRACK_KEYS
 
 
 def test_each_symbol_frame_is_built_once_however_many_ideas_it_has(tmp_path, monkeypatch):
@@ -508,7 +506,7 @@ def test_the_rescale_threshold_is_half_a_percent(tmp_path, factor, applied):
         assert row["price_scale"] == 1.0  # exactly 1.0, not the factor that was ignored
 
 
-def test_an_idea_without_a_usable_scale_stays_pending(tmp_path):
+def test_an_idea_without_a_usable_scale_gets_no_row(tmp_path):
     ctx, ideas = _book()
     stp = ideas[0]
     unusable = [
@@ -526,21 +524,16 @@ def test_an_idea_without_a_usable_scale_stays_pending(tmp_path):
 
     rows = _track(missing_now, [*unusable, no_key, stp, ideas[3]], tmp_path)
     for idea_id in [*(i["id"] for i in unusable), "no-atr-key", "ntr"]:
-        row = rows[idea_id]
-        assert row["track_status"] == "pending", idea_id
-        assert row["price_scale"] == 1.0, idea_id
-        assert {k: row[k] for k in NO_TRADE} == dict.fromkeys(NO_TRADE), idea_id
+        assert idea_id not in rows, idea_id
     # The same idea with a usable ATR on both sides is still tracked.
     assert rows["stp"]["track_status"] == "closed"
 
 
-def test_a_rejected_idea_reports_no_scale_was_applied(tmp_path):
+def test_a_rejected_idea_gets_no_row(tmp_path):
     ctx, ideas = _book()
     # The levels are rescaled, but the stop is still above the (rescaled) entry fill: refused.
     bad = {**ideas[0], "id": "bad", "stop": 101.0}
-    row = _track(_rescaled(ctx, 0.25), [bad], tmp_path)["bad"]
-    assert row["track_status"] == "pending"
-    assert row["price_scale"] == 1.0
+    assert _track(_rescaled(ctx, 0.25), [bad], tmp_path) == {}
 
 
 # -------------------------------------------------------------------- a synthetic universe

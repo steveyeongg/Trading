@@ -831,6 +831,7 @@ async def test_tracking_runs_at_the_target_with_watch_only_ideas_and_inactive_sy
         "status": "ok",
         "ideas": len(ideas),
         "by_status": {"pending": len(ideas)},
+        "untracked": 0,
     }
 
 
@@ -846,6 +847,38 @@ async def test_tracking_results_are_written_without_the_price_scale(h):
         "open",
         "closed",
     }
+
+
+async def test_an_open_idea_whose_symbol_tonights_panel_lacks_keeps_its_stored_tracking(h):
+    """The incident: tracking wrote a row of Nones (``pending``) for every idea it could not
+    track, so an open idea whose stock dropped out of tonight's panel (it went thin, under the
+    loader's liquidity prefilter) lost its stored entry date and price. The job now loads every
+    tracked idea's symbol whatever its liquidity, and an idea that still cannot be tracked gets
+    no row, so its stored fields stay. A brand-new idea published tonight stays pending."""
+    h.store = FakeProductStore(scanned=[FRI])
+    entry_day = date(2026, 10, 13)
+    h.store.ideas[(WED, "GONE", "breakout")] = {
+        "id": uuid.uuid4(), "session": WED, "target_session": THU, "symbol": "GONE",
+        "setup": "breakout", "version": "breakout-v1", "trigger": 50.0, "stop": 45.0,
+        "atr14": 2.0, "live": True, "watch_only": False, "reconstructed": False,
+        "published_at": MON_19_OCT_1700_ET - timedelta(days=5), "track_status": "open",
+        "entry_date": entry_day, "entry_price": 50.05, "current_stop": 46.0,
+    }  # fmt: skip
+
+    run = await run_job(h.deps(), "nightly")
+
+    assert "GONE" in h.extras[0]  # asked for whatever its liquidity
+    kept = h.store.ideas[(WED, "GONE", "breakout")]
+    assert (kept["track_status"], kept["entry_date"], kept["entry_price"]) == (
+        "open",
+        entry_day,
+        50.05,
+    )
+    assert kept["current_stop"] == 46.0
+    assert run["steps"]["tracking"]["untracked"] == 1
+    fresh = [r for r in h.store.ideas.values() if r["session"] == TARGET]
+    assert fresh and all(r["track_status"] == "pending" for r in fresh)
+    assert all(r.get("entry_date") is None for r in fresh)
 
 
 # ---------------------------------------------------------------------------- positions

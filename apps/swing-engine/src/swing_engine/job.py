@@ -18,7 +18,8 @@ run at 16:20) must not publish or digest tonight on bars that are not settled ye
    tickers never can) are listed in the step, not counted as a failure.
 3. ``scan``: every session after the last stored scan through the target, oldest first, or just
    the target when nothing was ever scanned or the target already was (a re-run refreshes it).
-   The stored bars are loaded once, with the held symbols whatever their liquidity. One context
+   The stored bars are loaded once, with the held symbols and those of every idea still tracked
+   whatever their liquidity. One context
    is built per session and reused for its scan; the target's is kept for the steps below and
    handed to ``JobDeps.on_context`` (the API's cache). A session's book holds only the positions
    opened by then. The ideas of a session are for the next one; they are ``reconstructed`` when
@@ -28,6 +29,7 @@ run at 16:20) must not publish or digest tonight on bars that are not settled ye
    the setup's pre-registered parameters) in the scan payload, so the dashboard's Today page
    never needs a context; an idea the templates cannot narrate is stored with nulls.
 4. ``tracking``: every pending or open idea, watch-only ones included, re-simulated to the target.
+   An idea tonight's bars cannot track keeps its stored tracking (it is counted as ``untracked``).
 5. ``positions``: :func:`~swing_engine.positions.nightly_update` for each open position, with
    the pre-registered trail and longest hold of the setup it came from
    (:func:`~swing_engine.positions.resolve_exit_rules`): split
@@ -550,8 +552,11 @@ class _Run:
         latest = await self.store.latest_scan()
         sessions = _sessions_to_scan(cal, None if latest is None else latest["session"], target)
         positions = await self.store.list_positions("open")
-        held = sorted({str(p["symbol"]) for p in positions})
-        panel, kinds, _ = await self.deps.loader(target, universe, extra_symbols=held)
+        # Loaded whatever their liquidity: the held symbols (tonight's actions) and those of every
+        # idea still tracked (pending or open), so tracking never loses a stock that went thin.
+        tracked = await self.store.trackable_ideas()
+        extra = sorted({str(p["symbol"]) for p in positions} | {str(i["symbol"]) for i in tracked})
+        panel, kinds, _ = await self.deps.loader(target, universe, extra_symbols=extra)
 
         scanned: tuple[ScanContext, ScanResult] | None = None
         for session in sessions:
@@ -604,6 +609,8 @@ class _Run:
             "status": "ok",
             "ideas": len(rows),
             "by_status": dict(Counter(str(row["track_status"]) for row in rows)),
+            # Ideas tonight's bars could not track: their stored tracking is left as it was.
+            "untracked": len(ideas) - len(rows),
         }
 
     async def _positions(self) -> dict[str, Any]:

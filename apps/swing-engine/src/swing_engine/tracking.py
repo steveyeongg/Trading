@@ -75,27 +75,9 @@ def _float(value: float | None) -> float | None:
     return None if value is None else float(value)
 
 
-def _row(
-    idea_id: Any, outcome: TradeOutcome | None, known: date | None, scale: float = 1.0
-) -> dict[str, Any]:
-    """The tracking columns of one idea; ``outcome=None`` is an idea with nothing to track yet.
-
-    ``scale`` is the factor applied to the published levels (1.0 when none was).
-    """
-    if outcome is None:
-        return {
-            "id": idea_id,
-            "track_status": TrackStatus.PENDING.value,
-            "entry_date": None,
-            "entry_price": None,
-            "exit_date": None,
-            "exit_price": None,
-            "exit_reason": None,
-            "known_date": None,
-            "r_multiple": None,
-            "current_stop": None,
-            "price_scale": 1.0,
-        }
+def _row(idea_id: Any, outcome: TradeOutcome, known: date | None, scale: float) -> dict[str, Any]:
+    """The tracking columns of one tracked idea; ``scale`` is the factor applied to its published
+    levels (1.0 when none was)."""
     return {
         "id": idea_id,
         "track_status": outcome.status.value,
@@ -134,7 +116,8 @@ def track_ideas(
     delisted: AbstractSet[str],
     repo: Path,
 ) -> list[dict[str, Any]]:
-    """Where each published idea stands as of ``ctx.session``: one row per idea, in input order.
+    """Where each published idea stands as of ``ctx.session``: one row per idea it can track, in
+    input order.
 
     An idea needs ``id, session, symbol, setup, version, trigger, stop, atr14`` (``session`` is
     its signal date; ``trigger``, ``stop`` and ``atr14`` are as published). Each row has the
@@ -144,8 +127,8 @@ def track_ideas(
     :func:`~swing_engine.backtest.trades.known_date_for`), ``r_multiple`` and ``current_stop``;
     a field that does not apply yet is None. It also has ``price_scale``, the factor the
     published levels were multiplied by to match today's adjusted prices (see the module
-    docstring; 1.0 when none was applied, and for every idea left ``pending``). Prices are on the
-    current adjusted scale. The input is not changed.
+    docstring; 1.0 when none was applied). Prices are on the current adjusted scale. The input
+    is not changed.
 
     ``delisted`` is the set of symbols whose asset status is inactive: an open trade in one
     closes as DELISTED at its last priced close. ``repo`` is where the pre-registered parameters
@@ -155,8 +138,10 @@ def track_ideas(
     finds a halt or a segment break from them. Each symbol's frame is built once however many
     ideas it has. An idea that cannot be tracked (its symbol is not in the panel or has no bar
     on the signal date, the signal date is not a panel session, its price scale cannot be worked
-    out, or the idea is not one the model accepts) stays ``pending`` and is logged, and never
-    stops the others.
+    out, or the idea is not one the model accepts) gets **no row**: it is logged, never stops
+    the others, and keeps whatever tracking is stored for it. A row of Nones for it would wipe
+    the entry and exit of a trade that was tracked last night, when tonight's panel happens not
+    to hold its symbol.
     """
     bars = PanelBars(ctx.panel, ctx.ind)
     frames: dict[int, pd.DataFrame] = {}
@@ -169,12 +154,10 @@ def track_ideas(
         col = bars.columns.get_indexer([symbol])[0]
         if col < 0 or at < 0 or math.isnan(bars.close[at, col]):
             log.debug("tracking.no_bar", id=str(idea_id), symbol=symbol, session=str(signal.date()))
-            rows.append(_row(idea_id, None, None))
             continue
         scale = _price_scale(idea, float(bars.atr[at, col]))
         if not math.isfinite(scale):
             log.debug("tracking.no_scale", id=str(idea_id), symbol=symbol, atr14=idea.get("atr14"))
-            rows.append(_row(idea_id, None, None))
             continue
         if col not in frames:
             frames[col] = bars.frame(col)
@@ -192,7 +175,6 @@ def track_ideas(
             )
         except ValueError as exc:
             log.warning("tracking.rejected", id=str(idea_id), symbol=symbol, error=str(exc))
-            rows.append(_row(idea_id, None, None))
             continue
         known = known_date_for(bars.index, outcome.exit_date, outcome.exit_reason)
         rows.append(_row(idea_id, outcome, known, scale))
