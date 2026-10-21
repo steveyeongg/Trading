@@ -37,7 +37,7 @@ uv run python -m swing_engine oos --family breakout --version breakout-v1     # 
 uv run --package signal-service uvicorn signal_service.main:app --reload
 
 # Dashboard on :3000 (also the `atlas-web` preview config in .claude/launch.json)
-cd apps/web && pnpm install && pnpm dev
+cd apps/web && pnpm install && pnpm dev -H 127.0.0.1 -p 3000   # -H: there is no login, so keep it on this Mac
 cd apps/web && pnpm typecheck      # tsc --noEmit; also `pnpm build`
 ```
 

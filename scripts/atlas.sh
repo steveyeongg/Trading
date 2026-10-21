@@ -14,8 +14,13 @@ LOG_DIR="$ROOT/logs"
 COMPOSE_FILE="infra/docker/docker-compose.yml"
 API_PORT=8000
 WEB_PORT=3000
+# Both servers listen on this Mac only (127.0.0.1): ATLAS has no login. The URLs below are what
+# we show; the checks use the loopback address, because "localhost" may try ::1 first.
+LOOPBACK=127.0.0.1
 API_URL="http://localhost:$API_PORT"
 WEB_URL="http://localhost:$WEB_PORT"
+API_CHECK="http://$LOOPBACK:$API_PORT"
+WEB_CHECK="http://$LOOPBACK:$WEB_PORT"
 API_WAIT_S="${ATLAS_API_WAIT_S:-90}"
 WEB_WAIT_S="${ATLAS_WEB_WAIT_S:-120}"
 
@@ -59,11 +64,13 @@ EOF
 # A pid file holds two lines: the pid, then the process's start time. A pid alone is not enough
 # (after a reboot the same number belongs to some other program, and `down` must never kill it),
 # so a process counts as ours only while its start time still matches the recorded one.
+# `ps -o lstart` prints local time in the locale's format, so it is always asked in UTC and the C
+# locale: a pid file written under one TZ must still match when read under another.
 
 pid_file() { printf '%s/%s.pid' "$STATE_DIR" "$1"; }
 
 start_time_of() {
-  ps -p "$1" -o lstart= 2>/dev/null | sed 's/^ *//; s/ *$//' || true
+  LC_ALL=C TZ=UTC ps -p "$1" -o lstart= 2>/dev/null | sed 's/^ *//; s/ *$//' || true
 }
 
 record_pid() { # name pid
@@ -123,11 +130,12 @@ stop_tree() { # label pid
 # --- checks --------------------------------------------------------------------------------
 
 # Presence only: the value is never read into a variable or printed. In .env a key counts as set
-# when its value starts with something other than a space or "#" (so `KEY=   # note`, which the
-# dotenv loader reads as empty, is not set).
+# when it has a value the dotenv loader would read as non-empty: `KEY=v`, `export KEY=v` and
+# `KEY = v` are set; `KEY=`, `KEY=""`, `KEY=''` and `KEY=   # note` are not.
 env_has() { # NAME
   if [ -n "$(printenv "$1" 2>/dev/null || true)" ]; then return 0; fi
-  grep -q "^$1=[^[:space:]#]" "$ROOT/.env" 2>/dev/null
+  grep -Eq "^[[:space:]]*(export[[:space:]]+)?$1[[:space:]]*=[[:space:]]*([^[:space:]#\"']|\"[^\"]|'[^'])" \
+    "$ROOT/.env" 2>/dev/null
 }
 
 preflight() {
@@ -160,11 +168,12 @@ require_free_port() { # name label port
   fi
 }
 
+# The waits below are deadlines on the shell's clock ($SECONDS), so "90 s" means 90 seconds of
+# wall time however long each attempt takes.
 wait_for_postgres() {
-  local waited=0
+  local deadline=$((SECONDS + 60))
   until docker exec atlas-postgres pg_isready -U atlas -d atlas >/dev/null 2>&1; do
-    waited=$((waited + 1))
-    [ "$waited" -lt 60 ] || die "Postgres didn't become ready in 60 s. See: docker logs atlas-postgres"
+    [ "$SECONDS" -lt "$deadline" ] || die "Postgres didn't become ready in 60 s. See: docker logs atlas-postgres"
     sleep 1
   done
   say "Postgres is ready."
@@ -172,14 +181,13 @@ wait_for_postgres() {
 
 # 0 once $1 answers; 1 after $2 seconds or as soon as process $3 is gone.
 wait_for_url() { # url seconds pid
-  local waited=0
-  while [ "$waited" -lt "$2" ]; do
+  local deadline=$((SECONDS + $2))
+  while :; do
     if curl -fsS --max-time 3 "$1" >/dev/null 2>&1; then return 0; fi
     if ! kill -0 "$3" 2>/dev/null; then return 1; fi
+    if [ "$SECONDS" -ge "$deadline" ]; then return 1; fi
     sleep 1
-    waited=$((waited + 1))
   done
-  return 1
 }
 
 failed_to_start() { # label logname
@@ -202,8 +210,8 @@ start_api() {
   fi
   rm -f "$(pid_file api)"
   say "Starting the API on :$API_PORT (log: logs/api.log) ..."
-  nohup uv run --package signal-service uvicorn signal_service.main:app --port "$API_PORT" \
-    >>"$LOG_DIR/api.log" 2>&1 </dev/null &
+  nohup uv run --package signal-service uvicorn signal_service.main:app \
+    --host "$LOOPBACK" --port "$API_PORT" >>"$LOG_DIR/api.log" 2>&1 </dev/null &
   record_pid api "$!"
   if [ "${ATLAS_DISABLE_SCHEDULER:-}" = "1" ]; then
     say "ATLAS_DISABLE_SCHEDULER=1: the automatic after-close scan is off. Use Run scan now."
@@ -230,7 +238,10 @@ start_web() {
     if [ -d "$ROOT/apps/web/node_modules" ]; then touch "$ROOT/apps/web/node_modules"; fi
   fi
   say "Starting the dashboard on :$WEB_PORT (log: logs/web.log) ..."
-  (cd "$ROOT/apps/web" && exec nohup pnpm dev >>"$LOG_DIR/web.log" 2>&1 </dev/null) &
+  # Next listens on every interface unless told otherwise; -p pins the port instead of letting
+  # Next move to 3001 when 3000 is taken (the waits and the browser use $WEB_PORT).
+  (cd "$ROOT/apps/web" && exec nohup pnpm dev -H "$LOOPBACK" -p "$WEB_PORT" \
+    >>"$LOG_DIR/web.log" 2>&1 </dev/null) &
   record_pid web "$!"
 }
 
@@ -251,9 +262,9 @@ cmd_up() {
   start_web
 
   say "Waiting for the API ..."
-  wait_for_url "$API_URL/healthz" "$API_WAIT_S" "$(live_pid api || true)" || failed_to_start "API" api
+  wait_for_url "$API_CHECK/healthz" "$API_WAIT_S" "$(live_pid api || true)" || failed_to_start "API" api
   say "Waiting for the dashboard ..."
-  wait_for_url "$WEB_URL" "$WEB_WAIT_S" "$(live_pid web || true)" || failed_to_start "web app" web
+  wait_for_url "$WEB_CHECK" "$WEB_WAIT_S" "$(live_pid web || true)" || failed_to_start "web app" web
 
   say "ATLAS is up: $WEB_URL (first run downloads data in the background; progress is on the Today page)"
   if [ "$(uname)" = "Darwin" ] && [ -z "${ATLAS_NO_OPEN:-}" ]; then
@@ -263,9 +274,16 @@ cmd_up() {
 
 # --- down ----------------------------------------------------------------------------------
 
+# A killed server can take a moment to let go of its port, so look again for up to 2 s before
+# reporting it.
 stop_port_report() { # port
-  local holder
+  local holder waited=0
   holder="$(port_holder "$1")"
+  while [ -n "$holder" ] && [ "$waited" -lt 2 ]; do
+    sleep 1
+    waited=$((waited + 1))
+    holder="$(port_holder "$1")"
+  done
   if [ -n "$holder" ]; then
     warn "Port $1 is still in use by pid $holder. ATLAS didn't start it, or it hasn't exited."
   fi
@@ -319,38 +337,66 @@ def when(iso):
         return moment.isoformat()
 
 
-status = json.loads(os.environ["ATLAS_STATUS_JSON"])
-last = status.get("last_scan")
-rows = [("Data as of", status.get("data_as_of") or "nothing scanned yet")]
-if last:
-    line = "session %s, %s (%s run)" % (last.get("session"), last.get("status"), last.get("kind"))
-    if last.get("error"):
-        line += ": " + str(last["error"])[:200]
-    rows.append(("Last scan", line))
+def summary(status):
+    last = status.get("last_scan")
+    rows = [("Data as of", status.get("data_as_of") or "nothing scanned yet")]
+    if last:
+        line = "session %s, %s (%s run)" % (last.get("session"), last.get("status"), last.get("kind"))
+        if last.get("error"):
+            line += ": " + str(last["error"])[:200]
+        rows.append(("Last scan", line))
+    else:
+        rows.append(("Last scan", "none yet"))
+    rows.append(("Next scan", when(status.get("next_scan_at")) or "not scheduled"))
+    if status.get("scheduler_running"):
+        rows.append(("Scheduler", "running"))
+    else:
+        rows.append(("Scheduler", "off: " + str(status.get("disabled_reason") or "not running")))
+    progress = status.get("backfill")
+    if progress and progress.get("total"):
+        done, total = int(progress["done"]), int(progress["total"])
+        rows.append(("First download", "%d of %d symbols (%d%%)" % (done, total, 100 * done // total)))
+    rows.append(("Alpaca keys", yes(status.get("alpaca_configured"))))
+    rows.append(("Telegram", yes(status.get("telegram_configured"))))
+    rows.append(("Auto-execution", "on" if status.get("auto_execution") else "off"))
+    return ["  %-15s %s" % (label + ":", value) for label, value in rows]
+
+
+# Anything unexpected in the answer (not JSON, not an object, a wrong type) gives the one fallback
+# line, never a traceback; nothing is printed until the whole summary is built.
+try:
+    status = json.loads(os.environ["ATLAS_STATUS_JSON"])
+    if not isinstance(status, dict):
+        raise ValueError("not a JSON object")
+    lines = summary(status)
+except Exception:
+    print("  (couldn't read the status summary)")
 else:
-    rows.append(("Last scan", "none yet"))
-rows.append(("Next scan", when(status.get("next_scan_at")) or "not scheduled"))
-if status.get("scheduler_running"):
-    rows.append(("Scheduler", "running"))
-else:
-    rows.append(("Scheduler", "off: " + str(status.get("disabled_reason") or "not running")))
-progress = status.get("backfill")
-if progress and progress.get("total"):
-    done, total = int(progress["done"]), int(progress["total"])
-    rows.append(("First download", "%d of %d symbols (%d%%)" % (done, total, 100 * done // total)))
-rows.append(("Alpaca keys", yes(status.get("alpaca_configured"))))
-rows.append(("Telegram", yes(status.get("telegram_configured"))))
-rows.append(("Auto-execution", "on" if status.get("auto_execution") else "off"))
-for label, value in rows:
-    print("  %-15s %s" % (label + ":", value))
+    print("\n".join(lines))
 PYEOF
   else
     say "  (python3 not found, so the scan summary is skipped; see the Settings page)"
   fi
 }
 
+# The "detail" of an error answer ({"detail": "..."}), if it has one; reads $ATLAS_STATUS_JSON.
+error_detail() {
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 - <<'PYEOF' 2>/dev/null || true
+import json
+import os
+
+try:
+    detail = json.loads(os.environ["ATLAS_STATUS_JSON"]).get("detail")
+except Exception:
+    detail = None
+if isinstance(detail, str) and detail.strip():
+    print(detail.strip()[:300])
+PYEOF
+}
+
 cmd_status() {
-  local pid code answer body
+  local pid code answer raw body status_code detail
 
   if docker_running; then
     say "Docker:    running"
@@ -366,19 +412,19 @@ cmd_status() {
 
   pid="$(live_pid api)"
   if [ -n "$pid" ]; then
-    if curl -fsS --max-time 3 "$API_URL/healthz" >/dev/null 2>&1; then
+    if curl -fsS --max-time 3 "$API_CHECK/healthz" >/dev/null 2>&1; then
       say "API:       running (pid $pid), answering at $API_URL"
     else
       say "API:       pid $pid is running but $API_URL/healthz doesn't answer (see logs/api.log)"
     fi
-  elif curl -fsS --max-time 3 "$API_URL/healthz" >/dev/null 2>&1; then
+  elif curl -fsS --max-time 3 "$API_CHECK/healthz" >/dev/null 2>&1; then
     say "API:       answering at $API_URL, but scripts/atlas.sh didn't start it"
   else
     say "API:       not running"
   fi
 
   pid="$(live_pid web)"
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$WEB_URL" 2>/dev/null || true)"
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$WEB_CHECK" 2>/dev/null || true)"
   answer="HTTP $code"
   if [ "$code" = "000" ] || [ -z "$code" ]; then answer="nothing"; fi # 000: curl's "no answer"
   if [ -n "$pid" ]; then
@@ -393,14 +439,34 @@ cmd_status() {
     say "Web:       not running"
   fi
 
-  body="$(curl -fsS --max-time 5 "$API_URL/v1/system/status" 2>/dev/null || true)"
+  # The body, a newline and the HTTP status (000 when nothing answered).
+  raw="$(curl -s --max-time 5 -w '\n%{http_code}' "$API_CHECK/v1/system/status" 2>/dev/null || true)"
+  status_code=""
+  body="$raw"
+  case "$raw" in
+    *$'\n'*)
+      status_code="${raw##*$'\n'}"
+      body="${raw%$'\n'*}"
+      ;;
+  esac
   say ""
-  if [ -n "$body" ]; then
-    say "Nightly scan:"
-    ATLAS_STATUS_JSON="$body" summarise_status
-  else
-    say "Nightly scan: unknown (the API didn't answer /v1/system/status)"
-  fi
+  case "$status_code" in
+    200)
+      say "Nightly scan:"
+      ATLAS_STATUS_JSON="$body" summarise_status
+      ;;
+    503)
+      say "Nightly scan: unknown (the API is up but its database isn't reachable)"
+      detail="$(ATLAS_STATUS_JSON="$body" error_detail)"
+      if [ -n "$detail" ]; then say "  $detail"; fi
+      ;;
+    "" | 000)
+      say "Nightly scan: unknown (the API didn't answer /v1/system/status)"
+      ;;
+    *)
+      say "Nightly scan: unknown (the API answered HTTP $status_code to /v1/system/status)"
+      ;;
+  esac
 }
 
 # --- main ----------------------------------------------------------------------------------

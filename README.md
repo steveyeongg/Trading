@@ -35,7 +35,7 @@ monitor → journal → portfolio + VaR → Prometheus / Grafana. Its ML trend m
 was trained on leaked labels and is refused unless retrained; its 1-minute
 signal recompute is off by default (see [Legacy switches](#legacy-composite-switches)).
 
-**1,665 backend tests passing** with a local Postgres up (6 skipped: they need a DeepSeek
+**1,691 backend tests passing** with a local Postgres up (6 skipped: they need a DeepSeek
 key, seeded data or a machine with no Postgres; without Postgres the database
 tests skip instead), dashboard typecheck clean. All 30 GAP_AUDIT items for the
 BLUEPRINT v2 alignment are closed. The swing engine is built to the BLUEPRINT
@@ -193,7 +193,9 @@ warns if the Alpaca keys are missing from `.env`; it never prints a value from
 it), starts Postgres and Redis, applies the database migrations, starts the API
 on :8000 and the dashboard on :3000 in the background (logs in `logs/api.log`
 and `logs/web.log`, process ids in `.atlas/`), waits until both answer, and
-opens <http://localhost:3000>. It is safe to run twice: it reports
+opens <http://localhost:3000>. Both servers listen on `127.0.0.1` only, so
+nothing else on your network can reach them (ATLAS has no login). It is safe to
+run twice: it reports
 `API already running (pid N)` instead of starting a second copy, and it refuses
 to start (rather than kill anything) if another program already holds port 8000
 or 3000. `down` stops what it started, including the child processes, and
@@ -260,7 +262,7 @@ uv run python -m journal_service.seed --n-bars 4000
 uv run --package signal-service uvicorn signal_service.main:app --reload     # :8000
 
 # 11. Run the dashboard (Terminal 2)
-cd apps/web && pnpm install && pnpm dev                                       # :3000
+cd apps/web && pnpm install && pnpm dev -H 127.0.0.1 -p 3000                  # :3000 (-H keeps it on this Mac)
 # open http://localhost:3000  → Today, Positions, Track record, Settings
 
 # 12. (optional) Observability stack — Prometheus + Grafana
@@ -397,7 +399,7 @@ atlas/  (named "Trading" on disk for historical reasons)
 │   │                          # setups, sizing, nightly scan, backtest + validation gate, and the
 │   │                          # product layer: nightly job, scheduler, tracking, positions, digest
 │   └── web/                   # Next.js 14 dashboard — Today / Positions / Track record / Settings +
-│                              # the stock page; the 8 older composite pages are kept as legacy
+│                              # the stock page; the 7 older composite pages are kept as legacy
 ├── scripts/                   # atlas.sh (one-command start: up | down | status), dev.sh
 ├── packages/shared-py/        # logging · db · auth · entitlements · metrics · schemas
 ├── infra/
@@ -406,7 +408,7 @@ atlas/  (named "Trading" on disk for historical reasons)
 │   └── observability/         # Prometheus + Grafana + dashboard JSON + alerts
 ├── ml/                        # registry (legacy models), validation (swing pre-registrations + reports), notebooks, experiments
 ├── docs/                      # SYSTEM.md, BLUEPRINT.md, GAP_AUDIT.md, ADRs, runbooks
-└── tests/                     # cross-package (1,665 passing, 6 skipped)
+└── tests/                     # cross-package (1,691 passing, 6 skipped)
 ```
 
 ## What's next

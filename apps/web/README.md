@@ -13,7 +13,7 @@ uv run --package signal-service uvicorn signal_service.main:app --reload
 # 2. Frontend
 cd apps/web
 pnpm install            # or: npm install / yarn install
-pnpm dev                # http://localhost:3000
+pnpm dev -H 127.0.0.1 -p 3000   # http://localhost:3000, this Mac only (Next listens on every interface by default; there is no login)
 ```
 
 Set `ATLAS_API_URL` (defaults to `http://localhost:8000`) to point at a different backend. Requests go through `/api/*` so the browser never deals with CORS in dev.

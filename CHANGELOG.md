@@ -87,7 +87,7 @@ idea is shown as Unproven and none goes in the Telegram digest.
   have not passed testing*, muted and tagged, on Today.
 - **Run scan now** on Today and Settings; a system status panel (data as of,
   last scan and steps, next scan, first-download progress, keys configured).
-- The eight composite pages are **legacy**: kept, reachable by address
+- The seven composite pages are **legacy**: kept, reachable by address
   (`/scanner`, `/symbols/[symbol]`, `/alerts`, `/backtest`, `/portfolio`,
   `/journal`, and the old settings at `/settings/legacy`), out of the nav.
 
@@ -97,9 +97,12 @@ idea is shown as Unproven and none goes in the Telegram digest.
 and Docker (*"Docker isn't running. Start Docker Desktop, then run:
 scripts/atlas.sh up"*), starts Postgres and Redis, migrates, starts the API and
 dashboard in the background (`logs/`, `.atlas/*.pid`), waits for both, and
-opens the browser on a Mac. Idempotent; refuses to start rather than kill
-another program's process on port 8000 or 3000; treats a pid file as ours only
-while the process's start time matches. `down` stops the process trees and
+opens the browser on a Mac. Both servers are bound to `127.0.0.1` (ATLAS has no
+login; Next's default is every interface) and the dashboard's port is pinned.
+Idempotent; refuses to start rather than kill another program's process on port
+8000 or 3000; treats a pid file as ours only while the process's start time
+(read in UTC, so a different TZ or locale cannot break it) matches; its waits
+are wall-clock deadlines. `down` stops the process trees and
 `docker compose stop`s (data kept). `status` never fails and summarises the
 nightly scan. Flags: `ATLAS_DISABLE_SCHEDULER=1`, `ATLAS_NO_OPEN=1`.
 
@@ -122,7 +125,7 @@ in the live record.
 
 ### Tests
 
-- Backend suite **1,665 passed, 6 skipped** with the local Postgres up (plus the
+- Backend suite **1,691 passed, 6 skipped** with the local Postgres up (plus the
   known `test_swing_store` event-loop teardown error, which only appears when
   Postgres is up). With no Postgres the DB-backed tests skip instead; the suite
   needs neither Postgres nor Redis. New coverage: the job on fakes (catch-up

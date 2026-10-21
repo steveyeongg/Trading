@@ -24,14 +24,22 @@ running. Start Docker Desktop, then run: scripts/atlas.sh up"* and exits 1);
 refuses to start if another program holds port 8000 or 3000 (it never kills a
 process it did not start); `docker compose up -d`; waits for `pg_isready` in
 `atlas-postgres`; `atlas_shared.migrate up`; starts the API
-(`uvicorn signal_service.main:app --port 8000`, no `--reload`) and the
-dashboard (`pnpm dev`, after `pnpm install --frozen-lockfile` when
-`apps/web/node_modules` is missing or older than the lockfile) with
-`nohup`, logs in `logs/api.log` and `logs/web.log`, pids in `.atlas/api.pid`
-and `.atlas/web.pid`; waits for `/healthz` (90 s) and the dashboard (120 s);
-prints the dashboard URL and, on a Mac, opens it. A pid file records the
-process's start time as well, so a pid reused after a reboot is never
-mistaken for ATLAS's.
+(`uvicorn signal_service.main:app --host 127.0.0.1 --port 8000`, no `--reload`)
+and the dashboard (`pnpm dev -H 127.0.0.1 -p 3000`, after
+`pnpm install --frozen-lockfile` when `apps/web/node_modules` is missing or older
+than the lockfile) with `nohup`, logs in `logs/api.log` and `logs/web.log`, pids
+in `.atlas/api.pid` and `.atlas/web.pid`; waits for `/healthz` (90 s) and the
+dashboard (120 s), both measured on the wall clock and checked at `127.0.0.1`;
+prints `http://localhost:3000` and, on a Mac, opens it. A pid file records the
+process's start time as well (read in UTC, whatever the time zone or locale), so
+a pid reused after a reboot is never mistaken for ATLAS's.
+
+**The dashboard and the API listen only on this Mac.** ATLAS has no login, and
+`pnpm dev` alone would listen on every network interface (Next's default is
+`0.0.0.0`), so both servers are bound to `127.0.0.1` and the dashboard's port is
+pinned to 3000 (otherwise Next would move to 3001 when 3000 is taken, and the
+script would wait on the wrong port). Another device on your network cannot open
+them. Don't change that without putting a login in front first.
 
 | Flag | Effect |
 |---|---|
@@ -89,7 +97,7 @@ uv run python -m journal_service.seed --n-bars 4000
 # 7. API + dashboard (add ATLAS_TREND_MODEL=ml/registry/trend/v2.joblib in front to load the retrained model)
 uv run --package signal-service uvicorn signal_service.main:app --reload     # :8000
 
-cd apps/web && pnpm install && pnpm dev                                       # :3000
+cd apps/web && pnpm install && pnpm dev -H 127.0.0.1 -p 3000                  # :3000, this Mac only
 
 # 8. Observability (separate stack)
 docker compose -f infra/observability/docker-compose.yml up -d                # :3001 Grafana, :9090 Prom
@@ -361,7 +369,7 @@ conservative; sparse-data deployments may want to relax them.
 | Stop a scan that is running | Not supported from the UI. `scripts/atlas.sh down` ends it; the next `up` catches up and re-runs the session safely (scans are upserts, one digest per session). |
 | Stop firing new alerts (legacy) | `UPDATE alert_rules SET enabled = FALSE WHERE …` (or DELETE in `/alerts`). |
 | Stop auto-executing trades | **Unset `ATLAS_ENABLE_AUTO_EXECUTION` and bounce the API.** The monitor loop is now opt-in (BLUEPRINT §22 #6) so this is also the *default* state. |
-| Lower the dev tier below Elite | Via `/settings` (production: revoke `broker_autotrade` on the user). Blocks the `/v1/execute` route. |
+| Lower the dev tier below Elite | Via `/settings/legacy` (production: revoke `broker_autotrade` on the user). Blocks the `/v1/execute` route. |
 | Pause the position monitor (without restart) | Not currently supported — bouncing the API is the path. The loop cancels cleanly in lifespan teardown. |
 | Stop WS live push | Drop the Prometheus alert `SignalServiceDown` cascading, or firewall `:8000`. |
 | Force every signal through the templated rationale | Unset `DEEPSEEK_API_KEY` and bounce. The §10.3 payload shape stays identical — only `payload.source` changes from `deepseek-chat` to `templated`. |
@@ -380,7 +388,7 @@ conservative; sparse-data deployments may want to relax them.
 | **Run scan now** answers *"a scan is already running"* | A job is in progress (the scheduler or an earlier click). Wait for it; Settings shows its steps. |
 | No Telegram digest arrived | In order: Settings, Telegram digest is on; `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are set (status shows Telegram yes); Send test message works; the digest step of the last job shows `sent` (a failed send leaves it for the next run to retry). Also expected: with no Live setup the digest only says nothing validated is waiting. |
 | Every idea on Today is under *"Unproven ideas: these setups have not passed testing"* | Expected at present: both v1 setups failed their out-of-sample test (Track record shows the numbers). It changes only when a new setup version passes its single out-of-sample run. |
-| Dashboard sidebar empty (legacy) | `GET /v1/watchlist` returned the hardcoded fallback (AAPL/MSFT/NVDA/TSLA/SPY/QQQ — equities-only since 0.23). Apply migration `0005`, hit `/settings` → Save. |
+| Dashboard sidebar empty (legacy) | `GET /v1/watchlist` returned the hardcoded fallback (AAPL/MSFT/NVDA/TSLA/SPY/QQQ — equities-only since 0.23). Apply migration `0005`, hit `/settings/legacy` → Save. |
 | Portfolio page 500 | Migration `0003` not applied, or no positions for `user_id='dashboard'`. Run `portfolio_service.seed`. |
 | Journal page empty | `journal_service.seed --n-bars 4000` to backfill from a synthetic backtest. |
 | `/v1/metrics` empty | No traffic yet; hit `/healthz` then re-scrape. |

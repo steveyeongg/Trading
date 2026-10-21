@@ -8,10 +8,20 @@ system directories. The fakes record their calls, and the "servers" are ``sleep`
 
 The script is executed through its shebang with that ``PATH``, so on a Mac it runs under the
 system's bash 3.2: the oldest bash it has to support.
+
+Regression notes (review of the first version):
+
+* ``ps -o lstart`` prints local time, so a pid file written under one ``TZ`` no longer matched
+  the same process read under another, and ``down`` left the servers running
+  (``test_pid_check_survives_a_different_timezone_and_locale``).
+* ``pnpm dev`` binds Next to every interface, and the dashboard has no login: the script now binds
+  both servers to 127.0.0.1 and pins the dashboard's port.
+* The waits counted loop passes, not seconds, so a slow ``curl`` made "90 s" much longer.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import platform
 import shutil
@@ -35,6 +45,7 @@ READY = (
     "(first run downloads data in the background; progress is on the Today page)"
 )
 ALPACA_WARNING = "Alpaca keys are not set in .env: ATLAS can't download prices until you add them."
+STALE_START = "Mon Jan  1 00:00:00 2001"
 
 STATUS_JSON = (
     '{"data_as_of": "2026-10-16", "last_scan": {"session": "2026-10-16", "kind": "nightly", '
@@ -79,25 +90,53 @@ fi
 exit 0
 """
 
-# curl succeeds (exit FAKE_CURL_EXIT), answers the status route with JSON and `-w` with "200".
+# curl exits FAKE_CURL_EXIT (after FAKE_CURL_DELAY seconds; only for URLs containing FAKE_FAIL_URL
+# when that is set), answers the status route with
+# FAKE_STATUS_JSON and FAKE_STATUS_CODE, and honours `-w '%{http_code}'` the way the real one does
+# (including the "000" it prints when nothing answered).
 _FAKE_CURL = """#!/bin/sh
+echo "$*" >> "$FAKE_LOG/curl.log"
+if [ -n "${FAKE_CURL_DELAY:-}" ]; then sleep "$FAKE_CURL_DELAY"; fi
+fmt=""; url=""
 for arg in "$@"; do
   case "$arg" in
-    *v1/system/status)
-      if [ "${FAKE_CURL_EXIT:-0}" != "0" ]; then exit "$FAKE_CURL_EXIT"; fi
-      printf '%s' "$FAKE_STATUS_JSON"; exit 0 ;;
+    *'%{http_code}') fmt="$arg" ;;
+    http://*) url="$arg" ;;
   esac
 done
-if [ "${FAKE_CURL_EXIT:-0}" != "0" ]; then exit "$FAKE_CURL_EXIT"; fi
-for arg in "$@"; do
-  case "$arg" in '%{http_code}') printf 200; exit 0 ;; esac
-done
+emit() {
+  printf '%s' "$1"
+  case "$fmt" in '\\n'*) printf '\\n' ;; esac
+  if [ -n "$fmt" ]; then printf '%s' "$2"; fi
+}
+if [ "${FAKE_CURL_EXIT:-0}" != "0" ]; then
+  emit "" 000
+  exit "$FAKE_CURL_EXIT"
+fi
+if [ -n "${FAKE_FAIL_URL:-}" ]; then
+  case "$url" in *"$FAKE_FAIL_URL"*) emit "" 000; exit 7 ;; esac
+fi
+case "$url" in
+  *v1/system/status) emit "$FAKE_STATUS_JSON" "${FAKE_STATUS_CODE:-200}" ;;
+  *) emit "" 200 ;;
+esac
 exit 0
 """
 
-# lsof reports a listener only for the port in FAKE_BUSY_PORT.
+# lsof reports a listener for the port in FAKE_BUSY_PORT: for ever, or for the first
+# FAKE_BUSY_CALLS calls about that port when that is set.
 _FAKE_LSOF = """#!/bin/sh
-case "$*" in *"tcp:${FAKE_BUSY_PORT:-none}"*) echo 4242; exit 0 ;; esac
+case "$*" in
+  *"tcp:${FAKE_BUSY_PORT:-none}"*)
+    n=0
+    if [ -f "$FAKE_LOG/lsof.count" ]; then n=$(cat "$FAKE_LOG/lsof.count"); fi
+    n=$((n + 1))
+    echo "$n" > "$FAKE_LOG/lsof.count"
+    if [ -n "${FAKE_BUSY_CALLS:-}" ] && [ "$n" -gt "$FAKE_BUSY_CALLS" ]; then exit 1; fi
+    echo 4242
+    exit 0
+    ;;
+esac
 exit 1
 """
 
@@ -144,6 +183,9 @@ class Sandbox:
 
     def pid(self, name: str) -> int:
         return int((self.root / ".atlas" / f"{name}.pid").read_text().splitlines()[0])
+
+    def write_env(self, text: str) -> None:
+        (self.root / ".env").write_text(text)
 
 
 def _write_exec(path: Path, body: str) -> None:
@@ -216,6 +258,40 @@ def box(tmp_path: Path) -> Iterator[Sandbox]:
     _kill_leftovers(sandbox)
 
 
+@dataclass
+class Running:
+    """A sandbox after a first ``up`` (browser opening off) on top of a stale pid file."""
+
+    box: Sandbox
+    first: subprocess.CompletedProcess[str]
+    stale_pid: int
+    api_pid: int
+    web_pid: int
+    api_child: int
+    web_child: int
+
+
+@pytest.fixture
+def running(box: Sandbox) -> Running:
+    # A stale pid file (a process that has exited) is replaced, never trusted.
+    gone = subprocess.Popen(["true"])
+    gone.wait()
+    (box.root / ".atlas").mkdir()
+    (box.root / ".atlas" / "api.pid").write_text(f"{gone.pid}\n{STALE_START}\n")
+
+    first = box.run("up", ATLAS_NO_OPEN="1")
+    assert first.returncode == 0, first.stdout + first.stderr
+    return Running(
+        box=box,
+        first=first,
+        stale_pid=gone.pid,
+        api_pid=box.pid("api"),
+        web_pid=box.pid("web"),
+        api_child=_read_pid_file(box.logs / "api-child.pid"),
+        web_child=_read_pid_file(box.logs / "web-child.pid"),
+    )
+
+
 # --- the brief's test ---------------------------------------------------------------------
 
 
@@ -232,6 +308,14 @@ def test_script_is_executable_and_its_state_directory_is_ignored() -> None:
     ignored = (ROOT / ".gitignore").read_text().splitlines()
     assert ".atlas/" in ignored, ".atlas/ (pid files) must be git-ignored"
     assert "logs/" in ignored, "logs/ must be git-ignored"
+
+
+def test_the_preview_config_binds_the_dashboard_to_localhost_too() -> None:
+    launch = ROOT / ".claude" / "launch.json"
+    if not launch.exists():
+        pytest.skip("no .claude/launch.json in this checkout")
+    configs = {c["name"]: c for c in json.loads(launch.read_text())["configurations"]}
+    assert configs["atlas-web"]["runtimeArgs"] == ["dev", "-H", "127.0.0.1", "-p", "3000"]
 
 
 # --- usage ---------------------------------------------------------------------------------
@@ -285,29 +369,64 @@ def test_up_names_a_missing_uv_or_pnpm_before_touching_docker(box: Sandbox) -> N
     assert box.calls("docker") == []
 
 
-def test_up_warns_when_alpaca_keys_are_missing_and_never_prints_env_values(box: Sandbox) -> None:
-    secret, other = "KEYVALUE-1f3a9c", "SECRETVALUE-77b2e0"
-    # No .env at all: say so, point at the template, warn about the keys.
+SECRET, OTHER = "KEYVALUE-1f3a9c", "SECRETVALUE-77b2e0"
+
+
+@pytest.mark.parametrize(
+    ("env_text", "warns"),
+    [
+        pytest.param(f"ALPACA_API_KEY={SECRET}\nALPACA_API_SECRET=\n", True, id="secret-missing"),
+        pytest.param("", True, id="empty-file"),
+        pytest.param(f"ALPACA_API_KEY={SECRET}\nALPACA_API_SECRET={OTHER}\n", False, id="both-set"),
+        pytest.param("# ALPACA_API_KEY=abc\n# ALPACA_API_SECRET=def\n", True, id="commented-out"),
+        pytest.param(
+            "ALPACA_API_KEY=   # from alpaca\nALPACA_API_SECRET=# here\n", True, id="template-notes"
+        ),
+        pytest.param(
+            f"export ALPACA_API_KEY={SECRET}\nexport ALPACA_API_SECRET={OTHER}\n",
+            False,
+            id="export-form",
+        ),
+        pytest.param(
+            f"ALPACA_API_KEY = {SECRET}\nALPACA_API_SECRET   =   {OTHER}\n",
+            False,
+            id="spaces-around-equals",
+        ),
+        pytest.param(
+            f"ALPACA_API_KEY=\"{SECRET}\"\nALPACA_API_SECRET='{OTHER}'\n", False, id="quoted-values"
+        ),
+        pytest.param(f'ALPACA_API_KEY=""\nALPACA_API_SECRET={OTHER}\n', True, id="empty-double"),
+        pytest.param(f"ALPACA_API_KEY={SECRET}\nALPACA_API_SECRET=''\n", True, id="empty-single"),
+        pytest.param(
+            f"export ALPACA_API_KEY=''\nexport ALPACA_API_SECRET={OTHER}\n", True, id="export-empty"
+        ),
+    ],
+)
+def test_alpaca_key_check_reads_env_file_shapes_and_never_prints_values(
+    box: Sandbox, env_text: str, warns: bool
+) -> None:
+    box.write_env(env_text)
+    out = box.run("up", FAKE_DOCKER_INFO_EXIT="1")
+    assert DOCKER_DOWN in out.stderr
+    assert (ALPACA_WARNING in out.stderr) is warns, out.stderr
+    for shown in (out.stdout, out.stderr):
+        assert SECRET not in shown and OTHER not in shown
+
+
+def test_up_without_an_env_file_points_at_the_template(box: Sandbox) -> None:
     out = box.run("up", FAKE_DOCKER_INFO_EXIT="1")
     assert ".env.example" in out.stderr and ALPACA_WARNING in out.stderr
-    # Only the key: the secret is still missing.
-    (box.root / ".env").write_text(f"ALPACA_API_KEY={secret}\nALPACA_API_SECRET=\n")
+    box.write_env(f"ALPACA_API_KEY={SECRET}\nALPACA_API_SECRET={OTHER}\n")
     out = box.run("up", FAKE_DOCKER_INFO_EXIT="1")
-    assert ALPACA_WARNING in out.stderr and ".env.example" not in out.stderr
-    # Both set: no warning. Values are never printed in any case.
-    (box.root / ".env").write_text(f"ALPACA_API_KEY={secret}\nALPACA_API_SECRET={other}\n")
-    out = box.run("up", FAKE_DOCKER_INFO_EXIT="1")
-    assert ALPACA_WARNING not in out.stdout + out.stderr
-    assert DOCKER_DOWN in out.stderr
-    for run_output in (out.stdout, out.stderr):
-        assert secret not in run_output and other not in run_output
-    # A commented-out key is not a key, and neither is an uncommented template line with a note.
-    (box.root / ".env").write_text("# ALPACA_API_KEY=abc\n# ALPACA_API_SECRET=def\n")
-    out = box.run("up", FAKE_DOCKER_INFO_EXIT="1")
-    assert ALPACA_WARNING in out.stderr
-    (box.root / ".env").write_text("ALPACA_API_KEY=   # from alpaca\nALPACA_API_SECRET=# here\n")
-    out = box.run("up", FAKE_DOCKER_INFO_EXIT="1")
-    assert ALPACA_WARNING in out.stderr
+    assert ".env.example" not in out.stderr
+
+
+def test_keys_exported_in_the_shell_count_as_set(box: Sandbox) -> None:
+    out = box.run(
+        "up", FAKE_DOCKER_INFO_EXIT="1", ALPACA_API_KEY="shell-key", ALPACA_API_SECRET="shell-sec"
+    )
+    assert ALPACA_WARNING not in out.stderr
+    assert "shell-key" not in out.stdout + out.stderr
 
 
 def test_up_refuses_a_port_held_by_another_process_and_kills_nothing(box: Sandbox) -> None:
@@ -320,63 +439,105 @@ def test_up_refuses_a_port_held_by_another_process_and_kills_nothing(box: Sandbo
     assert out.returncode == 1 and "8000" in out.stderr
 
 
-# --- up, status and down on fakes ----------------------------------------------------------
+# --- up ------------------------------------------------------------------------------------
 
 
-def test_up_status_up_again_and_down(box: Sandbox) -> None:
-    # A stale pid file (a process that has exited) is replaced, never trusted.
-    gone = subprocess.Popen(["true"])
-    gone.wait()
-    (box.root / ".atlas").mkdir()
-    (box.root / ".atlas" / "api.pid").write_text(f"{gone.pid}\nMon Jan  1 00:00:00 2001\n")
-
-    first = box.run("up", ATLAS_NO_OPEN="1")
-    assert first.returncode == 0, first.stdout + first.stderr
-    assert READY in first.stdout
+def test_up_runs_the_steps_in_order_and_starts_both_servers(running: Running) -> None:
+    box = running.box
+    assert READY in running.first.stdout
     assert box.calls("open") == [], "ATLAS_NO_OPEN must stop the browser opening"
 
-    # The steps ran in the brief's order, with its commands.
     docker = box.calls("docker")
     assert docker[0] == "info"
     assert "compose -f infra/docker/docker-compose.yml up -d" in docker
     assert any(c.startswith("exec atlas-postgres pg_isready") for c in docker)
+
     uv = box.calls("uv")
     migrate = [i for i, c in enumerate(uv) if "atlas_shared.migrate up" in c]
-    serve = [i for i, c in enumerate(uv) if "uvicorn signal_service.main:app --port 8000" in c]
+    serve = [i for i, c in enumerate(uv) if "uvicorn signal_service.main:app" in c]
     assert migrate and serve and migrate[0] < serve[0]
     assert "--package signal-service" in uv[serve[0]] and "--reload" not in uv[serve[0]]
-    assert box.calls("pnpm") == ["install --frozen-lockfile", "dev"]
+    assert uv[serve[0]].endswith("--host 127.0.0.1 --port 8000")
+
+    # Install, then the dashboard bound to this Mac only, on the port the script waits on.
+    assert box.calls("pnpm") == ["install --frozen-lockfile", "dev -H 127.0.0.1 -p 3000"]
+
     assert (box.root / "logs" / "api.log").exists() and (box.root / "logs" / "web.log").exists()
     assert "api boot line" in (box.root / "logs" / "api.log").read_text()
+    assert "web boot line" in (box.root / "logs" / "web.log").read_text()
+    assert _alive(running.api_pid) and _alive(running.web_pid)
 
-    api_pid, web_pid = box.pid("api"), box.pid("web")
-    assert api_pid != gone.pid and _alive(api_pid) and _alive(web_pid)
-    api_child = _read_pid_file(box.logs / "api-child.pid")
-    web_child = _read_pid_file(box.logs / "web-child.pid")
+    # The waits ask the loopback address, not "localhost" (which may try ::1 first).
+    curl = " ".join(box.calls("curl"))
+    assert "http://127.0.0.1:8000/healthz" in curl and "http://127.0.0.1:3000" in curl
 
-    # Running it again starts nothing new, and opens the browser (on a Mac).
-    again = box.run("up")
+
+def test_up_replaces_a_stale_pid_file(running: Running) -> None:
+    assert running.api_pid != running.stale_pid
+    assert (running.box.root / ".atlas" / "api.pid").read_text().splitlines()[1] != STALE_START
+
+
+def test_up_again_starts_nothing_new(running: Running) -> None:
+    box = running.box
+    again = box.run("up", ATLAS_NO_OPEN="1")
     assert again.returncode == 0, again.stdout + again.stderr
-    assert f"API already running (pid {api_pid})" in again.stdout
-    assert f"Web already running (pid {web_pid})" in again.stdout
+    assert f"API already running (pid {running.api_pid})" in again.stdout
+    assert f"Web already running (pid {running.web_pid})" in again.stdout
     assert READY in again.stdout
-    assert box.pid("api") == api_pid and box.pid("web") == web_pid
+    assert box.pid("api") == running.api_pid and box.pid("web") == running.web_pid
     assert len([c for c in box.calls("uv") if "uvicorn" in c]) == 1
-    assert box.calls("pnpm").count("dev") == 1
-    if platform.system() == "Darwin":
-        assert box.calls("open") == ["http://localhost:3000"]
-    else:
-        assert box.calls("open") == []
+    assert [c for c in box.calls("pnpm") if c.startswith("dev")] == ["dev -H 127.0.0.1 -p 3000"]
 
-    # status: one line each, then the nightly scan's summary.
-    status = box.run("status")
+
+def test_up_again_opens_the_browser_on_a_mac(running: Running) -> None:
+    again = running.box.run("up")
+    assert again.returncode == 0, again.stdout + again.stderr
+    if platform.system() == "Darwin":
+        assert running.box.calls("open") == ["http://localhost:3000"]
+    else:
+        assert running.box.calls("open") == []
+
+
+def test_up_reports_an_api_that_never_answers_with_the_tail_of_its_log(box: Sandbox) -> None:
+    """Also pins the wait to wall-clock time: each failed attempt takes 2 s here, so counting
+    loop passes (the first version) would run for about 9 s, a deadline for about 5."""
+    started = time.monotonic()
+    out = box.run(
+        "up", ATLAS_NO_OPEN="1", FAKE_CURL_EXIT="7", FAKE_CURL_DELAY="2", ATLAS_API_WAIT_S="3"
+    )
+    elapsed = time.monotonic() - started
+    assert out.returncode == 1
+    shown = out.stdout + out.stderr
+    assert "The API didn't start; see logs/api.log" in shown
+    assert "api boot line" in shown, "the last lines of logs/api.log are printed"
+    assert "scripts/atlas.sh down" in shown, "the way to stop what was started is named"
+    assert READY not in shown
+    assert elapsed < 7.5, f"the 3 s wait took {elapsed:.1f} s"
+
+
+def test_up_reports_a_dashboard_that_never_answers_with_the_tail_of_its_log(
+    box: Sandbox,
+) -> None:
+    out = box.run("up", ATLAS_NO_OPEN="1", FAKE_FAIL_URL=":3000", ATLAS_WEB_WAIT_S="2")
+    assert out.returncode == 1
+    shown = out.stdout + out.stderr
+    assert "The web app didn't start; see logs/web.log" in shown
+    assert "web boot line" in shown
+    assert "The API didn't start" not in shown and READY not in shown
+
+
+# --- status --------------------------------------------------------------------------------
+
+
+def test_status_reports_each_piece_and_the_nightly_scan(running: Running) -> None:
+    status = running.box.run("status")
     assert status.returncode == 0, status.stderr
     for text in (
         "Docker",
         "running",
         "Postgres",
-        f"pid {api_pid}",
-        f"pid {web_pid}",
+        f"pid {running.api_pid}",
+        f"pid {running.web_pid}",
         "200",
         "2026-10-16",
         "3200",
@@ -385,36 +546,93 @@ def test_up_status_up_again_and_down(box: Sandbox) -> None:
         assert text in status.stdout, (text, status.stdout)
     assert "Telegram" in status.stdout and "Alpaca" in status.stdout
 
-    # A server that is running but not answering is reported as such, and status still succeeds.
-    sick = box.run("status", FAKE_CURL_EXIT="7")
-    assert sick.returncode == 0, sick.stderr
-    assert f"pid {api_pid} is running but" in sick.stdout
-    assert f"pid {web_pid} is running but" in sick.stdout and "answered nothing" in sick.stdout
 
-    # down: parents and their children stop, pid files go, containers stop (not removed).
+def test_status_reports_a_running_server_that_does_not_answer(running: Running) -> None:
+    sick = running.box.run("status", FAKE_CURL_EXIT="7")
+    assert sick.returncode == 0, sick.stderr
+    assert f"pid {running.api_pid} is running but" in sick.stdout
+    assert f"pid {running.web_pid} is running but" in sick.stdout
+    assert "answered nothing" in sick.stdout
+
+
+def test_status_with_the_database_down_says_so_and_gives_the_reason(box: Sandbox) -> None:
+    detail = "Can't reach the database. Is Postgres running? (connection refused)"
+    out = box.run("status", FAKE_STATUS_CODE="503", FAKE_STATUS_JSON=json.dumps({"detail": detail}))
+    assert out.returncode == 0, out.stderr
+    assert "API is up but its database isn't reachable" in out.stdout
+    assert detail in out.stdout
+    assert "didn't answer" not in out.stdout and "Traceback" not in out.stdout + out.stderr
+
+
+def test_status_with_an_answer_that_is_not_json_falls_back_without_a_traceback(
+    box: Sandbox,
+) -> None:
+    out = box.run("status", FAKE_STATUS_JSON="<html>502 Bad Gateway</html>")
+    assert out.returncode == 0, out.stderr
+    assert "couldn't read the status summary" in out.stdout
+    assert "Traceback" not in out.stdout + out.stderr and out.stderr == ""
+    # Valid JSON that is not the expected object behaves the same.
+    out = box.run("status", FAKE_STATUS_JSON="[1, 2, 3]")
+    assert "couldn't read the status summary" in out.stdout
+    assert "Traceback" not in out.stdout + out.stderr
+
+
+def test_status_succeeds_with_everything_down(box: Sandbox) -> None:
+    out = box.run("status", FAKE_DOCKER_INFO_EXIT="1", FAKE_CURL_EXIT="7")
+    assert out.returncode == 0, out.stderr
+    assert "Traceback" not in out.stdout + out.stderr
+    for text in ("Docker", "Postgres", "API", "Web", "not running", "didn't answer"):
+        assert text in out.stdout, (text, out.stdout)
+
+
+# --- down ----------------------------------------------------------------------------------
+
+
+def test_down_stops_process_trees_and_stops_containers(running: Running) -> None:
+    box = running.box
     down = box.run("down")
     assert down.returncode == 0, down.stdout + down.stderr
-    for pid in (api_pid, web_pid, api_child, web_child):
+    for pid in (running.api_pid, running.web_pid, running.api_child, running.web_child):
         assert _wait_dead(pid), f"pid {pid} still running after down"
     assert not list((box.root / ".atlas").glob("*.pid"))
     docker = box.calls("docker")
     assert "compose -f infra/docker/docker-compose.yml stop" in docker
     assert not any(" down" in f" {c}" for c in docker)
 
-    # And with nothing running, status says so and still succeeds.
-    after = box.run("status", FAKE_CURL_EXIT="7")
+
+def test_status_after_down_says_not_running(running: Running) -> None:
+    running.box.run("down")
+    after = running.box.run("status", FAKE_CURL_EXIT="7")
     assert after.returncode == 0
     assert "not running" in after.stdout
 
 
-def test_up_reports_an_api_that_never_answers_with_the_tail_of_its_log(box: Sandbox) -> None:
-    out = box.run("up", ATLAS_NO_OPEN="1", FAKE_CURL_EXIT="7", ATLAS_API_WAIT_S="1")
-    assert out.returncode == 1
-    shown = out.stdout + out.stderr
-    assert "The API didn't start; see logs/api.log" in shown
-    assert "api boot line" in shown, "the last lines of logs/api.log are printed"
-    assert READY not in shown
-    assert "scripts/atlas.sh down" in shown, "the way to stop what was started is named"
+def test_pid_check_survives_a_different_timezone_and_locale(box: Sandbox) -> None:
+    """``ps -o lstart`` prints local time. The start time recorded by ``up`` under one TZ and
+    locale must still match when ``status`` and ``down`` run under another, or ``down`` would
+    leave the servers running."""
+    up = box.run(
+        "up",
+        ATLAS_NO_OPEN="1",
+        TZ="Asia/Kuala_Lumpur",
+        LANG="en_GB.UTF-8",
+        LC_ALL="en_GB.UTF-8",
+    )
+    assert up.returncode == 0, up.stdout + up.stderr
+    api_pid, web_pid = box.pid("api"), box.pid("web")
+    api_child = _read_pid_file(box.logs / "api-child.pid")
+    web_child = _read_pid_file(box.logs / "web-child.pid")
+
+    status = box.run("status", TZ="UTC")
+    assert f"pid {api_pid}" in status.stdout and f"pid {web_pid}" in status.stdout
+    again = box.run("up", ATLAS_NO_OPEN="1", TZ="America/Los_Angeles")
+    assert f"API already running (pid {api_pid})" in again.stdout, again.stdout + again.stderr
+
+    down = box.run("down", TZ="UTC")
+    assert down.returncode == 0, down.stdout + down.stderr
+    for pid in (api_pid, web_pid, api_child, web_child):
+        assert _wait_dead(pid), f"pid {pid} still running after down under another TZ"
+    assert not list((box.root / ".atlas").glob("*.pid"))
 
 
 def test_a_pid_file_for_someone_elses_process_is_never_trusted_or_killed(box: Sandbox) -> None:
@@ -424,9 +642,7 @@ def test_a_pid_file_for_someone_elses_process_is_never_trusted_or_killed(box: Sa
     try:
         (box.root / ".atlas").mkdir()
         for name in ("api", "web"):
-            (box.root / ".atlas" / f"{name}.pid").write_text(
-                f"{stranger.pid}\nMon Jan  1 00:00:00 2001\n"
-            )
+            (box.root / ".atlas" / f"{name}.pid").write_text(f"{stranger.pid}\n{STALE_START}\n")
         status = box.run("status", FAKE_CURL_EXIT="7")
         assert status.returncode == 0
         assert f"pid {stranger.pid}" not in status.stdout
@@ -439,18 +655,22 @@ def test_a_pid_file_for_someone_elses_process_is_never_trusted_or_killed(box: Sa
         stranger.wait()
 
 
-# --- status and down never fail hard -------------------------------------------------------
-
-
-def test_status_succeeds_with_everything_down(box: Sandbox) -> None:
-    out = box.run("status", FAKE_DOCKER_INFO_EXIT="1", FAKE_CURL_EXIT="7")
-    assert out.returncode == 0, out.stderr
-    assert "Traceback" not in out.stdout + out.stderr
-    for text in ("Docker", "Postgres", "API", "Web", "not running"):
-        assert text in out.stdout, (text, out.stdout)
-
-
 def test_down_with_nothing_running_and_docker_stopped_succeeds(box: Sandbox) -> None:
     out = box.run("down", FAKE_DOCKER_INFO_EXIT="1")
     assert out.returncode == 0, out.stdout + out.stderr
     assert not any("stop" in c for c in box.calls("docker"))
+
+
+def test_down_reports_a_port_that_stays_in_use_after_a_pause(box: Sandbox) -> None:
+    started = time.monotonic()
+    out = box.run("down", FAKE_BUSY_PORT="8000")
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert "Port 8000 is still in use by pid 4242" in out.stderr
+    assert time.monotonic() - started >= 2, "the port was re-checked before it was reported"
+
+
+def test_down_does_not_report_a_port_that_frees_up_a_moment_later(box: Sandbox) -> None:
+    out = box.run("down", FAKE_BUSY_PORT="8000", FAKE_BUSY_CALLS="1")
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert "still in use" not in out.stdout + out.stderr
+    assert int((box.logs / "lsof.count").read_text()) >= 2
