@@ -1,33 +1,8 @@
 'use client';
 
-import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { useEffect, useRef, useState } from 'react';
-import { errorText } from '@/lib/error-text';
 import { dateTimeET, sessionDate } from '@/lib/format';
-import { swingApi } from '@/lib/swing-api';
-import type { FreshnessOut, RegimeOut, StatusOut, TodayOut } from '@/lib/swing-types';
-
-const SCAN_STARTED_TEXT = 'Scan started.';
-const SCAN_STARTING_TEXT = 'Scan is starting…';
-const SCAN_RUNNING_TEXT = 'Scan running…';
-
-// How long, after a scan was asked for, the page checks for it every few seconds.
-const POLL_MS = 3_000;
-const GIVE_UP_MS = 45_000;
-// The server stamps a run's start with its own clock; allow for the browser's being a little off.
-const CLOCK_SKEW_MS = 5_000;
-
-/**
- * Whether the scan asked for at `clickedAt` (a `Date.now()` value) has finished: the latest job
- * run started after the click and is no longer running. Today's own fields can't say so when a
- * quick scan of the same session ends between two looks, but the run's start time can.
- */
-export function scanSettled(status: StatusOut, clickedAt: number): boolean {
-  const last = status.last_scan;
-  if (last === null || last.status === 'running' || last.started_at === null) return false;
-  const started = Date.parse(last.started_at);
-  return Number.isFinite(started) && started >= clickedAt - CLOCK_SKEW_MS;
-}
+import type { FreshnessOut, RegimeOut, TodayOut } from '@/lib/swing-types';
+import { useRunScan } from '@/lib/use-run-scan';
 
 const REGIME_TONE: Record<string, string> = {
   uptrend: 'text-bull',
@@ -77,72 +52,13 @@ function Market({ regime }: { regime: RegimeOut | null }) {
   );
 }
 
-type Notice = { kind: 'starting' | 'started' | 'error'; text: string };
-
 /**
  * The top of Today: the market regime and breadth, how fresh the data is, and the "Run scan now"
- * button. The button is off while a scan runs or the request is in flight; it never claims the
- * scan's results, only that a scan was asked for.
+ * button. The button's behaviour is `useRunScan`'s, shared with the status panel on Settings.
  */
 export function RegimeBanner({ today }: { today: TodayOut }) {
   const { freshness, regime } = today;
-  const queryClient = useQueryClient();
-  const [notice, setNotice] = useState<Notice | null>(null);
-  const running = freshness.last_scan_status === 'running';
-  const kind = notice?.kind;
-
-  const scan = useMutation({
-    mutationFn: () => swingApi.runScan(),
-    onSuccess: (out) =>
-      setNotice(
-        out.starting
-          ? { kind: 'starting', text: SCAN_STARTING_TEXT }
-          : { kind: 'started', text: SCAN_STARTED_TEXT },
-      ),
-    // 409 (a scan is already running) and 503 (it cannot start) carry the server's reason.
-    onError: (err) => setNotice({ kind: 'error', text: errorText(err) }),
-    onSettled: () => queryClient.invalidateQueries({ queryKey: ['today'] }),
-  });
-
-  // "Starting" has done its job once the scan shows as running; when the run ends, the notes go.
-  const wasRunning = useRef(running);
-  useEffect(() => {
-    if (running && kind === 'starting') setNotice({ kind: 'started', text: SCAN_STARTED_TEXT });
-    if (wasRunning.current && !running) setNotice(null);
-    wasRunning.current = running;
-  }, [running, kind]);
-
-  // After a 202 the job may not be recorded yet, and a quick one can finish between two looks at
-  // Today. So for a while, look again every few seconds, at Today and at the latest job run: once
-  // that run started after the click and has ended, the scan is over and the note and the lock go.
-  const clickedAt = useRef(0);
-  useEffect(() => {
-    if (kind !== 'starting' && kind !== 'started') return;
-    let alive = true;
-    const look = () => {
-      void queryClient.invalidateQueries({ queryKey: ['today'] });
-      swingApi
-        .status()
-        .then((status) => {
-          if (alive && scanSettled(status, clickedAt.current)) setNotice(null);
-        })
-        .catch(() => undefined); // the next look tries again
-    };
-    look();
-    const poll = window.setInterval(look, POLL_MS);
-    // Give up GIVE_UP_MS after the click, however often this effect runs again (starting -> started).
-    const left = Math.max(0, GIVE_UP_MS - (Date.now() - clickedAt.current));
-    const giveUp = window.setTimeout(() => setNotice(null), left);
-    return () => {
-      alive = false;
-      window.clearInterval(poll);
-      window.clearTimeout(giveUp);
-    };
-  }, [kind, queryClient]);
-
-  const busy = running || scan.isPending || kind === 'starting' || kind === 'started';
-  const message: Notice | null =
-    notice ?? (running ? { kind: 'started', text: SCAN_RUNNING_TEXT } : null);
+  const { message, busy, start } = useRunScan(freshness.last_scan_status === 'running');
 
   return (
     <section
@@ -168,11 +84,7 @@ export function RegimeBanner({ today }: { today: TodayOut }) {
           <button
             type="button"
             disabled={busy}
-            onClick={() => {
-              clickedAt.current = Date.now();
-              setNotice(null);
-              scan.mutate();
-            }}
+            onClick={start}
             className="rounded border border-accent-muted px-3 py-1.5 text-sm text-accent hover:bg-accent/10 focus-visible:outline focus-visible:outline-1 focus-visible:outline-accent disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
           >
             Run scan now
