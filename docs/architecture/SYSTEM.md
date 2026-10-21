@@ -4,16 +4,20 @@ Single-page tour of what's built, how it fits together, and the things that
 were intentionally left out. Complements `BLUEPRINT.md` (the design target)
 with the actual delivered shape.
 
-> **Status (0.24.0):** the **rules-based daily swing engine**
-> (`apps/swing-engine`, CLI only so far) is the primary path. The 8-engine
+> **Status (0.25.0):** the **rules-based daily swing engine**
+> (`apps/swing-engine`, with its product layer in `apps/signal-service` and the
+> four dashboard pages in `apps/web`) is the primary path. Both of its setups
+> (`breakout-v1`, `pullback-v1`) **failed** their single out-of-sample test, so
+> both are Research only and every idea is shown as Unproven. The 8-engine
 > composite described in BLUEPRINT v2, the XGBoost trend model and the
 > 1-minute signal path are **legacy**: the code is kept and still serves the
-> dashboard, but it is no longer the default recommendation path
+> older dashboard pages, but it is no longer the default recommendation path
 > ([ADR-0003](../adr/0003-rules-based-swing-engine.md)). All 30 GAP_AUDIT items
 > for the BLUEPRINT v2 alignment are closed. The swing engine is built to the
 > §22 non-negotiables; the legacy composite is known to fall short of "no fake
-> confidence" (see the §22 table below). 1,115 backend tests passing (9
-> skipped: they need a local Postgres, a DeepSeek key or seeded data),
+> confidence" (see the §22 table below). 1,665 backend tests passing with a local
+> Postgres up (6 skipped: they need a DeepSeek key, seeded data or a machine
+> with no Postgres; without Postgres the database tests skip instead),
 > dashboard typecheck clean.
 
 ## Swing engine (rules-based daily)
@@ -83,10 +87,61 @@ test before it is shown as Live (spec
              AND its protocol block equals the current config
 ```
 
-Phase 1 (this release) ships the engine, the CLI and the validation harness.
-The nightly job, forward tracking, positions, dashboard pages and Telegram
-digest are Phase 2
-(`docs/superpowers/plans/2026-10-18-swing-engine-phase2.md`).
+### Product layer (0.25.0)
+
+The engine above is a library plus a CLI. The product layer runs it every night
+inside the one API process and puts it on the dashboard.
+
+```
+   signal_service.main lifespan
+      swing_engine.scheduler      16:45 ET (close + 45 min; 13:45 on a half day), catch-up at
+                                  start when a due session is missing, retry every 15 min while a
+                                  catch-up fails; off with ATLAS_DISABLE_SCHEDULER=1 or under pytest
+          │            (the same job: "Run scan now" = POST /v1/scan/run, and
+          │             `python -m swing_engine job`)
+          ▼
+   swing_engine.job.run_job       one job at a time per process; every step recorded in swing_job_runs
+      assets    weekly asset-list refresh
+      bars      first run: resumable backfill (progress done/total); later: split-aware update
+      scan      every missed session in order (loader.py -> scan.py); ideas stored with their
+                narration (narrate.py); reconstructed = saved after its session opened
+      tracking  tracking.py: re-simulate pending/open ideas with execution.simulate_trade
+      positions positions.py: nightly action for each recorded position
+      digest    digest.py: one Telegram message per session, validated ideas only
+          │
+          ▼
+   Postgres (migration 0010)  swing_settings · swing_scans · swing_ideas · swing_positions ·
+                              swing_job_runs · swing_digests
+          │
+          ▼
+   signal_service.swing_routes (/v1/today, /v1/stocks, /v1/positions, /v1/track-record,
+      /v1/settings, /v1/scan/run, /v1/system/status)
+      reads the stored scan and job rows, the committed ml/validation reports, and the
+      swing_context cache (the job's target-session ScanContext, for stock and position pages)
+          │
+          ▼
+   apps/web: Today · Positions · Track record · Settings · stock page ("Check a stock")
+```
+
+Module map (all under `apps/swing-engine/src/swing_engine/` unless noted):
+`settings.py` (validated account settings), `product_store.py` (the six tables),
+`tracking.py` (forward tracking and the live/reconstructed rule), `positions.py`
+(nightly actions, split rescale, stop ratchet), `narrate.py` (plain-English
+reason and what cancels an idea), `checklist.py` (the stock page's rule
+checklist), `digest.py` (Telegram text and delivery), `loader.py` (stored bars
+to a `Panel`), `job.py`, `scheduler.py`. In `apps/signal-service/src/signal_service/`:
+`swing_routes.py` (the routes), `swing_context.py` (the context cache),
+`swing_track_record.py` (the track-record reader over `ml/validation` and the
+stored ideas), `swing_deps.py` (the job's real dependencies, shared by the
+scheduler and "Run scan now").
+
+Invariants the product layer keeps: it places no orders (`auto_execution`
+reports the API's startup flag, off by default), it shows a stated reason
+instead of an empty area, every idea from a setup that has not passed testing is
+tagged Unproven and left out of the digest, one set of ideas exists per
+(session, symbol, setup) with the first `published_at` kept, and a position in a
+stock with no bar on the scan day gets an explicit *no price data* action
+instead of a stale stop. Single user: the swing tables have no `user_id`.
 
 ## Legacy composite pipeline (lifecycle, end-to-end)
 
@@ -163,6 +218,10 @@ Background loops in the `signal-service` lifespan:
   evaluation on it (§12.2 event derivation) are **off by default**; set
   `ATLAS_ENABLE_LEGACY_SIGNAL_STREAM=1` in the real shell environment before
   the process starts (it is read at import time, not from `.env`).
+- **swing scheduler** — on by default; runs the nightly job at the close plus
+  45 minutes and catches up missed sessions at start. `ATLAS_DISABLE_SCHEDULER=1`
+  turns it off; it never starts under pytest. It also warms the swing context
+  cache in the background. It places no orders.
 - **monitor** (10s) — **disabled by default**; enable with
   `ATLAS_ENABLE_AUTO_EXECUTION=1`. Sweeps open positions, persists trailing
   state, exits triggered positions via the execution engine. §22 #6
@@ -188,9 +247,9 @@ Background loops in the `signal-service` lifespan:
 | `apps/alert-service` | **`derive_events()`** (§12.2: 7 triggers) · `AlertEngine` (cooldown + dispatch + last-signal state) · log / webhook / telegram / email channels · **§12.3 Telegram layout** |
 | `apps/backtest-service` | event-driven simulator · walk-forward · cost sensitivity · bootstrap-CI Sharpe · deflated Sharpe |
 | `apps/execution-service` | paper + Alpaca brokers · `ExecutionEngine` · ladder `plan_exit` + chandelier trail · `run_monitor_once` (**opt-in**) |
-| `apps/signal-service` | FastAPI surface — routes / WS / lifespan loops / middleware · `/metrics` · `screener.py` · `providers.py` |
-| `apps/swing-engine` | **Primary path.** Rules-based daily swing engine (US common stocks, long-only, no order placement). **Data:** Alpaca SIP daily bars (`adjustment=all`, stored as `1d`) plus unadjusted raw bars (`1d_raw`, price floor only), resumable `backfill` (`--refresh-assets` picks up new listings and delistings; a stored asset list is otherwise reused) and split-aware `update` (overlap check, full refetch when the adjustment moved) · **Assets:** active and delisted Alpaca assets classified into operating-company stock vs ETF / fund / SPAC / warrant / unit / right / preferred / OTC · **Calendar:** `/v2/calendar` sessions, half days, 16-minute SIP delay · **Panel + indicators:** wide `Panel`, strict per-segment SMA / EMA / Wilder ATR / RSI (a gap of more than 10 sessions restarts a symbol) · **Universe:** point-in-time price / dollar-volume / history / minimum-volatility (ATR14 at least 0.5% of close, which drops price-pinned buyout targets) / asset-kind screen · **Regime:** SPY uptrend / mixed / downtrend, plus breadth · **Leaders / RS:** weighted 63/126/189/252-session return percentile and the leader gate · **Setups:** `breakout-v1`, `pullback-v1` (versioned frozen params) · **Fill / exit model:** one `simulate_trade` used by scan, backtest and baseline (next-session buy-stop, no chase, gap-through stops, chandelier trail, time stop, `delisted` exit) · **Sizing:** fixed-fractional with position / count / open-risk caps and correlation overlap flags · **Scan:** look-ahead-free nightly scan, ranked ideas, watch-only in a downtrend · **Backtest:** trade list, stats, 100-seed random-entry baseline, capacity-limited portfolio sim vs SPY buy-and-hold · **Validation:** pre-registered in-sample grid, one-shot out-of-sample run, ship gate, Live / Research-only verdicts in `ml/validation/` · CLI `python -m swing_engine backfill\|update\|scan\|insample\|oos` · synthetic test helpers |
-| `apps/web` | Next.js 14 dashboard — **8 pages**, WS-driven cache, lightweight-charts, full §11 surface |
+| `apps/signal-service` | FastAPI surface — routes / WS / lifespan loops / middleware · `/metrics` · `screener.py` · `providers.py` · **swing product routes** (`swing_routes.py`, `swing_context.py`, `swing_track_record.py`, `swing_deps.py`) and the **nightly scheduler** started in the lifespan |
+| `apps/swing-engine` | **Primary path.** Rules-based daily swing engine (US common stocks, long-only, no order placement). **Data:** Alpaca SIP daily bars (`adjustment=all`, stored as `1d`) plus unadjusted raw bars (`1d_raw`, price floor only), resumable `backfill` (`--refresh-assets` picks up new listings and delistings; a stored asset list is otherwise reused) and split-aware `update` (overlap check, full refetch when the adjustment moved) · **Assets:** active and delisted Alpaca assets classified into operating-company stock vs ETF / fund / SPAC / warrant / unit / right / preferred / OTC · **Calendar:** `/v2/calendar` sessions, half days, 16-minute SIP delay · **Panel + indicators:** wide `Panel`, strict per-segment SMA / EMA / Wilder ATR / RSI (a gap of more than 10 sessions restarts a symbol) · **Universe:** point-in-time price / dollar-volume / history / minimum-volatility (ATR14 at least 0.5% of close, which drops price-pinned buyout targets) / asset-kind screen · **Regime:** SPY uptrend / mixed / downtrend, plus breadth · **Leaders / RS:** weighted 63/126/189/252-session return percentile and the leader gate · **Setups:** `breakout-v1`, `pullback-v1` (versioned frozen params) · **Fill / exit model:** one `simulate_trade` used by scan, backtest and baseline (next-session buy-stop, no chase, gap-through stops, chandelier trail, time stop, `delisted` exit) · **Sizing:** fixed-fractional with position / count / open-risk caps and correlation overlap flags · **Scan:** look-ahead-free nightly scan, ranked ideas, watch-only in a downtrend · **Backtest:** trade list, stats, 100-seed random-entry baseline, capacity-limited portfolio sim vs SPY buy-and-hold · **Validation:** pre-registered in-sample grid, one-shot out-of-sample run, ship gate, Live / Research-only verdicts in `ml/validation/` · **Product layer (0.25.0):** `settings.py`, `product_store.py` (migration 0010 tables), `tracking.py` (split-safe forward tracking, live vs reconstructed), `positions.py` (nightly action per position), `narrate.py`, `checklist.py`, `digest.py` (Telegram, validated ideas only), `loader.py`, `job.py` (the nightly job with catch-up), `scheduler.py` (16:45 ET) · CLI `python -m swing_engine backfill\|update\|scan\|job\|insample\|oos` · synthetic test helpers |
+| `apps/web` | Next.js 14 dashboard — **4 swing pages** (Today, Positions, Track record, Settings) plus the stock page `/stocks/[symbol]`, and the **8 legacy composite pages** kept at their old addresses; TanStack Query, lightweight-charts |
 
 ## HTTP surface
 
@@ -213,7 +272,20 @@ POST   /v1/execute                            — open/close (tier-gated)
 GET    /v1/orders                             — order history (per user)
 WS     /v1/stream                             — regime push (signals only with ATLAS_ENABLE_LEGACY_SIGNAL_STREAM=1)
 
-# Phase 2 — Screener (BLUEPRINT §13.2)
+# Swing product (0.25.0) — signal_service/swing_routes.py; single user, no auth dependency
+GET    /v1/today                              — latest scan: validated / unproven / watch-only ideas, position actions, capacity
+GET    /v1/stocks/{symbol}                    — chart bars, tonight's levels, eligibility checklist
+GET    /v1/positions            POST          — the user's open and closed trades (record a trade)
+PATCH  /v1/positions/{id}                     — move the stop
+POST   /v1/positions/{id}/close               — close at the price the user got (result in R)
+GET    /v1/track-record                       — per setup: in-sample, out-of-sample (every failed condition), live record
+GET    /v1/settings             PUT           — account and risk settings, universe floors, digest switch
+POST   /v1/settings/telegram-test             — send one fixed test message
+POST   /v1/scan/run                           — "Run scan now": 202 started, 409 already running, 503 cannot start
+GET    /v1/system/status                      — data as of, last scan + steps, next scan, backfill progress,
+                                                keys configured, scheduler running/off and why
+
+# Legacy Phase 2 — Screener (BLUEPRINT §13.2)
 GET    /v1/screener/universes                 — built-in universes + metadata
 POST   /v1/screener/run                       — ranked candidates with gate reasons
 
@@ -225,18 +297,32 @@ GET    /v1/providers/status                   — 12 deps × configured / availa
 GET    /v1/data/freshness                     — per-symbol last-bar age + macro snapshot age
 ```
 
-## Dashboard pages (8)
+## Dashboard pages
 
-These pages and the HTTP surface above belong to the legacy composite. The
-swing engine has no HTTP routes or dashboard pages yet (Phase 2).
+Browser calls go to `/api/*`, which `next.config.js` rewrites to the API. Data
+fetching is client-side TanStack Query. API types for the swing pages are
+hand-mirrored in `apps/web/src/lib/swing-types.ts`, the legacy ones in
+`types.ts`; update them when a response shape changes.
+
+**Swing pages (primary; the nav bar):**
 
 | Page | Surface |
 |---|---|
-| `/` | Quick-scan input (1 ticker → symbol page; many → `/scanner`), watchlist with live composite scores, BLUEPRINT explainer card, §23 disclaimer. |
+| `/` Today | Market line (`UPTREND, new trades OK` / `MIXED, half-size trades` / `DOWNTREND, stand aside: no new buy ideas`), ranked validated ideas, the muted `Unproven ideas: these setups have not passed testing` section, watch-only names in a downtrend, nightly actions for open positions, last-scan status and failure copy, first-run download progress, **Run scan now**, disclaimer. |
+| `/stocks/[symbol]` | Reached from "Check a stock" (the search box on every page) or an idea: daily chart with levels, the eligibility checklist, "I bought this". |
+| `/positions` | Record trades placed with the user's broker, the nightly action, stop edit, close at the user's price, closed trades with R and hold time. |
+| `/track-record` | Per setup: in-sample, out-of-sample (with each failed condition), live record, verdict. |
+| `/settings` | Account, risk and universe settings, Telegram digest switch and test, system status panel; links to `/settings/legacy`. |
+
+**Legacy composite pages (kept, reachable by address, not in the nav; the legacy
+HTTP surface above serves them):**
+
+| Page | Surface |
+|---|---|
 | `/scanner` | Universe dropdown, manual symbol append, horizon / min-composite / top-N / explain controls. Full §11.3 column set. Collapsible no-signal-reasons + skipped-symbols. |
 | `/symbols/{symbol}` | Price chart (entry/stop/T1-T3 lines) · SignalCard · **§10.3 ExplanationPanel** (renders the structured payload inline — or the no-signal reason when gated) · macro + sentiment snapshots. |
 | `/alerts` | Alert rules CRUD + deliveries audit. |
-| `/settings` | Watchlist editor · **ProvidersStatusPanel** (12 deps × config / fallback) · TierSwitcher. |
+| `/settings/legacy` | Watchlist editor · **ProvidersStatusPanel** (12 deps × config / fallback) · TierSwitcher. |
 | `/backtest` | Walk-forward synthetic backtest with cost sweep + Sharpe CI. |
 | `/portfolio` | Holdings · sector exposure · VaR strip. |
 | `/journal` | Closed-trade log + attribution. |
@@ -248,6 +334,12 @@ swing engine has no HTTP routes or dashboard pages yet (Phase 2).
   `'1d_raw'` (unadjusted), `ts` = session date at 00:00 UTC, plus the `assets`
   table. Legacy 1-minute bars share the hypertable; every swing read filters
   on its two resolutions.
+- **Swing product tables** (migration `0010`, `DOUBLE PRECISION` / `JSONB`,
+  no `user_id`) — `swing_settings` (one row), `swing_scans` (one per scanned
+  session, payload JSON, `reconstructed`), `swing_ideas` (one per session ×
+  symbol × setup, with forward-tracking columns and `known_date`),
+  `swing_positions` (what the user says they hold), `swing_job_runs` (per-step
+  log), `swing_digests` (one row per session and kind, so a digest goes out once).
 - **Redis** — macro snapshot (read by the API every signal request).
 - **joblib** — legacy trend model registry (`ml/registry/trend/<version>.joblib`).
   `load_trend_model` refuses artifacts without the per-symbol label scheme
@@ -264,7 +356,8 @@ swing engine has no HTTP routes or dashboard pages yet (Phase 2).
 
 `0001_initial` (bars + signals) · `0002_news` · `0003_portfolio` · `0004_journal`
 · `0005_watchlist` · `0006_alerts` · `0007_user_scoping` · `0008_orders`
-· `0009_swing_assets` (the swing engine's `assets` table and a `bars (resolution, ts)` index).
+· `0009_swing_assets` (the swing engine's `assets` table and a `bars (resolution, ts)` index)
+· `0010_swing_product` (the six swing product tables above).
 
 ## §22 non-negotiables status
 
@@ -307,7 +400,12 @@ composite does **not** meet "no fake confidence".
 | **Hosted notebooks / browser strategy editor** | The CLI + API cover the use case. | Power users want browser-based strategy authoring. |
 | **Multi-region active-active** | One region, one VM. | Latency SLO per geography becomes a contract obligation. |
 | **Public API SDKs / marketplace / billing** | No paying users yet. | First customer signs the dotted line. |
-| **Swing engine product layer** (nightly job, forward tracking, positions, dashboard pages, Telegram digest) | Phase 1 ships the engine, CLI and validation harness. The product layer is planned in `docs/superpowers/plans/2026-10-18-swing-engine-phase2.md`. | Phase 2. |
+| **Proper ESLint setup for `apps/web`** | `pnpm lint` is broken at baseline (no ESLint config; eslint 9 against `eslint-config-next` 14 crashes), and fixing it would lint every legacy page. Phase 2 verified its files with `pnpm typecheck`, `pnpm build` and a one-off ESLint run over the files each task touched. | A separate change: eslint 8, or a compatible flat config, then clean the legacy pages. |
+| **Postgres advisory lock for cross-process jobs** | The job's lock is an in-process `asyncio.Lock`, so `python -m swing_engine job` can overlap the API's scheduler. A once-per-session digest record limits the damage to a narrow duplicate-digest race. Single user, one machine. | A second process routinely runs jobs (cron plus API), or a duplicate digest is ever seen. |
+| **Stop-history storage** | A position keeps its current stop; the Positions page shows the latest action but not every earlier stop. The spec's "stop history" needs a table or column. | When the history is wanted on the Positions page. |
+| **Earnings-date source** | Free sources need a new key, and a guess is worse than nothing. Without one the "earnings within 10 sessions" badge is simply not shown. | When a free, reliable earnings calendar is added. |
+| **`ref_close` per idea (exact split rescale)** | Forward tracking rescales an idea's published levels after a split from the ATR ratio, which is sensitive to a revised signal-day bar and ignores dividend-sized (under 0.5%) restatements. Storing the signal-day close with each idea (a new migration) makes it exact. Rare and small in effect. | A mis-tracked fill near the trigger is seen, or the live record is relied on for a split-heavy stretch. |
+| **`avg_hold` in the live record** | `sessions_held` is not stored on a tracked idea, so the live statistics' average hold is empty (the validation reports have it). Needs migration 0011. | When live hold time is wanted next to the tested figure. |
 | **ML ranker for the swing engine** | The audit found no edge in the legacy model; the engine is rules-based and every rule has to pass out-of-sample testing first (ADR-0003). | Only if a model beats the rules out of sample under the same pre-registration protocol. |
 | **Real social sentiment (Twitter / Reddit)** | `s_sent` formula reserves 30% weight for social; today wired from news data only. | When a social-data adapter exists and the lift on signal quality justifies it. |
 

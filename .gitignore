@@ -60,6 +60,9 @@ secrets/
 # Logs
 *.log
 logs/
+
+# scripts/atlas.sh state (pid files)
+.atlas/
 GAP_AUDIT.md
 
 # Docker volumes

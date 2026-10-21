@@ -4,6 +4,139 @@ Chronological record of what shipped across the build. Newest first.
 Every entry maps to a turn in the build log; phase numbers reference
 `docs/architecture/BLUEPRINT.md` §18.
 
+## 0.25.0 — Swing engine Phase 2: nightly job, dashboard, positions, track record, Telegram digest, one-command start
+
+The engine from 0.24.0 becomes a product you can run: it scans by itself after
+each close, follows its own ideas forward, checks the trades you record, tells
+you on Telegram, and shows all of it on four plain-English pages. One command
+starts the whole stack. Design: the
+[spec](docs/superpowers/specs/2026-10-18-atlas-swing-rebuild-design.md);
+plan: [Phase 2](docs/superpowers/plans/2026-10-18-swing-engine-phase2.md).
+
+### Where the setups stand (validation results committed before this release)
+
+Both pre-registered v1 setups were run once on the out-of-sample window
+(2023-01-01 to 2026-10-16; 5,717 symbols, delisted coverage 73%, so the profit
+factor bar is 1.30) and **both failed**. They are **Research only**, so every
+idea is shown as Unproven and none goes in the Telegram digest.
+
+- `breakout-v1`: 1,760 triggered ideas (657 distinct trades), expectancy +0.06R
+  against +0.09R for random entries, profit factor 1.11 (needs 1.30), worst
+  drawdown 20% against SPY's 19%; as a portfolio about -0.1% a year.
+- `pullback-v1`: 18,273 triggered ideas (8,606 distinct trades), expectancy
+  +0.04R against +0.07R for random entries, profit factor 1.06 (needs 1.30),
+  worst drawdown 46% against SPY's 19%; as a portfolio about -12% a year.
+- Each family has used 1 of its 3 out-of-sample runs. A failed test is a
+  result, not a defect: these rules, as written, have not shown an edge on
+  this data. The product is honest about it everywhere (Today, Track record,
+  the digest, the README).
+
+### New: the product layer (`apps/swing-engine`, `apps/signal-service`)
+
+- **Nightly job** (`swing_engine.job`, `python -m swing_engine job`). Steps
+  `assets`, `bars`, `scan`, `tracking`, `positions`, `digest`, each recorded as
+  it runs. It targets the last session whose close is 45+ minutes old, so it
+  never publishes on unsettled bars. It catches up every missed session in
+  order (their ideas are marked *reconstructed* and never count toward the live
+  record) and sends **one** digest that lists the missed days. Scans are
+  upserts keyed by (session, symbol, setup) that keep the first `published_at`,
+  so running a session twice changes nothing and sends nothing twice. The
+  CPU-bound work runs off the event loop. One job runs at a time per process.
+- **Scheduler** (`swing_engine.scheduler`, started in the API lifespan). Runs
+  the job at 16:45 ET (13:45 on a half day; the DST switch is handled), catches
+  up at start when a due session is missing, retries a failing catch-up every
+  15 minutes, survives a sleeping Mac by re-reading the wall clock, and never
+  stops the API from starting. Off with `ATLAS_DISABLE_SCHEDULER=1` and never
+  started under pytest.
+- **Forward tracking** (`tracking.py`). Every published idea is re-simulated each
+  night with the same fill and exit model as the tests. Split-safe: published
+  levels are rescaled when a later split restates the bars.
+- **Positions** (`positions.py`). Record a trade you placed; each night ATLAS
+  says hold, raise the stop, stop hit, time limit, or *no price data for X since
+  DATE* for a stock with no bar. It also splits-adjusts the position and never
+  lowers a stop. It places no order.
+- **Plain English** (`narrate.py`, `checklist.py`). Each idea carries a one-line
+  reason and what cancels it; the stock page lists every rule a stock passes or
+  fails.
+- **Telegram digest** (`digest.py`). Validated ideas only, at most five, never a
+  stock you hold, never a zero-share idea, nothing to buy in a downtrend, your
+  positions' actions, the disclaimer; one failure notice per session if the
+  scan fails; both switch off in Settings.
+- **Migration `0010_swing_product`**: `swing_settings`, `swing_scans`,
+  `swing_ideas`, `swing_positions`, `swing_job_runs`, `swing_digests`
+  (`DOUBLE PRECISION` / `JSONB`, single user).
+- **API** (`swing_routes.py`, `swing_context.py`, `swing_track_record.py`,
+  `swing_deps.py`): `GET /v1/today`, `GET /v1/stocks/{symbol}`, `GET` / `POST`
+  `/v1/positions`, `PATCH /v1/positions/{id}`, `POST /v1/positions/{id}/close`,
+  `GET /v1/track-record`, `GET` / `PUT /v1/settings`,
+  `POST /v1/settings/telegram-test`, `POST /v1/scan/run` (202, 409 while one
+  runs, 503 with the reason) and `GET /v1/system/status`. A database that is
+  down answers 503 with a readable reason. The current verdict gates what
+  counts as Live at read time.
+
+### New: the dashboard (`apps/web`)
+
+- **Four pages**: Today, Positions, Track record, Settings, plus the stock page
+  (`/stocks/[symbol]`, "Check a stock" on every page). Plain labels, no jargon
+  on the primary pages. Every page says why it is empty instead of showing a
+  blank area (API unreachable, first-time download with a percentage, nothing
+  passed testing, no setup met its rules, last scan failed at step X with the
+  previous scan still shown), and the market line reads *UPTREND, new trades
+  OK*, *MIXED, half-size trades* or *DOWNTREND, stand aside: no new buy ideas*.
+- **Unproven ideas** sit under the exact heading *Unproven ideas: these setups
+  have not passed testing*, muted and tagged, on Today.
+- **Run scan now** on Today and Settings; a system status panel (data as of,
+  last scan and steps, next scan, first-download progress, keys configured).
+- The eight composite pages are **legacy**: kept, reachable by address
+  (`/scanner`, `/symbols/[symbol]`, `/alerts`, `/backtest`, `/portfolio`,
+  `/journal`, and the old settings at `/settings/legacy`), out of the nav.
+
+### New: `scripts/atlas.sh`
+
+`scripts/atlas.sh up | down | status | help`. `up` checks `uv`, `pnpm`, `.env`
+and Docker (*"Docker isn't running. Start Docker Desktop, then run:
+scripts/atlas.sh up"*), starts Postgres and Redis, migrates, starts the API and
+dashboard in the background (`logs/`, `.atlas/*.pid`), waits for both, and
+opens the browser on a Mac. Idempotent; refuses to start rather than kill
+another program's process on port 8000 or 3000; treats a pid file as ours only
+while the process's start time matches. `down` stops the process trees and
+`docker compose stop`s (data kept). `status` never fails and summarises the
+nightly scan. Flags: `ATLAS_DISABLE_SCHEDULER=1`, `ATLAS_NO_OPEN=1`.
+
+### Docs
+
+README (quick start is `scripts/atlas.sh up`; the dashboard, the nightly job
+and where the setups stand), OPERATIONS (the nightly job, catch-up, 16:45 ET and
+half days, Run scan now, the digest, the process switches and kill switches,
+migrations through `0010`, new recoveries), SYSTEM (product layer, routes,
+pages, tables, deferral ledger), CLAUDE.md, `.env.example`, `docs/README.md`
+and `apps/web/README.md`.
+
+### Known limits (on the SYSTEM deferral ledger)
+
+No ESLint setup for `apps/web` (`pnpm lint` is broken at baseline; Phase 2 used
+`pnpm typecheck`, `pnpm build` and a substitute ESLint run), the job lock is
+per process (no Postgres advisory lock), no stop history, no earnings dates, no
+stored `ref_close` per idea (split rescale uses the ATR ratio) and no `avg_hold`
+in the live record.
+
+### Tests
+
+- Backend suite **1,665 passed, 6 skipped** with the local Postgres up (plus the
+  known `test_swing_store` event-loop teardown error, which only appears when
+  Postgres is up). With no Postgres the DB-backed tests skip instead; the suite
+  needs neither Postgres nor Redis. New coverage: the job on fakes (catch-up
+  across missed sessions, idempotent re-runs, one digest, mid-job failure and
+  re-run), the scheduler (half days, DST, sleeping Mac, retries), tracking
+  across splits, positions with no bar on the scan day, the digest's rules and
+  length, the routes (409, 503, validation shapes), and `scripts/atlas.sh` on
+  fake `docker`, `uv`, `pnpm`, `curl`, `lsof` and `open` (preflight, ports,
+  idempotent `up`, `down` of process trees, stale and recycled pids, `status`
+  with everything down, bash 3.2).
+- Dashboard: `pnpm typecheck` and `pnpm build` clean. There is no JS test
+  runner, so page behaviour is checked by hand in the browser, not by an
+  automated test.
+
 ## 0.24.0 — Swing engine Phase 1: rules-based daily engine, validation gate, legacy guards
 
 The audit of 2026-10-18 found the composite pipeline unsound (1-minute IEX
