@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from swing_engine import product_store
 from swing_engine.config import RiskSettings, UniverseFilter
 from swing_engine.product_store import (
+    _FAIL_RUNNING_JOBS_SQL,
     _LAST_STEP_OK_SQL,
     _MARK_DIGEST_SQL,
     _UPDATE_JOB_STEPS_SQL,
@@ -40,6 +41,7 @@ from swing_engine.product_store import (
     _UPSERT_SCAN_SQL,
     create_position,
     digest_sent,
+    fail_running_jobs,
     finish_job,
     get_position,
     idea_rows,
@@ -514,6 +516,19 @@ async def test_update_job_steps_sends_json_with_nan_as_null(fake_db):
     assert json.loads(params["steps"]) == {"bars": {"status": "running", "done": 3, "total": None}}
 
 
+async def test_fail_running_jobs_closes_only_running_rows_with_the_reason(fake_db):
+    """The incident: the API stopped mid-job and left its row ``running``, which kept "Run scan
+    now" refused and Today's progress up for good. Start-up closes such rows as failed, with the
+    reason on the row and on each step still running."""
+    assert await fail_running_jobs("interrupted: the API stopped during the run") == 0
+    ((statement, params),) = fake_db.calls
+    assert statement is _FAIL_RUNNING_JOBS_SQL
+    assert params == {"error": "interrupted: the API stopped during the run"}
+    sql = " ".join(statement.text.split())
+    assert "SET status = 'failed', finished_at = clock_timestamp(), error = :error" in sql
+    assert sql.split("WHERE")[-1].strip().startswith("status = 'running'")
+
+
 # --- round trips against a real database ------------------------------------------------
 
 
@@ -868,6 +883,37 @@ async def test_job_runs_start_finish_latest(pg):
     newest = await latest_job()
     assert newest is not None and newest["id"] == later and newest["session"] is None
     assert newest["steps"] == {"scan": {"ideas": 3}} and newest["error"] is None
+
+
+@db
+async def test_fail_running_jobs_marks_the_running_step_failed_and_leaves_finished_runs(pg):
+    started = await start_job("zztest-nightly", SESSION)
+    await update_job_steps(
+        started, {"assets": {"status": "ok"}, "bars": {"status": "running", "done": 3}}
+    )
+    finished = await start_job("zztest-manual", SESSION)
+    await finish_job(finished, "ok", {"scan": {"status": "ok"}}, None)
+
+    assert await fail_running_jobs("interrupted: the API stopped during the run") >= 1
+
+    rows = {
+        r["id"]: dict(r)
+        for r in (
+            await pg.execute(
+                text("SELECT id, status, steps, error, finished_at FROM swing_job_runs "
+                     "WHERE id IN (:a, :b)"),
+                {"a": started, "b": finished},
+            )
+        ).mappings()
+    }  # fmt: skip
+    closed, kept = rows[started], rows[finished]
+    assert closed["status"] == "failed" and closed["finished_at"] is not None
+    assert closed["error"] == "interrupted: the API stopped during the run"
+    assert closed["steps"] == {
+        "assets": {"status": "ok"},
+        "bars": {"status": "failed", "error": "interrupted: the API stopped during the run"},
+    }
+    assert kept["status"] == "ok" and kept["error"] is None
 
 
 @db

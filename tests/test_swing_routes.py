@@ -867,6 +867,70 @@ def test_the_lifespan_warms_the_cache_after_starting_the_scheduler(monkeypatch):
     assert order == ["scheduler", "warm"]
 
 
+class _JobRunStore:
+    """The one call the lifespan makes of the job-run store at start-up."""
+
+    def __init__(self, order: list[str]) -> None:
+        self.order = order
+        self.errors: list[str] = []
+
+    async def fail_running_jobs(self, error: str) -> int:
+        self.order.append("close interrupted runs")
+        self.errors.append(error)
+        return 1
+
+
+def test_the_lifespan_closes_interrupted_runs_before_the_scheduler_starts(monkeypatch):
+    """The incident: an API stopped mid-job left its run ``running``, which locked "Run scan
+    now" (409) and Today's progress for good. Start-up closes such runs as failed first."""
+    order: list[str] = []
+    fake = _JobRunStore(order)
+
+    async def fake_scheduler(make_deps: object) -> None:
+        order.append("scheduler")
+        await asyncio.Event().wait()
+
+    async def warm() -> None:
+        pass
+
+    monkeypatch.setattr(scheduler, "_STATE", scheduler._State())
+    monkeypatch.setattr(service, "load_env", lambda: None)
+    monkeypatch.setattr(service, "swing_scheduler", fake_scheduler)
+    monkeypatch.setattr(service, "warm_swing_context", warm)
+    monkeypatch.setattr(service, "swing_store", fake)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("ATLAS_DISABLE_SCHEDULER", raising=False)
+
+    with TestClient(service.app) as client:
+        assert client.get("/healthz").status_code == 200
+        for _ in range(100):
+            if "scheduler" in order:
+                break
+            threading.Event().wait(0.01)
+
+    assert order == ["close interrupted runs", "scheduler"]
+    assert fake.errors == ["interrupted: the API stopped during the run"]
+
+
+def test_under_pytest_the_lifespan_never_touches_the_real_job_store(monkeypatch):
+    from swing_engine import product_store
+
+    called: list[str] = []
+
+    async def real_db(error: str) -> int:
+        called.append(error)
+        return 0
+
+    monkeypatch.setattr(product_store, "fail_running_jobs", real_db)
+    monkeypatch.setattr(service, "load_env", lambda: None)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)  # even with the env var gone
+    monkeypatch.setattr(service, "swing_scheduler", lambda make_deps: asyncio.sleep(0))
+    monkeypatch.setattr(service, "warm_swing_context", lambda: asyncio.sleep(0))
+    with TestClient(service.app) as client:
+        assert client.get("/healthz").status_code == 200
+    assert called == []
+
+
 def test_under_pytest_the_lifespan_never_warms_the_cache(monkeypatch):
     warmed: list[bool] = []
 

@@ -13,14 +13,18 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import sys
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from typing import Any
 
 from atlas_shared import get_logger, get_settings, load_env, setup_logging
 from atlas_shared import metrics as mx
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from swing_engine import product_store
+from swing_engine.job import safe_reason
 from swing_engine.scheduler import (
     disabled_reason,
     mark_disabled,
@@ -52,6 +56,35 @@ MONITOR_INTERVAL = 10.0  # seconds between position-monitor sweeps
 # The monitor loop auto-closes positions on stop / target / time, which is an
 # execution action. Disabled unless `ATLAS_ENABLE_AUTO_EXECUTION=1` is set.
 _AUTO_EXEC_ENABLED = os.environ.get("ATLAS_ENABLE_AUTO_EXECUTION", "0") == "1"
+
+
+swing_store: Any = product_store
+"""The swing job-run store the lifespan closes interrupted runs in (a module attribute, so tests
+swap it; under pytest the real one is never touched)."""
+
+JOBS_INTERRUPTED = "interrupted: the API stopped during the run"
+"""The error a run left ``running`` by an API that stopped mid-run is closed with at start-up."""
+
+STARTUP_DB_WAIT_S = 5.0
+"""How long start-up waits for the database to close interrupted runs before going on."""
+
+
+async def _close_interrupted_jobs() -> None:
+    """Mark every swing job run still ``running`` as failed: no job of this process has started
+    yet, so such a row was left by an API that stopped mid-run, and it would keep "Run scan now"
+    refused and Today's progress showing forever. Never raises and never blocks start-up for
+    more than :data:`STARTUP_DB_WAIT_S`; under pytest only an injected store is used."""
+    if swing_store is product_store and "pytest" in sys.modules:
+        return
+    try:
+        closed = await asyncio.wait_for(
+            swing_store.fail_running_jobs(JOBS_INTERRUPTED), STARTUP_DB_WAIT_S
+        )
+    except Exception as exc:
+        log.warning("swing.interrupted_jobs_not_closed", error=safe_reason(exc))
+        return
+    if closed:
+        log.warning("swing.interrupted_jobs_closed", count=closed)
 
 
 async def _monitor_loop() -> None:
@@ -93,6 +126,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         tasks.append(asyncio.create_task(_monitor_loop()))
     else:
         log.info("monitor.disabled", reason="auto-execution opt-in; set ATLAS_ENABLE_AUTO_EXECUTION=1 to enable")
+    # Before the scheduler can start a job: a run an earlier API left "running" is closed.
+    await _close_interrupted_jobs()
     # Evaluated here, after load_env(), so ATLAS_DISABLE_SCHEDULER=1 works from `.env` too. The
     # deps are built inside the task: a failure there is the scheduler's, never the API's. The
     # swing context cache is warmed in the background after it (it logs and gives up on a DB
@@ -145,7 +180,9 @@ app.include_router(swing_router)
 
 
 @app.middleware("http")
-async def metrics_middleware(request: Request, call_next):
+async def metrics_middleware(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
     """Record per-route request count + latency. Uses the route *template*
     (e.g. /v1/signals/{symbol}) as the label to keep cardinality bounded."""
     start = time.perf_counter()

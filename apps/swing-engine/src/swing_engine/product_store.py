@@ -277,6 +277,24 @@ _FINISH_JOB_SQL = text(
 _UPDATE_JOB_STEPS_SQL = text(
     "UPDATE swing_job_runs SET steps = CAST(:steps AS JSONB) WHERE id = :id"
 )
+# Runs left ``running`` by a process that stopped mid-run (the API was quit, the Mac shut down):
+# closed as failed, and each step still marked running is failed with the same reason, so the
+# step log says where the run stopped. ``COALESCE`` keeps an empty step log as it was.
+_FAIL_RUNNING_JOBS_SQL = text(
+    """
+    UPDATE swing_job_runs
+    SET status = 'failed', finished_at = clock_timestamp(), error = :error,
+        steps = CASE WHEN jsonb_typeof(steps) = 'object' THEN COALESCE((
+            SELECT jsonb_object_agg(
+                key,
+                CASE WHEN value ->> 'status' = 'running'
+                     THEN jsonb_build_object('status', 'failed', 'error', CAST(:error AS TEXT))
+                     ELSE value END)
+            FROM jsonb_each(steps)), steps) ELSE steps END
+    WHERE status = 'running'
+    RETURNING id
+    """
+)
 _LATEST_JOB_SQL = text(
     f"SELECT {_cols(_JOB_COLUMNS)} FROM swing_job_runs ORDER BY started_at DESC LIMIT 1"
 )
@@ -657,6 +675,19 @@ async def update_job_steps(job_id: uuid.UUID | str, steps: Any) -> None:
     params = {"id": _uuid(job_id), "steps": None if steps is None else _dumps(steps)}
     async with session_scope() as session:
         await session.execute(_UPDATE_JOB_STEPS_SQL, params)
+
+
+async def fail_running_jobs(error: str) -> int:
+    """Close every job run still marked ``running`` as ``failed`` with ``error``; how many.
+
+    For process start-up only (the API's lifespan, before the scheduler runs): no job of this
+    process is running yet, so a ``running`` row was left by one that stopped mid-run and would
+    otherwise lock "Run scan now" and Today's progress forever. Each step still marked running
+    gets ``{"status": "failed", "error": error}``.
+    """
+    async with session_scope() as session:
+        result = await session.execute(_FAIL_RUNNING_JOBS_SQL, {"error": error})
+        return len(result.all())
 
 
 async def latest_job() -> dict[str, Any] | None:

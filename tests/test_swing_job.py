@@ -579,6 +579,34 @@ async def test_a_position_saved_without_a_trail_follows_its_setups_preregistered
     ]
 
 
+async def test_a_cancelled_run_is_closed_as_failed_interrupted_and_the_cancel_propagates(h):
+    """The incident: the API was stopped while a job ran and its row stayed ``running`` for
+    good, which locked "Run scan now" and Today's progress. A cancelled run now closes its row
+    as failed (the step it was in says "interrupted"), shielded from the cancellation, and the
+    cancellation still propagates."""
+    h.store = FakeProductStore(jobs=[_refreshed_yesterday()])
+    entered, hang = asyncio.Event(), asyncio.Event()
+
+    async def stuck(client, bars_store, *, now) -> IngestResult:
+        entered.set()
+        await hang.wait()
+        raise AssertionError("never reached")
+
+    h.monkeypatch.setattr(job, "incremental_update", stuck)
+    task = asyncio.create_task(run_job(h.deps(), "nightly"))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    row = await h.store.latest_job()
+    assert row is not None and row["status"] == "failed" and row["finished_at"] is not None
+    assert row["steps"]["bars"] == {"status": "failed", "error": job.INTERRUPTED}
+    assert row["error"] == f"bars: {job.INTERRUPTED}"
+    assert row["error"].startswith("bars: interrupted")
+    assert not job.is_running()  # the lock is released: the next run can start
+
+
 # ---------------------------------------------------------------------------- the context (PR2)
 
 

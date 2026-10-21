@@ -139,6 +139,9 @@ PROGRESS_EVERY = 0.05
 DIGEST = "digest"
 FAILURE = "failure"
 
+INTERRUPTED = "interrupted: the run was stopped before it finished"
+"""The reason a cancelled run (the API stopping mid-run) is recorded with."""
+
 _SECRET_ENV_VARS = (*_ALPACA_SECRETS, "TELEGRAM_BOT_TOKEN")
 _REASON_CHARS = 300
 
@@ -365,6 +368,33 @@ class _Run:
         self._pending: asyncio.Task[None] | None = None
 
     async def run(self) -> dict[str, Any]:
+        try:
+            return await self._run()
+        except asyncio.CancelledError:
+            await self._interrupted()
+            raise
+
+    async def _interrupted(self) -> None:
+        """Close the run as failed when it is cancelled (the API is stopping) and its row was
+        recorded: a row left ``running`` would lock "Run scan now" and Today. The write is
+        shielded, so the cancellation that ended the run does not also stop its record."""
+        if self.job_id is None:
+            return
+        if self._pending is not None:
+            self._pending.cancel()  # a progress save must not land after the final write
+        step = next((n for n, i in self.steps.items() if i.get("status") == "running"), None)
+        if step is not None:
+            self.steps[step] = {"status": "failed", "error": INTERRUPTED}
+        error = INTERRUPTED if step is None else str(_Failure(step, INTERRUPTED))
+        log.warning("swing.job.interrupted", kind=self.kind, step=step)
+        try:
+            await asyncio.shield(
+                self.store.finish_job(self.job_id, "failed", copy.deepcopy(self.steps), error)
+            )
+        except (Exception, asyncio.CancelledError) as exc:
+            log.warning("swing.job.interrupted_not_saved", error=safe_reason(exc))
+
+    async def _run(self) -> dict[str, Any]:
         failure: _Failure | None = None
         try:
             self.calendar = await self.deps.calendar()
