@@ -454,6 +454,22 @@ def test_today_splits_live_and_unproven(api):
     }
 
 
+def test_today_says_when_the_latest_scan_was_saved_from_partial_data(api):
+    """The incident: a scan saved while most of tonight's bars were missing looked complete.
+    Today now carries ``partial_data`` from the job's scan step, for the scan it saved."""
+    scan_step = {"status": "ok", "partial": True, "coverage": 0.6, "missing": 400,
+                 "expected": 1000}  # fmt: skip
+    api.store = FakeStore(scan=_scan_row(), jobs=[_job("ok", {"scan": scan_step})])
+    assert _today(api)["partial_data"] == {"missing": 400, "expected": 1000}
+
+    complete = {**scan_step, "partial": False, "coverage": 1.0, "missing": 0}
+    api.store = FakeStore(scan=_scan_row(), jobs=[_job("ok", {"scan": complete})])
+    assert _today(api)["partial_data"] is None
+    other_day = {**_job("ok", {"scan": scan_step}), "session": PREV}  # not the scan shown
+    api.store = FakeStore(scan=_scan_row(), jobs=[other_day])
+    assert _today(api)["partial_data"] is None
+
+
 def test_today_downtrend_empty_reason(api):
     panel = _downtrend(PANEL)
     ctx = build_context(panel, KINDS, SESSION)

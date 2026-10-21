@@ -275,6 +275,11 @@ class ProgressOut(_Out):
     total: int
 
 
+class PartialDataOut(_Out):
+    missing: int
+    expected: int
+
+
 class TodayOut(_Out):
     freshness: FreshnessOut
     regime: RegimeOut | None
@@ -285,6 +290,9 @@ class TodayOut(_Out):
     capacity: CapacityOut
     empty_reason: Literal["first_run", "downtrend", "no_candidates", "last_scan_failed"] | None
     backfill: ProgressOut | None
+    # The latest scan was saved from incomplete bars: how many of the stocks that traded the
+    # session before had no bar on its session (null when the scan had them all).
+    partial_data: PartialDataOut | None
     # Whether any setup family's verdict is Live now (read from the committed validation files,
     # like each idea's ``live``): "no setup has passed testing" is true exactly when this is False.
     any_live_setup: bool
@@ -650,6 +658,20 @@ def _backfill(run: Mapping[str, Any] | None) -> dict[str, int] | None:
     return None if done is None or total is None else {"done": done, "total": total}
 
 
+def _partial(
+    run: Mapping[str, Any] | None, scan: Mapping[str, Any] | None
+) -> dict[str, int] | None:
+    """``{missing, expected}`` when the latest run's scan step flagged the latest scan
+    ``partial`` (too few stocks had a bar on its session); otherwise None."""
+    if run is None or scan is None or run.get("session") != scan.get("session"):
+        return None
+    info = (run.get("steps") or {}).get("scan")
+    if not isinstance(info, Mapping) or info.get("partial") is not True:
+        return None
+    missing, expected = as_int(info.get("missing")), as_int(info.get("expected"))
+    return None if missing is None or expected is None else {"missing": missing, "expected": expected}
+
+
 # --- routes: Today ----------------------------------------------------------------------------
 
 
@@ -737,6 +759,7 @@ async def today() -> dict[str, Any]:
             },
             "empty_reason": empty,
             "backfill": _backfill(run),
+            "partial_data": _partial(run, scan),
             "any_live_setup": any(f.verdict == "live" for f in families.values()),
         }
     )

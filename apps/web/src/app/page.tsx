@@ -6,6 +6,7 @@ import {
   EmptyState,
   NO_SETUP_PASSED_TEXT,
   NO_VALIDATED_IDEAS_TEXT,
+  PartialDataBanner,
   ScanFailedBanner,
 } from '@/components/EmptyState';
 import {
@@ -132,6 +133,7 @@ function TodayView({ today }: { today: TodayOut }) {
     <div className="space-y-6">
       <RegimeBanner today={today} />
       {today.empty_reason === 'last_scan_failed' && <ScanFailedBanner freshness={today.freshness} />}
+      <PartialDataBanner today={today} />
       <PositionActionsCard actions={today.positions} openPositions={capacity.open_positions} />
       <EmptyState today={today} />
 

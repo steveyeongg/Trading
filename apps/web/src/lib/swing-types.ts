@@ -153,6 +153,14 @@ export interface CapacityOut {
   max_risk_dollars: number;
 }
 
+/** The latest scan was saved from incomplete bars (`PartialDataOut`). */
+export interface PartialDataOut {
+  /** Stocks that traded the session before but have no bar on the scan's session. */
+  missing: number;
+  /** Active common stocks with a bar on the session before. */
+  expected: number;
+}
+
 export interface TodayOut {
   freshness: FreshnessOut;
   regime: RegimeOut | null;
@@ -166,6 +174,8 @@ export interface TodayOut {
   empty_reason: EmptyReason | null;
   /** The first-time download's progress, only while that job is running. */
   backfill: ProgressOut | null;
+  /** Set when the latest scan had prices for under 95% of the stocks; null when complete. */
+  partial_data: PartialDataOut | null;
   /** Some setup family's verdict is Live now. False is exactly when "no setup has passed testing"
    * is true; it does not depend on tonight's ideas. */
   any_live_setup: boolean;

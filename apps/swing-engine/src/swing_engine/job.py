@@ -13,9 +13,12 @@ run at 16:20) must not publish or digest tonight on bars that are not settled ye
    bars (the first run), when the assets step refreshed the list in this run (it loads the new
    listings and retries symbols whose load failed) or when SPY's newest bar is more than
    :data:`~swing_engine.ingest.MAX_STALE_SESSIONS` sessions behind (the update maintains only
-   recent symbols); it saves ``{"done": n, "total": m}`` progress about every 5%. Otherwise the
-   incremental update. Symbols the data provider cannot serve (several hundred placeholder
-   tickers never can) are listed in the step, not counted as a failure.
+   recent symbols), or when the previous run's bars step failed for symbols that already have
+   stored bars (transient failures, which the backfill catches up; symbols that never had bars
+   are the provider's permanently unservable baseline); it saves ``{"done": n, "total": m}``
+   progress about every 5%. Otherwise the incremental update. Symbols the data provider cannot
+   serve (several hundred placeholder tickers never can) are listed in the step, not counted as
+   a failure; ``transient_failed`` counts the failed ones that already had stored bars.
 3. ``scan``: every session after the last stored scan through the target, oldest first, or just
    the target when nothing was ever scanned or the target already was (a re-run refreshes it).
    The stored bars are loaded once, with the held symbols and those of every idea still tracked
@@ -27,7 +30,11 @@ run at 16:20) must not publish or digest tonight on bars that are not settled ye
    or a slow run), so they never count toward the live record. Each idea is stored with its
    narration (``why`` it was picked and what ``cancels`` it, :mod:`swing_engine.narrate`, with
    the setup's pre-registered parameters) in the scan payload, so the dashboard's Today page
-   never needs a context; an idea the templates cannot narrate is stored with nulls.
+   never needs a context; an idea the templates cannot narrate is stored with nulls. The step
+   records the target session's ``coverage``: of the active common stocks in the loaded panel
+   with a bar on the session before, the share that also has one on the target. Under
+   :data:`MIN_COVERAGE` the scan is still saved but flagged ``partial`` (an update that stopped
+   half way, or a provider outage), Today says so and the digest waits for a complete run.
 4. ``tracking``: every pending or open idea, watch-only ones included, re-simulated to the target.
    An idea tonight's bars cannot track keeps its stored tracking (it is counted as ``untracked``).
 5. ``positions``: :func:`~swing_engine.positions.nightly_update` for each open position, with
@@ -37,7 +44,8 @@ run at 16:20) must not publish or digest tonight on bars that are not settled ye
    a missed day is reported instead of tonight's hold (a position never advised is judged on the
    target alone). A position already advised for the target keeps its stored action, so running
    a session twice says the same thing.
-6. ``digest``: one Telegram digest per session, only when the user has it on.
+6. ``digest``: one Telegram digest per session, only when the user has it on, and never from a
+   ``partial`` scan (skipped with reason "partial data", so a later complete run still sends it).
 
 A failed step records ``{"status": "failed", "error": <reason>}`` (first line only, secrets
 removed), the steps after it do not run, the job is ``failed`` and the previous scan stays as it
@@ -134,6 +142,13 @@ scheduler uses this same constant."""
 
 ASSET_REFRESH_EVERY = timedelta(days=7)
 """How old the last asset-list refresh may be before the job fetches the lists again."""
+
+MIN_COVERAGE = 0.95
+"""Below this share of the stocks that traded the session before having a bar on the target
+session, the scan is flagged ``partial``: saved, but not digested."""
+
+PARTIAL_DATA = "partial data"
+"""The reason a digest is skipped for a partial scan."""
 
 PROGRESS_EVERY = 0.05
 """A first backfill saves its progress each time it advances this share of the symbols."""
@@ -367,6 +382,8 @@ class _Run:
         self.assets_refreshed = False
         self.actions: list[Action] = []
         self.held: list[str] = []
+        self.previous: Mapping[str, Any] | None = None  # the run before this one
+        self.partial = False
         self._pending: asyncio.Task[None] | None = None
 
     async def run(self) -> dict[str, Any]:
@@ -403,6 +420,10 @@ class _Run:
             self.target = self.calendar.last_completed_session(self.now, SCAN_DELAY_MINUTES)
         except Exception as exc:
             failure = _Failure("calendar", safe_reason(exc))
+        try:  # read before this run is recorded, which makes it the latest
+            self.previous = await self.store.latest_job()
+        except Exception as exc:
+            log.warning("swing.job.previous_run_unread", error=safe_reason(exc))
         self.job_id = await self.store.start_job(self.kind, self.target)
         if failure is None:
             try:
@@ -506,10 +527,11 @@ class _Run:
         return {"status": "ok", "assets": len(rows)}
 
     async def _bars(self) -> dict[str, Any]:
-        trigger = await self._backfill_trigger()
+        stored = await self.deps.bars_store.last_bar_dates()
+        trigger = self._backfill_trigger(stored)
         if trigger is None:
             result = await incremental_update(self.deps.client, self.deps.bars_store, now=self.now)
-            return {**_ingest_info("update", result), "trigger": None}
+            return {**_ingest_info("update", result, stored), "trigger": None}
         progress = _Progress(self)
         result = await backfill(
             self.deps.client,
@@ -519,21 +541,23 @@ class _Run:
             progress=progress,
         )
         return {
-            **_ingest_info("backfill", result),
+            **_ingest_info("backfill", result, stored),
             "trigger": trigger,
             "done": progress.done,
             "total": progress.total,
         }
 
-    async def _backfill_trigger(self) -> str | None:
+    def _backfill_trigger(self, stored: Mapping[str, date]) -> str | None:
         """Why the bars need the backfill tonight rather than the update, or None.
 
-        The update only maintains symbols already stored and at most
-        :data:`~swing_engine.ingest.MAX_STALE_SESSIONS` behind, so new listings, symbols whose
-        first load failed and a store left behind for weeks need the (resumable) backfill.
+        ``stored`` is each symbol's newest stored bar. The update only maintains symbols already
+        stored and at most :data:`~swing_engine.ingest.MAX_STALE_SESSIONS` behind, so new
+        listings, symbols whose first load failed, a store left behind for weeks and symbols
+        whose download failed last run although they have stored bars (a transient failure,
+        not the provider's unservable baseline) need the (resumable) backfill.
         """
         assert self.calendar is not None and self.target is not None
-        newest = (await self.deps.bars_store.last_bar_dates()).get(BENCHMARK)
+        newest = stored.get(BENCHMARK)
         if newest is None:
             return "no SPY bars stored"
         if self.assets_refreshed:
@@ -541,6 +565,9 @@ class _Run:
         behind = len(self.calendar.sessions_between(newest, self.target))
         if behind > MAX_STALE_SESSIONS:
             return f"SPY is {behind} sessions behind"
+        transient = _transient(_previous_failed(self.previous), stored)
+        if transient:
+            return f"{transient} symbols with stored bars failed to download last run"
         return None
 
     async def _scan(self) -> dict[str, Any]:
@@ -551,12 +578,20 @@ class _Run:
         rank_by = ranking_choice(self.deps.repo)
         latest = await self.store.latest_scan()
         sessions = _sessions_to_scan(cal, None if latest is None else latest["session"], target)
+        active = _active(await self.deps.bars_store.load_assets())
         positions = await self.store.list_positions("open")
         # Loaded whatever their liquidity: the held symbols (tonight's actions) and those of every
         # idea still tracked (pending or open), so tracking never loses a stock that went thin.
         tracked = await self.store.trackable_ideas()
         extra = sorted({str(p["symbol"]) for p in positions} | {str(i["symbol"]) for i in tracked})
         panel, kinds, _ = await self.deps.loader(target, universe, extra_symbols=extra)
+        missing, expected = coverage(panel, kinds, active, cal.previous_session(target), target)
+        share = 1.0 if expected == 0 else (expected - missing) / expected
+        self.partial = share < MIN_COVERAGE
+        if self.partial:
+            log.warning(
+                "swing.job.partial_data", session=str(target), missing=missing, expected=expected
+            )
 
         scanned: tuple[ScanContext, ScanResult] | None = None
         for session in sessions:
@@ -592,6 +627,10 @@ class _Run:
             "regime": result.regime.value,
             "ideas": len(result.ideas),
             "watch_only": len(result.watch_only),
+            "coverage": share,
+            "partial": self.partial,
+            "missing": missing,
+            "expected": expected,
         }
 
     async def _tracking(self) -> dict[str, Any]:
@@ -638,6 +677,9 @@ class _Run:
 
     async def _digest(self) -> dict[str, Any]:
         assert self.tonight is not None and self.settings is not None and self.target is not None
+        if self.partial:
+            # Not marked: the digest stays unsent, so a later complete run of the session sends it.
+            return {"status": "skipped", "reason": PARTIAL_DATA}
         if not self.settings.telegram_digest:
             return {"status": "skipped", "reason": "the Telegram digest is off in Settings"}
         if await self.store.digest_sent(self.target, DIGEST):
@@ -696,7 +738,8 @@ class _Progress:
 # --- helpers ---------------------------------------------------------------------------
 
 
-def _ingest_info(mode: str, result: IngestResult) -> dict[str, Any]:
+def _ingest_info(mode: str, result: IngestResult, stored: Mapping[str, date]) -> dict[str, Any]:
+    """The bars step's record. ``stored`` is each symbol's newest bar before the step ran."""
     return {
         "status": "ok",
         "mode": mode,
@@ -706,7 +749,52 @@ def _ingest_info(mode: str, result: IngestResult) -> dict[str, Any]:
         "raw_rows": result.raw_rows,
         "refetched": list(result.refetched),
         "failed": list(result.failed),
+        "transient_failed": _transient(result.failed, stored),
     }
+
+
+def _previous_failed(run: Mapping[str, Any] | None) -> list[str]:
+    """The symbols the bars step of ``run`` failed to download (none when it has no such step)."""
+    bars = ((run or {}).get("steps") or {}).get("bars")
+    failed = bars.get("failed") if isinstance(bars, Mapping) else None
+    return [str(s) for s in failed] if isinstance(failed, list) else []
+
+
+def _transient(failed: Sequence[str], stored: Mapping[str, date]) -> int:
+    """How many of ``failed`` already have stored bars: transient failures, not the symbols the
+    provider never serves (those never had a bar)."""
+    return sum(1 for s in failed if s in stored)
+
+
+def _active(assets: pd.DataFrame) -> set[str]:
+    """The symbols whose asset status is active (every symbol, when no status is stored)."""
+    if assets.empty:
+        return set()
+    if "status" not in assets.columns:
+        return {str(s) for s in assets["symbol"]}
+    return {str(s) for s in assets.loc[assets["status"] == "active", "symbol"]}
+
+
+def coverage(
+    panel: Panel, kinds: Mapping[str, AssetKind], active: set[str], previous: date, target: date
+) -> tuple[int, int]:
+    """``(missing, expected)`` for the target session's bars in ``panel``.
+
+    ``expected`` counts the active common stocks with a bar on ``previous`` (the session before);
+    ``missing`` those of them without a bar on ``target``. A target row absent from the panel
+    misses them all; a ``previous`` row absent expects none.
+    """
+    close = panel.close
+    before, day = pd.Timestamp(previous), pd.Timestamp(target)
+    if before not in close.index:
+        return 0, 0
+    symbols = [s for s in close.columns if kinds.get(s) is AssetKind.COMMON and s in active]
+    had = close.loc[before, symbols].notna()
+    expected = int(had.sum())
+    if day not in close.index:
+        return expected, expected
+    present = int(close.loc[day, symbols][had].notna().sum())
+    return expected - present, expected
 
 
 def _scan_session(

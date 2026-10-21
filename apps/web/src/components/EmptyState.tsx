@@ -25,6 +25,10 @@ function failure(freshness: FreshnessOut): { step: string; reason: string } {
   };
 }
 
+/** The warn line of a scan saved from incomplete bars (Today's `partial_data`). */
+export const partialDataText = (missing: number, expected: number, session: string) =>
+  `Prices were missing for ${missing} of ${expected} stocks on ${session}; tonight's ideas may be incomplete.`;
+
 export function scanFailedText(freshness: FreshnessOut): string {
   const { step, reason } = failure(freshness);
   return `Last scan failed at step ${step}: ${reason}. Showing the previous scan.`;
@@ -50,6 +54,17 @@ function Notice({ tone, children }: { tone: Tone; children: ReactNode }) {
     >
       {children}
     </div>
+  );
+}
+
+/** The warn banner of a scan that was saved although prices were missing for many stocks. */
+export function PartialDataBanner({ today }: { today: TodayOut }) {
+  const partial = today.partial_data;
+  if (partial === null) return null;
+  return (
+    <Notice tone="warn">
+      {partialDataText(partial.missing, partial.expected, sessionDate(today.freshness.data_as_of))}
+    </Notice>
   );
 }
 

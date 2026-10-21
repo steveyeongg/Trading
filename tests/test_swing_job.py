@@ -773,6 +773,102 @@ async def test_unservable_symbols_are_recorded_and_do_not_fail_the_bars_step(h):
     assert h.store.saved_sessions == [TARGET]  # the scan still ran
 
 
+def _bars_run(failed: Sequence[str]) -> dict[str, Any]:
+    """Yesterday's run: the asset list refreshed, and its bars step failed for ``failed``."""
+    row = _refreshed_yesterday()
+    row["steps"]["bars"] = {"status": "ok", "mode": "update", "failed": list(failed)}
+    return row
+
+
+async def test_last_runs_transient_bar_failures_trigger_a_backfill(h):
+    """The incident: a symbol whose download failed although it has stored bars (a transient
+    error) stayed behind until the asset list's weekly refresh. Such failures from the previous
+    run trigger the (resumable) backfill, which catches it up; the count is recorded."""
+    h.store = FakeProductStore(jobs=[_bars_run(["S01", "S02", "NEWCO"])])
+    h.ingest.result = IngestResult(40, 41, 41, [], failed=["S05", "NEVERHAD"])
+
+    run = await run_job(h.deps(), "nightly")
+
+    bars = run["steps"]["bars"]
+    assert h.ingest.names() == ["backfill"] and bars["mode"] == "backfill"
+    assert bars["trigger"] == "2 symbols with stored bars failed to download last run"
+    assert bars["transient_failed"] == 1  # tonight's S05 has bars; NEVERHAD never had any
+
+
+async def test_failures_of_symbols_that_never_had_bars_do_not_trigger_a_backfill(h):
+    """Symbols the provider never serves (no stored bar ever) are the permanent baseline."""
+    h.store = FakeProductStore(jobs=[_bars_run(["NEWCO", "ZZZA"])])
+
+    run = await run_job(h.deps(), "nightly")
+
+    assert h.ingest.names() == ["incremental_update"]
+    assert run["steps"]["bars"]["trigger"] is None
+    assert run["steps"]["bars"]["transient_failed"] == 0
+
+
+def _gappy(panel: Panel, share: float) -> Panel:
+    """``panel`` with no bar on the target session for the first ``share`` of its common stocks."""
+    commons = [s for s in panel.symbols() if KINDS[s].value == "common"]
+    gone = commons[: round(share * len(commons))]
+    frames = {f: getattr(panel, f).copy() for f in _FIELDS}
+    for f in _FIELDS:
+        frames[f].loc[pd.Timestamp(TARGET), gone] = np.nan
+    raw = None if panel.raw_close is None else panel.raw_close.copy()
+    if raw is not None:
+        raw.loc[pd.Timestamp(TARGET), gone] = np.nan
+    return Panel(**frames, raw_close=raw)
+
+
+async def test_a_scan_with_too_few_bars_is_saved_flagged_partial_and_not_digested(h):
+    """The incident: an update that stopped half way left most stocks without tonight's bar; the
+    scan ran on the rest and the digest went out as if the night were complete. Coverage under
+    95% now saves the scan flagged ``partial``, skips the digest (no failure notice either), and
+    leaves it unsent so a later complete run of the session still sends it."""
+    h.store = FakeProductStore(jobs=[_refreshed_yesterday()])
+    h.panel = _gappy(PANEL, 0.10)
+    commons = sum(1 for s in PANEL.symbols() if KINDS[s].value == "common")
+
+    run = await run_job(h.deps(), "nightly")
+
+    scan = run["steps"]["scan"]
+    assert run["status"] == "ok" and h.store.saved_sessions == [TARGET]
+    assert scan["partial"] is True and scan["expected"] == commons
+    assert scan["missing"] == round(0.10 * commons)
+    assert scan["coverage"] == pytest.approx(1 - round(0.10 * commons) / commons)
+    assert run["steps"]["digest"] == {"status": "skipped", "reason": "partial data"}
+    assert h.sent == [] and (TARGET, "digest") not in h.store.digests
+
+    h.panel = PANEL  # the bars arrive; a manual run of the same session
+    again = await run_job(h.deps(now=MON_19_OCT_1700_ET + timedelta(hours=1)), "manual")
+
+    assert again["steps"]["scan"]["partial"] is False and again["steps"]["scan"]["coverage"] == 1.0
+    assert len(h.sent) == 1 and h.store.digests[(TARGET, "digest")]["ok"] is True
+
+
+async def test_a_scan_missing_a_few_bars_is_complete(h):
+    h.panel = _gappy(PANEL, 0.025)  # one stock of forty: 97.5% coverage
+
+    run = await run_job(h.deps(), "nightly")
+
+    assert run["steps"]["scan"]["partial"] is False
+    assert run["steps"]["scan"]["coverage"] >= 0.95
+    assert run["steps"]["digest"]["status"] == "ok" and len(h.sent) == 1
+
+
+def test_coverage_counts_active_common_stocks_that_traded_the_session_before():
+    prev = CAL.previous_session(TARGET)
+    panel = _gappy(PANEL, 0.10)
+    commons = [s for s in PANEL.symbols() if KINDS[s].value == "common"]
+    assert job.coverage(panel, KINDS, set(commons), prev, TARGET) == (round(0.1 * len(commons)),
+                                                                      len(commons))  # fmt: skip
+    # An inactive (delisted) stock is not expected tonight, nor is an ETF.
+    rest = set(commons[round(0.1 * len(commons)) :])
+    assert job.coverage(panel, KINDS, rest, prev, TARGET) == (0, len(rest))
+    # No row at all for the target: every expected stock is missing.
+    cut = truncate(PANEL, pd.Timestamp(prev))
+    assert job.coverage(cut, KINDS, set(commons), prev, TARGET) == (len(commons), len(commons))
+
+
 async def test_first_run_backfills_from_2016_and_reports_progress_as_it_goes(h):
     h.bars = FakeBarsStore(spy=False)
 
