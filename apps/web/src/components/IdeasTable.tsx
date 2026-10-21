@@ -2,14 +2,15 @@
 
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { useId, type ReactNode } from 'react';
+import { useId } from 'react';
+import { IdeaBadges } from '@/components/IdeaBadges';
 import { Term } from '@/components/Term';
-import { plural } from '@/lib/copy';
-import { money, pct, price, r } from '@/lib/format';
+import { money, price } from '@/lib/format';
+import { trackRecordText, type TableKind } from '@/lib/idea-text';
 import type { IdeaOut } from '@/lib/swing-types';
 
 /** Which list a table shows: tested setups, setups that have not passed, or watch-only names. */
-export type TableKind = 'validated' | 'unproven' | 'watch';
+export type { TableKind };
 
 // --- filters (applied on the client, to the validated and the unproven table) -------------------
 
@@ -108,73 +109,6 @@ export function IdeasFilters({
 
 const count = new Intl.NumberFormat('en-US');
 
-type BadgeTone = 'warn' | 'accent' | 'muted';
-const BADGE_TONE: Record<BadgeTone, string> = {
-  warn: 'border-warn/50 text-warn',
-  accent: 'border-accent-muted text-accent',
-  muted: 'border-line-strong text-ink-muted',
-};
-
-function Badge({ tone, children }: { tone: BadgeTone; children: ReactNode }) {
-  return (
-    <span
-      className={`inline-block whitespace-nowrap rounded border px-1.5 py-0.5 text-[11px] leading-none ${BADGE_TONE[tone]}`}
-    >
-      {children}
-    </span>
-  );
-}
-
-/**
- * The track-record cell. A tested setup shows "52% win · +0.4R · 312 trades", marked "(in-sample)"
- * when the figures come from the tuning period instead of the out-of-sample test. A setup that has
- * not passed shows why, in the validation's own words.
- */
-export function trackRecordText(idea: IdeaOut, kind: TableKind): string {
-  const t = idea.track_record;
-  if (kind === 'unproven' || !idea.live) return t.verdict_text;
-  if (t.win_rate === null && t.expectancy_r === null && t.trades === null) return t.verdict_text;
-  const trades =
-    t.trades === null ? '—' : `${count.format(t.trades)} ${plural(t.trades, 'trade')}`;
-  const text = `${pct(t.win_rate)} win · ${r(t.expectancy_r)} · ${trades}`;
-  return t.source === 'insample' ? `${text} (in-sample)` : text;
-}
-
-function Badges({ idea, kind }: { idea: IdeaOut; kind: TableKind }) {
-  const unproven = kind === 'unproven' || !idea.live;
-  const badges: ReactNode[] = [];
-  if (unproven) {
-    badges.push(
-      <Badge key="unproven" tone="muted">
-        Unproven
-      </Badge>,
-    );
-  }
-  if (idea.already_held) {
-    badges.push(
-      <Badge key="held" tone="accent">
-        you already hold this
-      </Badge>,
-    );
-  }
-  if (idea.overlaps.length > 0) {
-    badges.push(
-      <Badge key="overlaps" tone="warn">
-        {`overlaps with ${idea.overlaps.join(', ')}`}
-      </Badge>,
-    );
-  }
-  if (idea.regime_warning) {
-    badges.push(
-      <Badge key="regime" tone="warn">
-        market not in uptrend
-      </Badge>,
-    );
-  }
-  if (badges.length === 0) return <span className="text-ink-subtle">—</span>;
-  return <div className="flex flex-wrap gap-1">{badges}</div>;
-}
-
 const TH = 'px-3 py-2 font-medium';
 const TD = 'px-3 py-2.5 align-top';
 
@@ -226,7 +160,7 @@ function IdeaRow({ idea, kind, place }: { idea: IdeaOut; kind: TableKind; place:
       </td>
       <td className={`${TD} min-w-[12rem]`}>{trackRecordText(idea, kind)}</td>
       <td className={`${TD} min-w-[10rem]`}>
-        <Badges idea={idea} kind={kind} />
+        <IdeaBadges idea={idea} unproven={muted} empty={<span className="text-ink-subtle">—</span>} />
       </td>
     </tr>
   );

@@ -2,7 +2,6 @@
 
 import { useQuery } from '@tanstack/react-query';
 import { useId, useMemo, useState } from 'react';
-import { ApiDown } from '@/components/ApiDown';
 import {
   EmptyState,
   NO_SETUP_PASSED_TEXT,
@@ -18,16 +17,16 @@ import {
   setupOptions,
   type IdeaFilters,
 } from '@/components/IdeasTable';
+import { LoadFailure } from '@/components/LoadFailure';
 import { PositionActionsCard } from '@/components/PositionActionsCard';
 import { RegimeBanner } from '@/components/RegimeBanner';
 import { SectionHeading } from '@/components/SectionHeading';
-import { errorText } from '@/lib/error-text';
+import { DISCLAIMER_TEXT } from '@/lib/copy';
 import { money } from '@/lib/format';
-import { isUnreachable, swingApi } from '@/lib/swing-api';
+import { swingApi } from '@/lib/swing-api';
 import type { IdeaOut, TodayOut } from '@/lib/swing-types';
 
 const LOADING_TEXT = "Loading today's ideas…";
-const DISCLAIMER_TEXT = 'Informational only, not financial advice. You place every order yourself.';
 
 const REFRESH_MS = 60_000; // normally: once a minute
 const REFRESH_WHILE_RUNNING_MS = 5_000; // while a scan runs
@@ -190,44 +189,6 @@ function TodayView({ today }: { today: TodayOut }) {
           capacity.open_risk_dollars,
         )} of ${money(capacity.max_risk_dollars)}`}
       </p>
-    </div>
-  );
-}
-
-function LoadFailure({
-  error,
-  retrying,
-  onRetry,
-}: {
-  error: unknown;
-  retrying: boolean;
-  onRetry: () => void;
-}) {
-  const retry = (
-    <button
-      type="button"
-      onClick={onRetry}
-      disabled={retrying}
-      className="rounded border border-line-strong px-3 py-1.5 text-sm text-ink hover:bg-bg-subtle disabled:cursor-not-allowed disabled:opacity-50"
-    >
-      {retrying ? 'Retrying…' : 'Retry'}
-    </button>
-  );
-  if (isUnreachable(error)) {
-    return (
-      <div className="space-y-3">
-        <ApiDown />
-        {retry}
-      </div>
-    );
-  }
-  return (
-    <div
-      role="alert"
-      className="flex flex-wrap items-center justify-between gap-3 rounded border border-warn/40 bg-bg-surface px-4 py-3 text-sm text-ink"
-    >
-      <span className="min-w-0 break-words">{errorText(error)}</span>
-      {retry}
     </div>
   );
 }
