@@ -276,6 +276,9 @@ export interface FamilyOut {
   label: string;
   verdict: Verdict;
   verdict_text: string;
+  /** Every failed condition of a `research` verdict, verbatim and in order (the first is also in
+   * `verdict_text`). Empty for `live` and for `not_tested`. */
+  failures: string[];
   versions: VersionOut[];
   insample: StatsOut | null;
   oos: StatsOut | null;

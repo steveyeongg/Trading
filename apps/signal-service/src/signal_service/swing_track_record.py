@@ -56,6 +56,9 @@ class FamilyRecord:
     family: str
     verdict: Verdict
     verdict_text: str
+    failures: list[str]
+    """Every failed condition of a ``research`` verdict, verbatim and in order; empty for
+    ``live`` and for ``not_tested`` (whose one "failure" is just "not yet tested")."""
     reports: list[dict[str, Any]]
     report: dict[str, Any] | None
     insample: dict[str, Any] | None
@@ -111,6 +114,7 @@ def read_families(repo: Path) -> dict[str, FamilyRecord]:
             family=family,
             verdict=kind,
             verdict_text=text,
+            failures=failures if kind == "research" else [],
             reports=reports,
             report=report,
             insample=insample,
@@ -239,6 +243,7 @@ def family_out(
         "label": SETUP_LABEL.get(fam.family, fam.family.capitalize()),
         "verdict": fam.verdict,
         "verdict_text": fam.verdict_text,
+        "failures": list(fam.failures),
         "versions": versions,
         "insample": stats_out(fam.insample),
         "oos": stats_out(report.get("oos_trades")),

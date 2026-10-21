@@ -1223,6 +1223,33 @@ def test_the_track_record_reads_the_committed_reports_as_phase_1_writes_them(api
     assert pullback["verdict"] == "research" and pullback["oos"]["n"] > 0
 
 
+def test_the_track_record_lists_every_failed_condition_verbatim(api):
+    """The badge names the first failure only; ``failures`` carries all of them, in order, so the
+    Track record page can show why a setup is Research only. Live and untested have none."""
+    api.repo = REPO
+
+    breakout, pullback = api.get("/v1/track-record").json()["families"]
+
+    for family in (breakout, pullback):
+        name = family["family"]
+        report = json.loads((REPO / f"ml/validation/{name}/{name}-v1.report.json").read_text())
+        assert family["failures"] == report["verdict"]["failures"]
+        assert family["verdict_text"] == f"Research only: {family['failures'][0]}"
+    assert len(breakout["failures"]) == 3
+    assert breakout["failures"][0].startswith("profit factor")
+    assert "random entry" in breakout["failures"][1]
+    assert breakout["failures"][2].startswith("drawdown")
+
+
+def test_failures_are_empty_when_a_setup_is_live_or_untested(api):
+    _live(api.repo, "breakout")
+
+    breakout, pullback = api.get("/v1/track-record").json()["families"]
+
+    assert breakout["verdict"] == "live" and breakout["failures"] == []
+    assert pullback["verdict"] == "not_tested" and pullback["failures"] == []
+
+
 def test_the_live_record_comes_from_the_stored_ideas_with_both_counts(api):
     ideas = [
         {"id": uuid.uuid4(), "symbol": f"Z{k}", "setup": "breakout", "session": SESSION,

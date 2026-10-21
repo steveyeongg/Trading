@@ -379,6 +379,7 @@ class FamilyOut(_Out):
     label: str
     verdict: Verdict
     verdict_text: str
+    failures: list[str]
     versions: list[VersionOut]
     insample: StatsOut | None
     oos: StatsOut | None
