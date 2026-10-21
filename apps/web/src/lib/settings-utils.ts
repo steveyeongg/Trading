@@ -147,6 +147,21 @@ export function changedKeys(values: FormValues, saved: SwingSettings): FieldKey[
   });
 }
 
+/**
+ * True when every box still holds exactly the text the stored settings give (nothing typed, not
+ * even something that means the same number, like "1.0" for "1"). Fresh settings from the server
+ * may replace the form only while this holds.
+ */
+export function isPristine(values: FormValues, saved: SwingSettings): boolean {
+  const initial = textsFrom(saved);
+  return FIELD_KEYS.every((key) => values[key].trim() === initial[key]);
+}
+
+/** Whether two sets of settings are the same, field for field. */
+export function sameSettings(a: SwingSettings, b: SwingSettings): boolean {
+  return FIELD_KEYS.every((key) => a[key] === b[key]) && a.telegram_digest === b.telegram_digest;
+}
+
 /** The save request: the changed fields only, in the server's units. Null if any is invalid. */
 export function buildPatch(values: FormValues, saved: SwingSettings): SettingsIn | null {
   const { errors, numbers } = checkValues(values);

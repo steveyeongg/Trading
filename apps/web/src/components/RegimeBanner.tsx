@@ -1,6 +1,8 @@
 'use client';
 
+import { RUN_SCAN_LABEL } from '@/lib/copy';
 import { dateTimeET, sessionDate } from '@/lib/format';
+import { RUN_SCAN_BUTTON_CLASS } from '@/lib/form-styles';
 import type { FreshnessOut, RegimeOut, TodayOut } from '@/lib/swing-types';
 import { useRunScan } from '@/lib/use-run-scan';
 
@@ -85,9 +87,9 @@ export function RegimeBanner({ today }: { today: TodayOut }) {
             type="button"
             disabled={busy}
             onClick={start}
-            className="rounded border border-accent-muted px-3 py-1.5 text-sm text-accent hover:bg-accent/10 focus-visible:outline focus-visible:outline-1 focus-visible:outline-accent disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
+            className={RUN_SCAN_BUTTON_CLASS}
           >
-            Run scan now
+            {RUN_SCAN_LABEL}
           </button>
         </div>
       </div>

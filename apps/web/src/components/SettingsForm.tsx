@@ -24,6 +24,7 @@ import {
   changedKeys,
   checkValues,
   fieldKind,
+  isPristine,
   splitIssues,
   textsFrom,
   universeDiffers,
@@ -78,11 +79,16 @@ function NumberField({
 export function SettingsForm({
   saved,
   onSaved,
+  onDirtyChange,
 }: {
-  /** The settings as last loaded or saved. */
+  /** The settings as last loaded or saved. When they are replaced while the boxes still hold
+   * what the old ones showed, the boxes follow; otherwise what is typed is kept. */
   saved: SwingSettings;
   /** The server's answer to a save, for the fields that save named. */
   onSaved: (patch: SettingsIn, response: SwingSettings) => void;
+  /** Whether any box holds something other than what `saved` shows (fresh data must not
+   * replace the form while it does). */
+  onDirtyChange: (dirty: boolean) => void;
 }) {
   const [values, setValues] = useState<FormValues>(() => textsFrom(saved));
   const [submitted, setSubmitted] = useState(false);
@@ -99,6 +105,20 @@ export function SettingsForm({
   const formRef = useRef<HTMLFormElement>(null);
   const savedRef = useRef<HTMLSpanElement>(null);
   const errorRef = useRef<HTMLParagraphElement>(null);
+
+  // Tell the page whether anything has been typed.
+  const dirty = !isPristine(values, saved);
+  useEffect(() => onDirtyChange(dirty), [dirty, onDirtyChange]);
+
+  // New stored settings (the page applies fresh data only while nothing is typed). A box that still
+  // holds what the old settings showed takes the new text; one with typing in it is left alone.
+  const previous = useRef(saved);
+  useEffect(() => {
+    const before = previous.current;
+    if (before === saved) return;
+    previous.current = saved;
+    setValues((all) => (isPristine(all, before) ? textsFrom(saved) : all));
+  }, [saved]);
 
   const changed = useMemo(() => changedKeys(values, saved), [values, saved]);
   const { errors: clientErrors } = useMemo(() => checkValues(values), [values]);

@@ -1,8 +1,8 @@
 'use client';
 
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useIsMutating, useQuery, useQueryClient } from '@tanstack/react-query';
 import Link from 'next/link';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { LoadFailure } from '@/components/LoadFailure';
 import { SettingsForm } from '@/components/SettingsForm';
 import { SystemStatusPanel } from '@/components/SystemStatusPanel';
@@ -15,20 +15,36 @@ import {
 } from '@/lib/copy';
 import { isUnreachable, swingApi } from '@/lib/swing-api';
 import type { SettingsIn, SwingSettings } from '@/lib/swing-types';
-import { sentFields } from '@/lib/use-save-settings';
+import { sameSettings } from '@/lib/settings-utils';
+import { SAVE_SETTINGS_KEY, sentFields } from '@/lib/use-save-settings';
 
 /**
  * The settings as last loaded or saved, shared by the form and the digest switch. A save names
  * the fields it changed, and only those take the server's answer, so two saves that cross never
  * undo each other.
+ *
+ * Fresh data from the server (a retry, or another window's save) replaces the settings only when
+ * nothing has been typed in the form and no save is running; otherwise the form keeps what the
+ * user is typing. Each arrival is looked at once, by `updatedAt`: the refetch that follows our own
+ * save carries the same values, so it changes nothing.
  */
-function SettingsView({ settings }: { settings: SwingSettings }) {
+function SettingsView({ settings, updatedAt }: { settings: SwingSettings; updatedAt: number }) {
   const [saved, setSaved] = useState<SwingSettings>(settings);
+  const [dirty, setDirty] = useState(false);
+  const saving = useIsMutating({ mutationKey: SAVE_SETTINGS_KEY }) > 0;
   const applySaved = (patch: SettingsIn, response: SwingSettings) =>
     setSaved((current) => ({ ...current, ...sentFields(patch, response) }));
+
+  const looked = useRef(updatedAt);
+  useEffect(() => {
+    if (looked.current === updatedAt) return;
+    looked.current = updatedAt;
+    if (!dirty && !saving && !sameSettings(settings, saved)) setSaved(settings);
+  }, [updatedAt, settings, saved, dirty, saving]);
+
   return (
     <>
-      <SettingsForm saved={saved} onSaved={applySaved} />
+      <SettingsForm saved={saved} onSaved={applySaved} onDirtyChange={setDirty} />
       <TelegramSettings saved={saved} onSaved={applySaved} />
     </>
   );
@@ -71,7 +87,7 @@ export default function SettingsPage() {
       )}
 
       {settings.data !== undefined ? (
-        <SettingsView settings={settings.data} />
+        <SettingsView settings={settings.data} updatedAt={settings.dataUpdatedAt} />
       ) : (
         settings.isPending && <p className="text-sm text-ink-muted">{SETTINGS_LOADING_TEXT}</p>
       )}

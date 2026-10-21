@@ -25,6 +25,7 @@ import {
   statusScanTimesText,
 } from '@/lib/copy';
 import { count, dateTimeET, sessionDate } from '@/lib/format';
+import { RUN_SCAN_BUTTON_CLASS } from '@/lib/form-styles';
 import type { LastScanOut, ProgressOut, StatusOut, StepInfo } from '@/lib/swing-types';
 import { useRunScan } from '@/lib/use-run-scan';
 import { useSystemStatus } from '@/lib/use-system-status';
@@ -47,18 +48,27 @@ interface StepView {
 }
 
 /**
- * How one step of the log reads. `info` is undefined when the run never reached the step. A status
- * this build does not know is shown as the text the job recorded.
+ * How one step of the log reads. `info` is undefined when the run never reached the step; a value
+ * that is not a step record at all (null, a string, a list, a record with no status) reads the same
+ * way, so a malformed log can never throw here. A status this build does not know is shown as the
+ * text the job recorded.
  */
-function stepView(info: StepInfo | undefined): StepView {
-  if (info === undefined) {
-    return { mark: '·', word: 'not run', tone: MUTED, outcome: STATUS_STEP_NOT_RUN_TEXT, error: null };
-  }
-  switch (info.status) {
+function stepView(info: unknown): StepView {
+  const notRun: StepView = {
+    mark: '·',
+    word: 'not run',
+    tone: MUTED,
+    outcome: STATUS_STEP_NOT_RUN_TEXT,
+    error: null,
+  };
+  if (typeof info !== 'object' || info === null || Array.isArray(info)) return notRun;
+  const step = info as StepInfo;
+  if (typeof step.status !== 'string') return notRun;
+  switch (step.status) {
     case 'ok':
       return { mark: '✓', word: 'ok', tone: 'text-bull', outcome: null, error: null };
     case 'failed': {
-      const error = typeof info.error === 'string' && info.error.trim() !== '' ? info.error : null;
+      const error = typeof step.error === 'string' && step.error.trim() !== '' ? step.error : null;
       return {
         mark: '✗',
         word: 'failed',
@@ -68,7 +78,8 @@ function stepView(info: StepInfo | undefined): StepView {
       };
     }
     case 'skipped': {
-      const reason = typeof info.reason === 'string' && info.reason.trim() !== '' ? info.reason : null;
+      const reason =
+        typeof step.reason === 'string' && step.reason.trim() !== '' ? step.reason : null;
       return {
         mark: '–',
         word: 'skipped',
@@ -82,15 +93,15 @@ function stepView(info: StepInfo | undefined): StepView {
     default:
       return {
         mark: '?',
-        word: String(info.status),
+        word: step.status,
         tone: MUTED,
-        outcome: String(info.status),
+        outcome: step.status,
         error: null,
       };
   }
 }
 
-function StepRow({ name, label, info }: { name: string; label: string; info: StepInfo | undefined }) {
+function StepRow({ name, label, info }: { name: string; label: string | null; info: unknown }) {
   const view = stepView(info);
   return (
     <li>
@@ -100,7 +111,7 @@ function StepRow({ name, label, info }: { name: string; label: string; info: Ste
         </span>
         {view.outcome === null && <span className="sr-only">{`${view.word}:`}</span>}
         <span className="font-mono">{name}</span>
-        <span className={MUTED}>{label}</span>
+        {label !== null && <span className={MUTED}>{label}</span>}
         {view.outcome !== null && <span className={view.tone}>{view.outcome}</span>}
       </div>
       {view.error !== null && (
@@ -110,12 +121,22 @@ function StepRow({ name, label, info }: { name: string; label: string; info: Ste
   );
 }
 
+const KNOWN_STEPS: ReadonlySet<string> = new Set(STATUS_STEPS.map((step) => step.name));
+const hasKey = (record: object, key: string) => Object.prototype.hasOwnProperty.call(record, key);
+
 function LastScan({ last }: { last: LastScanOut | null }) {
   if (last === null) return <p className={MUTED}>{STATUS_NO_SCAN_TEXT}</p>;
   const times = statusScanTimesText(
     last.started_at === null ? null : dateTimeET(last.started_at),
     last.generated_at === null ? null : dateTimeET(last.generated_at),
   );
+  const steps: Record<string, unknown> =
+    typeof last.steps === 'object' && last.steps !== null && !Array.isArray(last.steps)
+      ? last.steps
+      : {};
+  // A run that failed before the six steps (the calendar, the settings) records that step under
+  // its own name; it is listed after the six so the real failing step is visible.
+  const extra = Object.keys(steps).filter((name) => !KNOWN_STEPS.has(name));
   return (
     <div className={BLOCK}>
       <p className={last.status === 'failed' ? 'text-bear' : undefined}>
@@ -124,7 +145,15 @@ function LastScan({ last }: { last: LastScanOut | null }) {
       {times !== '' && <p className={`text-xs ${MUTED}`}>{times}</p>}
       <ol aria-label={STATUS_STEPS_LABEL} className="mt-2 space-y-1">
         {STATUS_STEPS.map(({ name, label }) => (
-          <StepRow key={name} name={name} label={label} info={last.steps[name]} />
+          <StepRow
+            key={name}
+            name={name}
+            label={label}
+            info={hasKey(steps, name) ? steps[name] : undefined}
+          />
+        ))}
+        {extra.map((name) => (
+          <StepRow key={`extra-${name}`} name={name} label={null} info={steps[name]} />
         ))}
       </ol>
       {last.error !== null && last.error.trim() !== '' && (
@@ -148,7 +177,7 @@ function Backfill({ backfill, firstRun }: { backfill: ProgressOut; firstRun: boo
         <progress
           value={Math.min(Math.max(0, backfill.done), max)}
           max={max}
-          className="mt-1 block h-2 w-full overflow-hidden rounded [&::-moz-progress-bar]:bg-accent [&::-webkit-progress-bar]:bg-bg-subtle [&::-webkit-progress-value]:bg-accent"
+          className="mt-1 block h-2 w-full appearance-none overflow-hidden rounded [&::-moz-progress-bar]:bg-accent [&::-webkit-progress-bar]:bg-bg-subtle [&::-webkit-progress-value]:bg-accent"
         />
       </label>
     </div>
@@ -188,7 +217,7 @@ function RunScanControl({ running }: { running: boolean }) {
         type="button"
         disabled={busy}
         onClick={start}
-        className="rounded border border-accent-muted px-3 py-1.5 text-sm text-accent hover:bg-accent/10 focus-visible:outline focus-visible:outline-1 focus-visible:outline-accent disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
+        className={RUN_SCAN_BUTTON_CLASS}
       >
         {RUN_SCAN_LABEL}
       </button>

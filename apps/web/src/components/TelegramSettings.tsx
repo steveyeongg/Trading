@@ -16,7 +16,7 @@ import { errorText } from '@/lib/error-text';
 import { SECONDARY_BUTTON_CLASS } from '@/lib/form-styles';
 import { swingApi } from '@/lib/swing-api';
 import type { SettingsIn, SwingSettings, TelegramTestOut } from '@/lib/swing-types';
-import { SAVE_SETTINGS_KEY, useSaveSettings } from '@/lib/use-save-settings';
+import { DIGEST_SAVE_KEYS, SAVE_SETTINGS_KEY, useSaveSettings } from '@/lib/use-save-settings';
 import { useSystemStatus } from '@/lib/use-system-status';
 
 /**
@@ -37,7 +37,7 @@ export function TelegramSettings({
 }) {
   const noteId = useId();
   const hintId = useId();
-  const toggle = useSaveSettings();
+  const toggle = useSaveSettings(DIGEST_SAVE_KEYS);
   // The form's Save button shares the route, and only one save runs at a time. The switch stays
   // enabled during its own save (so keyboard focus is not lost); a second flip then does nothing.
   const formSaving =
