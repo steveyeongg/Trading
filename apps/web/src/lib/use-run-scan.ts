@@ -92,7 +92,12 @@ export function useRunScan(running: boolean): RunScan {
       // The latest job run is read through the cache (not around it), so the status panel on
       // Settings shows what this look saw.
       queryClient
-        .fetchQuery({ queryKey: ['status'], queryFn: () => swingApi.status(), staleTime: 0, retry: false })
+        .fetchQuery({
+          queryKey: ['status'],
+          queryFn: () => swingApi.status(),
+          staleTime: 0,
+          retry: false,
+        })
         .then((status) => {
           if (alive && scanSettled(status, clickedAt.current)) {
             setNotice(null);

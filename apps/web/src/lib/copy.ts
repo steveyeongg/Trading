@@ -190,3 +190,140 @@ export function versionText(
   parts.push(passed ? 'passed' : passed === false ? 'failed' : 'not run');
   return parts.join(' · ');
 }
+
+// --- Settings page ----------------------------------------------------------------------------
+
+export const SETTINGS_LOADING_TEXT = 'Loading your settings…';
+export const SETTINGS_INTRO_TEXT =
+  'These set how many shares each idea suggests and how much risk you allow. ATLAS only suggests trades; it never places or changes an order.';
+export const LEGACY_SETTINGS_LINK_TEXT = 'Legacy alert and provider settings';
+
+export const SETTINGS_ACCOUNT_HEADING = 'ACCOUNT AND RISK';
+export const SETTINGS_UNIVERSE_HEADING = 'UNIVERSE FILTERS';
+export const SETTINGS_TELEGRAM_HEADING = 'TELEGRAM';
+
+/**
+ * Each number field of the form: its label (with the unit), the bounds as helper text (the
+ * server's, from `SwingSettings`), and what it says when the typed value is out of bounds.
+ * Percent fields are typed as % and sent as a fraction; the dollar volume is typed in millions.
+ */
+export const SETTINGS_FIELD_TEXT = {
+  equity: {
+    label: 'Account equity ($)',
+    hint: 'The account size used to work out share counts. Any amount above $0.',
+    invalid: 'Account equity must be a number above $0',
+  },
+  risk_pct: {
+    label: 'Risk per trade (%)',
+    hint: "How much of your equity one trade may lose if it hits its stop. Above 0%, up to 5%.",
+    invalid: 'Risk per trade must be above 0% and at most 5%',
+  },
+  max_position_pct: {
+    label: 'Largest position (% of equity)',
+    hint: 'The most one position may cost. Above 0%, up to 100%.',
+    invalid: 'Largest position must be above 0% and at most 100%',
+  },
+  max_positions: {
+    label: 'Most open positions',
+    hint: 'How many positions can be open at once. A whole number from 1 to 50.',
+    invalid: 'Most open positions must be a whole number from 1 to 50',
+  },
+  max_total_risk_pct: {
+    label: 'Total open risk cap (% of equity)',
+    hint: 'The most all open positions may lose together if every stop is hit. Above 0%, up to 50%.',
+    invalid: 'Total open risk cap must be above 0% and at most 50%',
+  },
+  min_price: {
+    label: 'Minimum stock price ($)',
+    hint: 'Ideas skip stocks priced below this. At least $1.',
+    invalid: 'Minimum stock price must be a number, at least $1',
+  },
+  min_dollar_volume: {
+    label: 'Minimum daily dollar volume ($ million)',
+    hint: 'Ideas skip stocks that trade less than this per day, in millions of dollars. At least 1 ($1 million).',
+    invalid: 'Minimum daily dollar volume must be a number, at least 1 ($ million)',
+  },
+} as const;
+
+/** Beside the universe fields when either differs from the default the setups were validated on. */
+export const UNIVERSE_WARNING_TEXT =
+  'Setups were validated with the default universe filters ($10, $20M). With different filters their track record may not apply.';
+
+export const SETTINGS_SAVE_LABEL = 'Save settings';
+export const SETTINGS_SAVING_LABEL = 'Saving…';
+export const SETTINGS_SAVED_TEXT = 'Settings saved.';
+export const SETTINGS_NO_CHANGES_TEXT = 'No unsaved changes.';
+export const SETTINGS_FIX_FIELDS_TEXT = 'Fix the highlighted fields, then save again.';
+
+export const TELEGRAM_DIGEST_LABEL = 'Send a nightly Telegram digest of validated ideas';
+export const TELEGRAM_DIGEST_NOTE = 'Unproven ideas are never included. Saves as soon as you change it.';
+export const TELEGRAM_TEST_LABEL = 'Send test message';
+export const TELEGRAM_TESTING_LABEL = 'Sending…';
+export const TELEGRAM_NOT_CONFIGURED_HINT = 'Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env';
+/** The test's answer, inline: "Sent: ..." or "Not sent: ...". */
+export const telegramTestResultText = (ok: boolean, detail: string) =>
+  detail.trim() === '' ? (ok ? 'Sent' : 'Not sent') : `${ok ? 'Sent' : 'Not sent'}: ${detail.trim()}`;
+
+// --- System status panel ----------------------------------------------------------------------
+
+export const STATUS_HEADING = 'SYSTEM STATUS';
+export const STATUS_LOADING_TEXT = 'Loading system status…';
+export const STATUS_NO_DATA_TEXT = 'No scan has finished yet';
+export const statusDataAsOfText = (date: string) => `Data as of ${date} close`;
+export const STATUS_NO_SCAN_TEXT = 'Last scan: none yet';
+export const STATUS_STEPS_LABEL = 'Steps of the last scan';
+export const STATUS_STEP_NOT_RUN_TEXT = 'not run';
+export const STATUS_AUTO_EXECUTION_OFF_TEXT = 'Automatic order placement: off';
+export const STATUS_AUTO_EXECUTION_ON_TEXT = 'Automatic order placement: ON (ATLAS_ENABLE_AUTO_EXECUTION=1)';
+export const STATUS_CONFIGURED_TEXT = 'configured';
+export const STATUS_NOT_SET_TEXT = 'not set';
+export const RUN_SCAN_LABEL = 'Run scan now';
+
+/** The six steps of a scan, in order, with what each one does. */
+export const STATUS_STEPS = [
+  { name: 'assets', label: 'Refresh the stock list' },
+  { name: 'bars', label: 'Download daily bars' },
+  { name: 'scan', label: 'Scan for ideas' },
+  { name: 'tracking', label: 'Update tracked ideas' },
+  { name: 'positions', label: 'Check your positions' },
+  { name: 'digest', label: 'Send the Telegram digest' },
+] as const;
+
+const SCAN_KIND_LABELS: Record<string, string> = {
+  nightly: 'nightly',
+  catchup: 'catch-up',
+  manual: 'manual',
+};
+const SCAN_STATUS_LABELS: Record<string, string> = {
+  ok: 'completed',
+  failed: 'failed',
+  running: 'running',
+};
+const has = (table: Record<string, string>, key: string) => Object.prototype.hasOwnProperty.call(table, key);
+
+/** "Last scan: nightly, completed": the kind and status as the job recorded them (an unknown value is shown as is). */
+export function statusLastScanText(kind: string, status: string): string {
+  const kindText = has(SCAN_KIND_LABELS, kind) ? SCAN_KIND_LABELS[kind] : kind;
+  const statusText = has(SCAN_STATUS_LABELS, status) ? SCAN_STATUS_LABELS[status] : status;
+  return `Last scan: ${kindText}, ${statusText}`;
+}
+export const statusScanTimesText = (started: string | null, finished: string | null) =>
+  [started === null ? null : `started ${started}`, finished === null ? null : `finished ${finished}`]
+    .filter((part) => part !== null)
+    .join(' · ');
+export const statusNextScanText = (when: string) => `Next scan: ${when}`;
+export const STATUS_NEXT_SCAN_AFTER_RUN_TEXT = 'Next scan: scheduled once this scan ends';
+
+/**
+ * Why automatic scans are off. The server words its reasons as full sentences that start
+ * "Automatic scans ..."; one that does not is prefixed, and none at all is a plain statement.
+ */
+export function schedulerOffText(reason: string | null): string {
+  const text = (reason ?? '').trim();
+  if (text === '') return 'Automatic scans are off.';
+  return /^automatic scans\b/i.test(text) ? text : `Automatic scans are off: ${text}`;
+}
+
+/** "1,234 of 6,000 symbols (20%)": the download's progress. */
+export const backfillLabelText = (done: string, total: string, percent: number) =>
+  `${done} of ${total} symbols (${percent}%)`;

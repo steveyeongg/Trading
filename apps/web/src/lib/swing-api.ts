@@ -13,6 +13,7 @@ import type {
   TelegramTestOut,
   TodayOut,
   TrackRecordOut,
+  ValidationDetail,
 } from './swing-types';
 
 // Client for the swing engine's routes (apps/signal-service/.../swing_routes.py). Same `/api/v1`
@@ -24,7 +25,8 @@ import type {
 //   Use `isUnreachable(err)` to show `ApiDown`.
 // - Anything else: the message is the server's `detail` string, or the first message of a 422's
 //   `detail` array (so a page can show it as is); `status` is the HTTP status. A body without a
-//   readable detail falls back to the code `http_<status>`.
+//   readable detail falls back to the code `http_<status>`. A 422 is a `ValidationError` (an
+//   `ApiError` that also carries every entry of the list, with its `loc`).
 
 /** The `ApiError.code` of a request that never reached the API. */
 export const UNREACHABLE = 'unreachable';
@@ -39,6 +41,43 @@ export function isUnreachable(err: unknown): boolean {
 
 // Pydantic prefixes the messages of validators that raise ValueError.
 const VALUE_ERROR_PREFIX = /^value error,\s*/i;
+
+/**
+ * A 422. As for any `ApiError`, `code` (and `message`) is the first validation message; `issues`
+ * is the whole list, each with the `loc` of the field it is about, for a form that shows each
+ * message next to its field.
+ */
+export class ValidationError extends ApiError {
+  constructor(
+    message: string,
+    public issues: ValidationDetail[],
+  ) {
+    super(message, 422);
+  }
+}
+
+/** One validation entry's message, as a page shows it (without Pydantic's "Value error," prefix). */
+export function issueMessage(issue: ValidationDetail): string {
+  return issue.msg.replace(VALUE_ERROR_PREFIX, '');
+}
+
+/** The readable entries of a 422 body's `detail` array, or null when it has none. */
+function validationIssues(body: unknown): ValidationDetail[] | null {
+  if (typeof body !== 'object' || body === null) return null;
+  const detail = (body as { detail?: unknown }).detail;
+  if (!Array.isArray(detail)) return null;
+  const issues: ValidationDetail[] = [];
+  for (const item of detail) {
+    const entry = item as { loc?: unknown; msg?: unknown; type?: unknown } | null;
+    if (entry === null || typeof entry !== 'object') continue;
+    if (typeof entry.msg !== 'string' || !entry.msg.trim()) continue;
+    const loc = Array.isArray(entry.loc)
+      ? entry.loc.filter((part): part is string | number => typeof part === 'string' || typeof part === 'number')
+      : [];
+    issues.push({ type: typeof entry.type === 'string' ? entry.type : '', loc, msg: entry.msg });
+  }
+  return issues.length > 0 ? issues : null;
+}
 
 function detailMessage(body: unknown): string | null {
   if (typeof body !== 'object' || body === null) return null;
@@ -78,7 +117,10 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 
   if (!response.ok) {
     if (!isJson && PROXY_FAILURES.has(response.status)) throw new ApiError(UNREACHABLE, 0);
-    throw new ApiError(detailMessage(parsed) ?? `http_${response.status}`, response.status);
+    const message = detailMessage(parsed) ?? `http_${response.status}`;
+    const issues = response.status === 422 ? validationIssues(parsed) : null;
+    if (issues !== null) throw new ValidationError(message, issues);
+    throw new ApiError(message, response.status);
   }
   // A 2xx that isn't JSON came from something other than the API.
   if (!isJson) throw new ApiError(UNREACHABLE, 0);
