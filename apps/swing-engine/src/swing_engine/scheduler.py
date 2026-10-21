@@ -15,7 +15,11 @@
    by then and only runs again if it has not.
 2. **The nightly loop.** It sleeps until :func:`next_scan_at` (the close plus 45 minutes in New
    York, so 13:45 on a half day and 16:45 EST after DST ends), runs the job as ``nightly``, and
-   starts over. A nightly that fails is not retried until the next night.
+   starts over. A nightly that fails (it raised, or came back with a status other than ``ok``)
+   is run again as ``nightly`` every :data:`CALENDAR_RETRY` until one succeeds or the next
+   scheduled scan is due, exactly as a failed catch-up is. A nightly that finds another job
+   running is re-checked the same way: 15 minutes later it runs again only if the session is
+   still not scanned.
 
 The schedule is built to survive a laptop. Sleeping is done in chunks of at most
 :data:`MAX_SLEEP_S`, and the time left is re-read from the wall clock (``deps.now()``) after each
@@ -169,11 +173,13 @@ async def swing_scheduler(
         return
     deps = dataclasses.replace(built, calendar=_DailyCalendar(built.calendar, built.now))
     try:
-        # ``when`` is the next scheduled scan. ``retry_at`` is when the next catch-up attempt is
-        # due (None: no catch-up pending), and ``recheck`` says the last attempt found another
-        # job running, so the session may be scanned by now.
+        # ``when`` is the next scheduled scan. ``retry_at`` is when the next attempt at a run that
+        # did not succeed is due (None: nothing pending), ``retry_kind`` is that run's kind (a
+        # catch-up, or a nightly that failed), and ``recheck`` says the last attempt found
+        # another job running, so the session may be scanned by now.
         when: datetime | None = None
         retry_at: datetime | None = None
+        retry_kind: JobKind = "catchup"
         recheck = False
         checked = False  # the startup check has run
         while True:
@@ -188,11 +194,13 @@ async def swing_scheduler(
                 wake = when if retry_at is None else min(retry_at, when)
                 await _sleep_until(wake, deps.now, sleep)
                 if deps.now() >= when:
-                    # The scan is due (or a catch-up ran past it). The nightly job also catches
-                    # up every missed session, so it ends the catch-up retries.
+                    # The scan is due (or a retry ran past it). The nightly job also catches up
+                    # every missed session, so it ends the earlier retries; if it does not
+                    # succeed, it is retried itself until the scan after it is due.
                     _set_state(running=True)
-                    await _run(deps, "nightly")
-                    when, retry_at, recheck = None, None, False
+                    outcome = await _run(deps, "nightly")
+                    when = None
+                    retry_at, retry_kind, recheck = _retry(deps, "nightly", outcome)
                     continue
                 if recheck:
                     recheck = False
@@ -201,19 +209,27 @@ async def swing_scheduler(
                         continue
                     if deps.now() >= when:  # the check itself outlasted the wait
                         continue
-                outcome = await _run(deps, "catchup")
-                retry_at = None if outcome == "ok" else deps.now() + CALENDAR_RETRY
-                recheck = outcome == "busy"
-                if retry_at is not None:
-                    log.info(
-                        "swing.scheduler.catch_up_retry", outcome=outcome, at=retry_at.isoformat()
-                    )
+                outcome = await _run(deps, retry_kind)
+                retry_at, retry_kind, recheck = _retry(deps, retry_kind, outcome)
             except Exception as exc:  # a calendar that ends too soon, or anything not foreseen
                 # ``when`` is kept: a scan that came due during the wait still runs afterwards.
                 await _wait_to_retry("an unexpected error", exc, deps, sleep)
     finally:
         _set_state(running=False, reason="Automatic scans stopped.")
         await _close(built.client)
+
+
+def _retry(
+    deps: JobDeps, kind: JobKind, outcome: Literal["ok", "failed", "busy"]
+) -> tuple[datetime | None, JobKind, bool]:
+    """After a run of ``kind``: when to try again (None after a success, else
+    :data:`CALENDAR_RETRY` from now), the kind to try, and whether to re-check first (another job
+    was running, and may have scanned the session by then)."""
+    if outcome == "ok":
+        return None, "catchup", False
+    retry_at = deps.now() + CALENDAR_RETRY
+    log.info("swing.scheduler.retry", kind=kind, outcome=outcome, at=retry_at.isoformat())
+    return retry_at, kind, outcome == "busy"
 
 
 class _DailyCalendar:

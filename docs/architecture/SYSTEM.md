@@ -96,7 +96,8 @@ inside the one API process and puts it on the dashboard.
    signal_service.main lifespan
       swing_engine.scheduler      16:45 ET (close + 45 min; 13:45 on a half day), catch-up at
                                   start when a due session is missing, retry every 15 min while a
-                                  catch-up fails; off with ATLAS_DISABLE_SCHEDULER=1 or under pytest
+                                  catch-up or the nightly fails (until the next scan is due); off
+                                  with ATLAS_DISABLE_SCHEDULER=1 or under pytest
           │            (the same job: "Run scan now" = POST /v1/scan/run, and
           │             `python -m swing_engine job`)
           ▼

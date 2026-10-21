@@ -165,7 +165,10 @@ count toward the live record. Starting between a close plus 16 minutes and its
 scan time is not a catch-up: the nightly run handles it. A catch-up that fails
 (the Mac often boots before Docker or Postgres is ready) is retried every 15
 minutes until it works or the next scheduled scan is due. A nightly run that
-fails is not retried until the next night; use **Run scan now**.
+fails (it raised, or a step failed) is retried the same way: every 15 minutes
+until one succeeds or the next scheduled scan is due. A nightly that finds
+another scan running (**Run scan now**) checks again 15 minutes later and runs
+only if that session is still not scanned.
 
 The scheduler sleeps in chunks of at most 5 minutes and re-reads the wall clock
 after each, so a Mac that wakes after the scan time runs the job within one

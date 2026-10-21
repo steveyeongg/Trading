@@ -470,28 +470,47 @@ async def test_a_laptop_that_wakes_after_the_scan_time_runs_at_once(rig):
 # ------------------------------------------------------------------------ nothing kills the loop
 
 
-async def test_an_exception_in_a_run_is_logged_and_the_next_night_still_runs(rig, monkeypatch):
+async def test_an_exception_in_a_run_is_logged_and_the_nightly_is_retried(rig, monkeypatch):
     monkeypatch.setenv("ALPACA_API_SECRET", "s3cr3t-alpaca-value")
     rig.effects = {1: RuntimeError("alpaca refused key s3cr3t-alpaca-value\n[SQL: SELECT 1]")}
-    rig.stop_after_runs(2)
+    rig.stop_after_runs(3)
 
     await rig.drive()
 
-    assert rig.runs == [("nightly", MON_SCAN), ("nightly", TUE_SCAN)]
+    assert rig.runs == [
+        ("nightly", MON_SCAN),
+        ("nightly", MON_SCAN + QUARTER_HOUR),  # the retry works: no more until tomorrow
+        ("nightly", TUE_SCAN),
+    ]
     warnings = [r for r in rig.log.records if r[0] == "warning"]
     assert len(warnings) == 1 and "alpaca refused key" in rig.log.text()
     assert "s3cr3t-alpaca-value" not in rig.log.text() and "SELECT 1" not in rig.log.text()
 
 
-async def test_a_job_that_is_already_running_is_skipped_and_logged(rig):
+async def test_a_job_that_is_already_running_is_skipped_logged_and_rechecked(rig):
+    """JobBusy at the scan time: someone else is scanning. 15 minutes later the session is still
+    not stored here, so the nightly runs then."""
     rig.effects = {1: JobBusy("a scan is already running")}
     rig.stop_after_runs(2)
 
     await rig.drive()
 
-    assert rig.runs == [("nightly", MON_SCAN), ("nightly", TUE_SCAN)]
+    assert rig.runs == [("nightly", MON_SCAN), ("nightly", MON_SCAN + QUARTER_HOUR)]
     assert "already running" in rig.log.text()
     assert not [r for r in rig.log.records if r[0] in ("warning", "error")]
+
+
+async def test_a_busy_nightly_whose_session_the_other_job_scanned_is_not_rerun(rig):
+    def the_other_job_finishes() -> BaseException:
+        rig.store.latest = MON
+        return JobBusy("a scan is already running")
+
+    rig.effects = {1: the_other_job_finishes}
+    rig.stop_after_runs(2)
+
+    await rig.drive()
+
+    assert rig.runs == [("nightly", MON_SCAN), ("nightly", TUE_SCAN)]
 
 
 async def test_a_failed_catch_up_does_not_stop_the_loop(rig):
@@ -600,20 +619,71 @@ async def test_a_catch_up_that_keeps_failing_gives_way_to_the_nightly_when_it_is
     ]
 
 
-async def test_the_nightly_ends_the_retries_even_when_it_fails_too(rig):
+async def test_the_nightly_ends_the_catch_up_retries_and_is_retried_itself(rig):
     rig.start(MON_1620_ET, latest=THU)
     rig.effects = {i: RuntimeError("alpaca 503") for i in (1, 2, 3)}
     rig.stop_after_runs(4)
 
     await rig.drive()
 
-    # 16:20, 16:35 catch-ups, the 16:45 nightly, then tomorrow's nightly: no catch-up after it
+    # 16:20, 16:35 catch-ups, the 16:45 nightly, then that nightly again: no catch-up after it
     assert [(kind, at) for kind, at in rig.runs] == [
         ("catchup", MON_1620_ET),
         ("catchup", MON_1620_ET + QUARTER_HOUR),
         ("nightly", MON_SCAN),
-        ("nightly", TUE_SCAN),
+        ("nightly", MON_SCAN + QUARTER_HOUR),
     ]
+
+
+# ------------------------------------------------------------------------ nightly retries
+
+
+async def test_a_nightly_that_fails_twice_then_succeeds_runs_three_times_15_minutes_apart(rig):
+    """The incident: a nightly that failed (Alpaca briefly down at 16:45) was not retried until
+    the next night, so Today showed the previous session's ideas all evening and no digest went
+    out. It now retries every 15 minutes, with the same chunked wall-clock sleep."""
+    rig.start(MON_1000_ET, latest=FRI)
+    rig.effects = {1: RuntimeError("alpaca 503")}
+    rig.statuses = {2: "failed"}  # a run that records a failed step counts as failed too
+    rig.stop_after_runs(4)
+
+    await rig.drive()
+
+    assert rig.runs == [
+        ("nightly", MON_SCAN),
+        ("nightly", MON_SCAN + QUARTER_HOUR),
+        ("nightly", MON_SCAN + 2 * QUARTER_HOUR),
+        ("nightly", TUE_SCAN),  # the third worked: nothing more until tomorrow's scan
+    ]
+    assert max(rig.sleeps) <= MAX_SLEEP_S
+
+
+async def test_a_successful_nightly_is_not_retried(rig):
+    rig.start(MON_1000_ET, latest=FRI)
+    rig.stop_after_runs(2)
+
+    await rig.drive()
+
+    assert rig.runs == [("nightly", MON_SCAN), ("nightly", TUE_SCAN)]
+    after = rig.sleeps[len(rig.sleeps) - int((TUE_SCAN - MON_SCAN).total_seconds() // 300) :]
+    assert set(after) == {MAX_SLEEP_S}  # straight on to waiting for tomorrow's scan
+
+
+async def test_a_failing_nightly_stops_retrying_when_the_next_scan_is_due(rig):
+    """Every retry fails: the last one is before Tuesday's scan time, and Tuesday's runs on time."""
+    rig.start(MON_1000_ET, latest=FRI)
+    always = RuntimeError("alpaca 503")
+    retries = int((TUE_SCAN - MON_SCAN) / QUARTER_HOUR)  # 96: the last lands on Tuesday's scan
+    rig.effects = {i: always for i in range(1, retries + 1)}  # every run before Tuesday's
+    rig.stop_after_runs(retries + 1)
+
+    await rig.drive()
+
+    times = [at for _, at in rig.runs]
+    assert all(kind == "nightly" for kind, _ in rig.runs)
+    assert times[:3] == [MON_SCAN, MON_SCAN + QUARTER_HOUR, MON_SCAN + 2 * QUARTER_HOUR]
+    assert times[-2] < TUE_SCAN and times[-1] == TUE_SCAN  # no retry past the scan time
+    assert len(times) == len(set(times))
 
 
 async def test_a_catch_up_that_succeeds_is_not_retried(rig):
