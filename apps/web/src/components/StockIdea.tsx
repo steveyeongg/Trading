@@ -2,12 +2,10 @@ import Link from 'next/link';
 import type { ReactNode } from 'react';
 import { IdeaBadges } from '@/components/IdeaBadges';
 import { Term } from '@/components/Term';
+import { STOCK_WATCH_ONLY_NOTE, STOCK_WATCH_ONLY_TEXT } from '@/lib/copy';
 import { money, price } from '@/lib/format';
 import { hasMeasuredRecord, ideaKind, trackRecordText } from '@/lib/idea-text';
 import type { IdeaOut } from '@/lib/swing-types';
-
-export const WATCH_ONLY_TEXT = 'Watch-only (market in downtrend)';
-export const WATCH_ONLY_NOTE = 'This is not a buy idea tonight, so no share count or risk is shown.';
 
 const shares = new Intl.NumberFormat('en-US');
 
@@ -62,8 +60,8 @@ export function StockIdea({ idea }: { idea: IdeaOut }) {
 
       {watch && (
         <div className="mt-2 text-sm">
-          <p className="font-medium text-warn">{WATCH_ONLY_TEXT}</p>
-          <p className="text-ink-muted">{WATCH_ONLY_NOTE}</p>
+          <p className="font-medium text-warn">{STOCK_WATCH_ONLY_TEXT}</p>
+          <p className="text-ink-muted">{STOCK_WATCH_ONLY_NOTE}</p>
         </div>
       )}
 

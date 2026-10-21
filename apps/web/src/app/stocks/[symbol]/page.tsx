@@ -10,7 +10,9 @@ import { StockIdea } from '@/components/StockIdea';
 import { TermText } from '@/components/TermText';
 import {
   DISCLAIMER_TEXT,
+  STOCK_EMPTY_SYMBOL_TEXT,
   STOCK_NOT_FOUND_HINT,
+  STOCK_POSITION_LINES_NOTE,
   stockLoadingText,
   stockNotFoundText,
 } from '@/lib/copy';
@@ -76,7 +78,7 @@ function StockView({ stock }: { stock: StockOut }) {
         <DailyChart key={stock.symbol} bars={stock.bars} lines={stock.lines} levels={stock.levels} />
         {idea === null && stock.levels !== null && (
           // The server draws levels without an idea only for a stock that is an open position.
-          <p className="mt-1 text-xs text-ink-muted">The price lines are for your open position.</p>
+          <p className="mt-1 text-xs text-ink-muted">{STOCK_POSITION_LINES_NOTE}</p>
         )}
       </section>
 
@@ -91,7 +93,7 @@ function StockView({ stock }: { stock: StockOut }) {
         </div>
       )}
 
-      <EligibilityChecklist symbol={stock.symbol} items={stock.checklist} hasIdea={idea !== null} />
+      <EligibilityChecklist symbol={stock.symbol} items={stock.checklist} idea={idea} />
     </div>
   );
 }
@@ -99,10 +101,13 @@ function StockView({ stock }: { stock: StockOut }) {
 export default function StockPage() {
   const params = useParams<{ symbol: string }>();
   const symbol = routeSymbol(params?.symbol);
+  // An address with no ticker in it (/stocks/%20): there is nothing to ask the API for.
+  const noSymbol = symbol === '';
 
   const { data, error, isPending, isFetching, refetch } = useQuery<StockOut>({
     queryKey: ['stock', symbol],
     queryFn: () => swingApi.stock(symbol),
+    enabled: !noSymbol,
     refetchInterval: REFRESH_MS,
     refetchOnWindowFocus: true,
     // Only a request that never reached the API is worth one more try; a 404 or a 503 is the
@@ -116,17 +121,23 @@ export default function StockPage() {
     <div className="space-y-6">
       <header>
         <h1 className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-          <span className="font-mono text-2xl font-semibold">{data?.symbol ?? symbol}</span>
+          <span className="font-mono text-2xl font-semibold">
+            {noSymbol ? 'Stock' : (data?.symbol ?? symbol)}
+          </span>
           {data !== undefined && data.name !== null && data.name !== '' && (
             <span className="min-w-0 break-words text-base text-ink-muted">{data.name}</span>
           )}
         </h1>
-        {data !== undefined && !notFound && (
+        {!noSymbol && data !== undefined && !notFound && (
           <p className="mt-1 text-sm text-ink-muted">{`As of ${sessionDate(data.session)} close`}</p>
         )}
       </header>
 
-      {notFound ? (
+      {noSymbol ? (
+        <p className="rounded-lg border border-line bg-bg-surface px-4 py-3 text-sm text-ink-muted">
+          {STOCK_EMPTY_SYMBOL_TEXT}
+        </p>
+      ) : notFound ? (
         <NotFound symbol={symbol} />
       ) : (
         <>

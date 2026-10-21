@@ -15,6 +15,7 @@ import {
 } from 'lightweight-charts';
 import { useEffect, useMemo, useRef } from 'react';
 import { CHART_COLORS } from '@/lib/chart-colors';
+import { CHART_NO_BARS_TEXT } from '@/lib/copy';
 import {
   LINE_SPECS,
   allLineRuns,
@@ -226,7 +227,7 @@ export function DailyChart({
         />
         {empty && (
           <p className="absolute inset-0 flex items-center justify-center px-4 text-center text-sm text-ink-muted">
-            No daily bars to draw for this stock yet.
+            {CHART_NO_BARS_TEXT}
           </p>
         )}
       </div>

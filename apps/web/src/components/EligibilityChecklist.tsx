@@ -1,18 +1,7 @@
 import { SectionHeading } from '@/components/SectionHeading';
 import { TermText } from '@/components/TermText';
-import { plural } from '@/lib/copy';
-import type { CheckOut } from '@/lib/swing-types';
-
-/**
- * The line above the checklist of a stock that has no idea tonight: how many rules it failed, or
- * that it passes them all and still no setup triggered.
- */
-export function checklistSummary(symbol: string, items: CheckOut[]): string {
-  if (items.length === 0) return `No rules could be checked for ${symbol} tonight.`;
-  const failed = items.filter((item) => !item.passed).length;
-  if (failed === 0) return `${symbol} passes the universe rules but no setup triggered tonight.`;
-  return `${symbol} doesn't qualify tonight: ${failed} ${plural(failed, 'rule')} failed.`;
-}
+import { checklistSummaryText, otherSetupRulesText } from '@/lib/copy';
+import type { CheckOut, IdeaOut } from '@/lib/swing-types';
 
 // Mark, rule, this stock's value, the limit. The mark's column is the same in the header, so the
 // failed rows' left edge does not push the others over.
@@ -21,22 +10,29 @@ const COLUMNS = 'sm:grid-cols-[1.25rem_minmax(0,2fr)_minmax(0,1.3fr)_minmax(0,1.
 /**
  * Every rule a stock is held to, in the server's order: ✓ or ✗, the rule in plain English, the
  * stock's own number and the limit, all as the API sends them. A failed rule has a red edge and
- * tint, and the words "Failed" / "Passed" for a screen reader, so colour is not the only cue. When
- * the stock has no idea (`hasIdea` false) a summary line comes first.
+ * tint, and the words "Failed" / "Passed" for a screen reader, so colour is not the only cue. A
+ * stock with no idea gets a summary line first; a stock with an idea gets a note that its setup
+ * only needs its own rules (the other family's rows may be red).
  */
 export function EligibilityChecklist({
   symbol,
   items,
-  hasIdea,
+  idea,
 }: {
   symbol: string;
   items: CheckOut[];
-  hasIdea: boolean;
+  idea: Pick<IdeaOut, 'setup_label'> | null;
 }) {
   return (
     <section aria-labelledby="checklist-heading" className="space-y-3">
       <SectionHeading id="checklist-heading">Eligibility checklist</SectionHeading>
-      {!hasIdea && <p className="text-sm font-medium text-ink">{checklistSummary(symbol, items)}</p>}
+      {idea === null ? (
+        <p className="text-sm font-medium text-ink">
+          {checklistSummaryText(symbol, items.length, items.filter((item) => !item.passed).length)}
+        </p>
+      ) : (
+        <p className="text-sm text-ink-muted">{otherSetupRulesText(idea.setup_label)}</p>
+      )}
       {items.length > 0 && (
         <div className="overflow-hidden rounded-lg border border-line bg-bg-surface">
           <div

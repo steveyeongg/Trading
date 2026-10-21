@@ -9,9 +9,6 @@ import { money, price } from '@/lib/format';
 import { trackRecordText, type TableKind } from '@/lib/idea-text';
 import type { IdeaOut } from '@/lib/swing-types';
 
-/** Which list a table shows: tested setups, setups that have not passed, or watch-only names. */
-export type { TableKind };
-
 // --- filters (applied on the client, to the validated and the unproven table) -------------------
 
 export const ALL_SETUPS = 'all';
