@@ -22,6 +22,7 @@ const oneDecimal = new Intl.NumberFormat('en-US', {
   minimumFractionDigits: 1,
   maximumFractionDigits: 1,
 });
+const wholeNumber = new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 });
 const percentFormats = new Map<number, Intl.NumberFormat>();
 
 /** Dollars rounded to the whole dollar: 1234.4 -> "$1,234". */
@@ -49,12 +50,49 @@ export function pct(x: number | null | undefined, digits = 0): string {
   return dropNegativeZero(format.format(x));
 }
 
-/** A result in R, signed, one decimal: r(0.4) -> "+0.4R", r(-1) -> "-1.0R", r(0) -> "0.0R". */
-export function r(x: number | null | undefined): string {
-  if (!isNum(x)) return DASH;
-  const size = oneDecimal.format(Math.abs(x));
-  if (/^[0.]+$/.test(size)) return '0.0R'; // zero, or too small to show
-  return `${x > 0 ? '+' : '-'}${size}R`;
+const decimalFormats = new Map<number, Intl.NumberFormat>();
+
+/** A signed number with `digits` places ("+0.09", "-1.0"); zero, or too small to show, has no sign. */
+function signedDecimal(x: number, digits: number): string {
+  let format = decimalFormats.get(digits);
+  if (format === undefined) {
+    format = new Intl.NumberFormat('en-US', {
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits,
+    });
+    decimalFormats.set(digits, format);
+  }
+  const size = format.format(Math.abs(x));
+  if (/^[0.]+$/.test(size)) return size;
+  return `${x > 0 ? '+' : '-'}${size}`;
+}
+
+/**
+ * A result in R, signed, one decimal by default: r(0.4) -> "+0.4R", r(-1) -> "-1.0R",
+ * r(0) -> "0.0R". `digits` asks for more places: r(0.059, 2) -> "+0.06R".
+ */
+export function r(x: number | null | undefined, digits = 1): string {
+  return isNum(x) ? `${signedDecimal(x, digits)}R` : DASH;
+}
+
+/** Like `r(x, 2)` without the trailing "R" ("+0.09"), for copy that writes its own "R". */
+export function signedNumber(x: number | null | undefined, digits = 2): string {
+  return isNum(x) ? signedDecimal(x, digits) : DASH;
+}
+
+/** A whole number with thousands separators: 18273 -> "18,273". */
+export function count(x: number | null | undefined): string {
+  return isNum(x) ? wholeNumber.format(x) : DASH;
+}
+
+/** A ratio with 2 decimals (profit factor, Sharpe): 1.1149 -> "1.11", -0.38 -> "-0.38". */
+export function ratio(x: number | null | undefined): string {
+  return isNum(x) ? dropNegativeZero(twoDecimals.format(x)) : DASH;
+}
+
+/** An average holding time: 19.25 -> "19.3 sessions". */
+export function sessions(x: number | null | undefined): string {
+  return isNum(x) ? `${oneDecimal.format(x)} sessions` : DASH;
 }
 
 // The weekday, day and month of a date, in the form "Mon 19 Oct" (and with the year).

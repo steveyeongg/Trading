@@ -111,3 +111,79 @@ export function exitReasonLabel(reason: string | null): string {
   if (reason === null || reason.trim() === '') return '—';
   return EXIT_REASONS.find((o) => o.value === reason)?.label ?? reason;
 }
+
+// --- Track record page ------------------------------------------------------------------------
+
+export const TRACK_RECORD_LOADING_TEXT = 'Loading the track record…';
+export const TRACK_RECORD_INTRO_TEXT =
+  "Every setup is tested on 2016–2022 (in-sample), then once on 2023 onward (out-of-sample) under rules sealed before the test. Only setups that pass are Live. Live and reconstructed columns track tonight's ideas forward.";
+/** The API answered with no setup families at all. */
+export const TRACK_RECORD_EMPTY_TEXT = 'No setups to show yet.';
+
+// The verdict badge, and what the verdict means for the ideas on Today.
+export const VERDICT_LIVE_LABEL = 'Live';
+export const VERDICT_NOT_TESTED_LABEL = 'Not yet tested';
+export const VERDICT_LIVE_NOTE = 'Passed testing: its ideas appear under Trade ideas on Today.';
+export const VERDICT_UNPROVEN_NOTE =
+  'Has not passed testing: its ideas appear on Today as Unproven and are left out of the Telegram digest.';
+
+// The card's section headings.
+export const SECTION_RESULTS_TEXT = 'Results';
+export const SECTION_EQUITY_TEXT = 'Simulated account against SPY';
+export const SECTION_VERSIONS_TEXT = 'Versions tested';
+
+// The results table.
+// "Results in R (risk units).": the R in between is a <Term> on the page.
+export const RESULTS_CAPTION_PREFIX = 'Results in';
+export const RESULTS_CAPTION_SUFFIX = '(risk units).';
+export const RESULTS_CAPTION_NOTE =
+  'In-sample and out-of-sample columns are simulated on historical data.';
+export const COLUMN_SUBTITLES = {
+  insample: '2016–2022, simulated',
+  oos: '2023 onward, simulated',
+  live: 'ideas tracked forward',
+  reconstructed: 'rebuilt after a missed day',
+} as const;
+export const NOT_RUN_TEXT = 'Not run yet';
+export const NO_LIVE_IDEAS_TEXT = 'No closed live ideas yet';
+export const NO_RECONSTRUCTED_IDEAS_TEXT = 'No closed reconstructed ideas yet';
+export const STATS_FOOTNOTE_TEXT =
+  'Live = ideas published before the next session opened. Reconstructed = ideas rebuilt after a missed day; they never count as live.';
+export const stillOpenText = (n: string) => `${n} still open`;
+export const distinctNoteText = (trades: string, expectancy: string) =>
+  `Distinct trades only: ${trades} trades, expectancy ${expectancy}`;
+
+// The equity chart and the account simulation under it.
+export const EQUITY_NONE_TEXT = 'No equity series in this report.';
+export const EQUITY_STRATEGY_LABEL = 'Strategy (out-of-sample, simulated)';
+export const EQUITY_SPY_LABEL = 'SPY';
+export const equityCaptionText = (from: string, to: string) =>
+  `Weekly account value, ${from} to ${to}. Historical and simulated: the setup's rules, sizing and position limits applied to past data. SPY is a buy-and-hold account of the same starting size.`;
+export const equityDescriptionText = (parts: string[]) =>
+  `Weekly account value, out-of-sample and simulated. ${parts.join(' ')}`;
+export const PORTFOLIO_CAPTION_TEXT = 'Out-of-sample account simulation, strategy against SPY';
+export const SPY_ROW_LABEL = 'SPY (buy and hold)';
+export const combinedNoteText = (note: string) => `Combined with the other setup: ${note}`;
+
+// The random-entry comparison. The numbers arrive signed ("+0.09") and the copy adds the R.
+export function randomEntryText(median: string, p5: string | null, p95: string | null): string {
+  const range = p5 !== null && p95 !== null ? ` (5–95%: ${p5}R to ${p95}R)` : '';
+  return `Random picks with the same exits: median ${median}R${range}`;
+}
+export const randomCompareText = (expectancy: string, above: boolean) =>
+  `Out-of-sample expectancy ${expectancy} is ${above ? 'above' : 'not above'} the random-pick median.`;
+
+// Versions: each setup version, failed ones included.
+export const NO_VERSIONS_TEXT = 'No versions tested yet.';
+export function versionText(
+  version: string,
+  runIndex: number | null,
+  frozen: string | null,
+  passed: boolean | null,
+): string {
+  const parts = [version];
+  if (runIndex !== null) parts.push(`run ${runIndex}`);
+  if (frozen !== null) parts.push(`frozen ${frozen}`);
+  parts.push(passed ? 'passed' : passed === false ? 'failed' : 'not run');
+  return parts.join(' · ');
+}

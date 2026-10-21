@@ -12,10 +12,10 @@ const isNum = (x: unknown): x is number => typeof x === 'number' && Number.isFin
 // "YYYY-MM-DD" is a business day to the chart. The string is passed on untouched: it never goes
 // through a JS Date, whose timezone could move it a day.
 const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
-const isDay = (x: unknown): x is string => typeof x === 'string' && ISO_DAY.test(x);
+export const isDay = (x: unknown): x is string => typeof x === 'string' && ISO_DAY.test(x);
 
 /** Ascending by day, one entry per day (the last one wins). */
-function ascending<T extends { time: string }>(rows: T[]): T[] {
+export function ascending<T extends { time: string }>(rows: T[]): T[] {
   const byDay = new Map<string, T>();
   for (const row of rows) byDay.set(row.time, row);
   return Array.from(byDay.values()).sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : 0));
