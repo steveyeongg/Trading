@@ -29,6 +29,12 @@ function failure(freshness: FreshnessOut): { step: string; reason: string } {
 export const partialDataText = (missing: number, expected: number, session: string) =>
   `Prices were missing for ${missing} of ${expected} stocks on ${session}; tonight's ideas may be incomplete.`;
 
+/** A run that failed after saving tonight's scan (tracking, positions or the digest). */
+export function stepFailedText(freshness: FreshnessOut): string {
+  const { step, reason } = failure(freshness);
+  return `Tonight's scan finished, but the ${step} step failed: ${reason}.`;
+}
+
 export function scanFailedText(freshness: FreshnessOut): string {
   const { step, reason } = failure(freshness);
   return `Last scan failed at step ${step}: ${reason}. Showing the previous scan.`;
@@ -66,6 +72,20 @@ export function PartialDataBanner({ today }: { today: TodayOut }) {
       {partialDataText(partial.missing, partial.expected, sessionDate(today.freshness.data_as_of))}
     </Notice>
   );
+}
+
+/**
+ * The warn line of a run that failed after tonight's scan was saved: the server reports a failed
+ * run but not `last_scan_failed` (which is only for a run that stopped before saving its scan),
+ * so tonight's ideas and the downtrend or no-candidates notice still show below it.
+ */
+export function StepFailedBanner({ today }: { today: TodayOut }) {
+  const afterScan =
+    today.freshness.last_scan_status === 'failed' &&
+    today.empty_reason !== 'last_scan_failed' &&
+    today.empty_reason !== 'first_run';
+  if (!afterScan) return null;
+  return <Notice tone="warn">{stepFailedText(today.freshness)}</Notice>;
 }
 
 /** The banner shown above everything when the latest scan failed; the previous ideas follow it. */

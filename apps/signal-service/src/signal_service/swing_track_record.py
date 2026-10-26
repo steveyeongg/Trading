@@ -231,7 +231,14 @@ def family_out(
     ]
     warnings = []
     expectancy = as_float(live.get("expectancy_r"))
-    if expectancy is not None and expectancy < 0 and live["n"] >= UNDERPERFORMING_AFTER:
+    # Only a Live family's live record can underperform its validation; a Research-only family
+    # was never vouched for, and its tracked ideas are not "live" in that sense.
+    if (
+        fam.verdict == "live"
+        and expectancy is not None
+        and expectancy < 0
+        and live["n"] >= UNDERPERFORMING_AFTER
+    ):
         warnings.append(
             f"live underperforming: expectancy {expectancy:.2f}R after {live['n']} live ideas"
         )

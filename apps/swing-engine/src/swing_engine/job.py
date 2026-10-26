@@ -465,7 +465,8 @@ class _Run:
         except Exception as exc:
             reason = safe_reason(exc)
             self.steps[name] = {"status": "failed", "error": reason}
-            log.debug("swing.job.step_failed", step=name, exc_info=True)
+            # No traceback: its frames can hold a request URL with a token in it.
+            log.debug("swing.job.step_failed", step=name, error=reason, type=type(exc).__name__)
             return _Failure(name, reason)
         finally:
             await self._flush()

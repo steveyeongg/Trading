@@ -562,6 +562,27 @@ def test_status_reports_each_piece_and_the_nightly_scan(running: Running) -> Non
     assert "Telegram" in status.stdout and "Alpaca" in status.stdout
 
 
+def _backfilling(data_as_of: str | None, trigger: str) -> str:
+    status = json.loads(STATUS_JSON)
+    status["data_as_of"] = data_as_of
+    status["last_scan"].update(status="running", steps={
+        "bars": {"status": "running", "done": 3200, "total": 6400, "trigger": trigger}})  # fmt: skip
+    return json.dumps(status)
+
+
+def test_status_calls_a_later_backfill_downloading_prices_and_says_why(running: Running) -> None:
+    """Every running backfill used to read "First download", even the weekly one after the
+    asset list was refreshed. Only a store that was never scanned is the first download."""
+    later = running.box.run("status", FAKE_STATUS_JSON=_backfilling("2026-10-16", "asset list refreshed"))
+    assert later.returncode == 0, later.stderr
+    assert "Downloading prices:" in later.stdout and "3200 of 6400 symbols (50%)" in later.stdout
+    assert "because: asset list refreshed" in later.stdout
+    assert "first download" not in later.stdout.lower()
+
+    first = running.box.run("status", FAKE_STATUS_JSON=_backfilling(None, "no SPY bars stored"))
+    assert "Downloading prices:" in first.stdout and "first download" in first.stdout
+
+
 def test_status_reports_a_running_server_that_does_not_answer(running: Running) -> None:
     sick = running.box.run("status", FAKE_CURL_EXIT="7")
     assert sick.returncode == 0, sick.stderr

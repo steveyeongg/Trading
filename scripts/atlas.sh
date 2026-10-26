@@ -45,7 +45,7 @@ Commands:
   down     Stop the API and the dashboard, then stop (not remove) the Docker containers.
            Your data stays.
   status   Show what is running, and the nightly scan's state: data as of, last and next
-           scan, first-time download progress, whether Alpaca and Telegram are set up.
+           scan, price download progress, whether Alpaca and Telegram are set up.
   help     Show this text.
 
 Environment flags:
@@ -354,12 +354,21 @@ def summary(status):
         rows.append(("Scheduler", "off: " + str(status.get("disabled_reason") or "not running")))
     progress = status.get("backfill")
     if progress and progress.get("total"):
+        # A running backfill: the first download only while nothing was ever scanned; later it
+        # is a catch-up (new listings, a store left behind), so say what triggered it.
         done, total = int(progress["done"]), int(progress["total"])
-        rows.append(("First download", "%d of %d symbols (%d%%)" % (done, total, 100 * done // total)))
+        line = "%d of %d symbols (%d%%)" % (done, total, 100 * done // total)
+        bars = ((last or {}).get("steps") or {}).get("bars") or {}
+        trigger = bars.get("trigger") if isinstance(bars, dict) else None
+        if not status.get("data_as_of"):
+            line += ", first download"
+        elif trigger:
+            line += ", because: " + str(trigger)[:120]
+        rows.append(("Downloading prices", line))
     rows.append(("Alpaca keys", yes(status.get("alpaca_configured"))))
     rows.append(("Telegram", yes(status.get("telegram_configured"))))
     rows.append(("Auto-execution", "on" if status.get("auto_execution") else "off"))
-    return ["  %-15s %s" % (label + ":", value) for label, value in rows]
+    return ["  %-19s %s" % (label + ":", value) for label, value in rows]
 
 
 # Anything unexpected in the answer (not JSON, not an object, a wrong type) gives the one fallback

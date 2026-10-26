@@ -509,6 +509,42 @@ def test_today_last_scan_failed_still_returns_previous_ideas(api):
     assert j["freshness"]["ideas_for"] == NEXT.isoformat()
 
 
+@pytest.mark.parametrize("step", ["tracking", "positions", "digest"])
+def test_a_failure_after_the_scan_was_saved_still_shows_tonights_scan(api, step):
+    """The incident: a failure in tracking, positions or the digest read "Showing the previous
+    scan" although tonight's scan was saved and is what Today shows. ``last_scan_failed`` is
+    now only for a run that stopped before saving its scan; the failed step is still in
+    ``freshness`` for the page's separate line."""
+    steps = {"scan": {"status": "ok"}, step: {"status": "failed", "error": "Telegram is down"}}
+    api.store = FakeStore(scan=_scan_row(), jobs=[_job("failed", steps)])
+
+    j = _today(api)
+
+    assert j["empty_reason"] is None and j["ideas"] + j["unproven"]
+    assert j["freshness"]["last_scan_status"] == "failed"
+    assert (j["freshness"]["failed_step"], j["freshness"]["failed_reason"]) == (
+        step,
+        "Telegram is down",
+    )
+
+
+def test_a_post_scan_failure_keeps_the_downtrend_notice(api):
+    panel = _downtrend(PANEL)
+    ctx = build_context(panel, KINDS, SESSION)
+    result = run_scan(panel, KINDS, SESSION, RiskSettings(), SETUPS, ctx=ctx)
+    steps = {"positions": {"status": "failed", "error": "boom"}}
+    api.store = FakeStore(scan=_scan_row(result, ctx), ideas=_idea_rows(result),
+                          jobs=[_job("failed", steps)])  # fmt: skip
+    assert _today(api)["empty_reason"] == "downtrend"
+
+
+@pytest.mark.parametrize("step", ["calendar", "settings", "assets", "bars", "scan"])
+def test_a_failure_before_the_scan_was_saved_is_last_scan_failed(api, step):
+    steps = {step: {"status": "failed", "error": "down"}}
+    api.store = FakeStore(scan=_scan_row(), jobs=[_job("failed", steps)])
+    assert _today(api)["empty_reason"] == "last_scan_failed"
+
+
 def test_scan_run_conflict_returns_409(api, monkeypatch):
     built: list[str] = []
 
@@ -1474,6 +1510,23 @@ def test_track_record_warnings(api):
         "validated with default universe filters; yours differ",
     ]
     assert pullback["warnings"] == []  # never validated: neither applies
+
+
+def test_a_research_only_family_never_reads_as_live_underperforming(api):
+    """The live-underperforming warning compared a family's live record with a validation it
+    never passed: a Research-only family's forward-tracked ideas are not a Live record."""
+    losing = [
+        {"id": uuid.uuid4(), "symbol": f"Z{k:02d}", "setup": "pullback", "session": SESSION,
+         "track_status": "closed", "entry_date": SESSION, "known_date": NEXT,
+         "r_multiple": -0.5, "watch_only": False, "reconstructed": False}
+        for k in range(30)
+    ]  # fmt: skip
+    api.store = FakeStore(ideas=losing)
+
+    _, pullback = api.get("/v1/track-record").json()["families"]
+
+    assert pullback["verdict"] != "live" and pullback["live"]["n"] == 30
+    assert pullback["warnings"] == []
 
 
 @pytest.mark.parametrize(

@@ -607,6 +607,26 @@ async def test_a_cancelled_run_is_closed_as_failed_interrupted_and_the_cancel_pr
     assert not job.is_running()  # the lock is released: the next run can start
 
 
+async def test_a_failed_step_is_logged_without_a_traceback(h, monkeypatch):
+    """The incident: the step-failure debug log carried ``exc_info``, whose frames can hold an
+    httpx request URL with the Telegram bot token. It logs the safe reason and type only."""
+    records: list[tuple[str, dict[str, Any]]] = []
+
+    class Log:
+        def __getattr__(self, level: str):
+            return lambda event, **fields: records.append((event, fields))
+
+    monkeypatch.setattr(job, "log", Log())
+    h.store = FakeProductStore(jobs=[_refreshed_yesterday()])
+    h.ingest.raises = RuntimeError(f"GET https://api.telegram.org/bot{FAKE_TOKEN}/x failed")
+
+    await run_job(h.deps(), "nightly")
+
+    (fields,) = [f for e, f in records if e == "swing.job.step_failed"]
+    assert "exc_info" not in fields and fields["type"] == "RuntimeError"
+    assert FAKE_TOKEN not in str(records) and fields["step"] == "bars"
+
+
 # ---------------------------------------------------------------------------- the context (PR2)
 
 

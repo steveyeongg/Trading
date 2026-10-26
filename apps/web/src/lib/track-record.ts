@@ -71,7 +71,7 @@ export interface RecordColumn {
   emptyText: string | null;
 }
 
-/** The four columns, in order: In-sample, Out-of-sample, Live, Reconstructed. */
+/** The four columns, in order: In-sample, Out-of-sample, Live (forward), Reconstructed (forward). */
 export function recordColumns(family: FamilyOut): RecordColumn[] {
   const insample = family.insample ?? null;
   const oos = family.oos ?? null;
@@ -92,13 +92,13 @@ export function recordColumns(family: FamilyOut): RecordColumn[] {
     },
     {
       key: 'live',
-      title: 'Live',
+      title: 'Live (forward)',
       stats: live,
       emptyText: live === null || live.n === 0 ? NO_LIVE_IDEAS_TEXT : null,
     },
     {
       key: 'reconstructed',
-      title: 'Reconstructed',
+      title: 'Reconstructed (forward)',
       stats: rebuilt,
       emptyText: rebuilt === null || rebuilt.n === 0 ? NO_RECONSTRUCTED_IDEAS_TEXT : null,
     },

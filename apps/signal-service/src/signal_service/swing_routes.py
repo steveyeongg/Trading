@@ -701,6 +701,11 @@ def _partial(
     return None if missing is None or expected is None else {"missing": missing, "expected": expected}
 
 
+AFTER_SCAN_STEPS = frozenset({"tracking", "positions", "digest"})
+"""Steps that run after tonight's scan is saved: a failure in one of them still shows tonight's
+scan (Today says which step failed), unlike a failure before it (``last_scan_failed``)."""
+
+
 # --- routes: Today ----------------------------------------------------------------------------
 
 
@@ -742,7 +747,9 @@ async def today() -> dict[str, Any]:
     step, reason = _failure(run)
     if scan is None:
         empty: str | None = "first_run"
-    elif status == "failed":
+    elif status == "failed" and step not in AFTER_SCAN_STEPS:
+        # Tonight's scan was not saved (assets, bars, the scan itself, or a pre-step such as the
+        # calendar or the settings, or a step not recorded): the ideas shown are the previous ones.
         empty = "last_scan_failed"
     elif state == Regime.DOWNTREND.value:
         empty = "downtrend"
