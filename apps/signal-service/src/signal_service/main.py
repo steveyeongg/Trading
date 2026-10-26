@@ -130,17 +130,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Before the scheduler can start a job: a run an earlier API left "running" is closed.
     await _close_interrupted_jobs()
     # Evaluated here, after load_env(), so ATLAS_DISABLE_SCHEDULER=1 works from `.env` too. The
-    # deps are built inside the task: a failure there is the scheduler's, never the API's. The
-    # swing context cache is warmed in the background after it (it logs and gives up on a DB
-    # error), so the first stock page does not wait for the build; never under pytest.
+    # deps are built inside the task: a failure there is the scheduler's, never the API's.
     if scheduler_enabled():
         tasks.append(asyncio.create_task(swing_scheduler(make_swing_deps)))
-        tasks.append(asyncio.create_task(warm_swing_context()))
         log.info("swing.scheduler.enabled")
     else:
         reason = disabled_reason() or "Automatic scans are off."
         mark_disabled(reason)
         log.info("swing.scheduler.disabled", reason=reason)
+    # The swing context cache is warmed in the background (it logs and gives up on a DB error),
+    # so the first stock page does not wait out the build. Whether or not the scheduler runs
+    # (ATLAS_DISABLE_SCHEDULER=1 still serves the pages); never under pytest.
+    if "PYTEST_CURRENT_TEST" not in os.environ:
+        tasks.append(asyncio.create_task(warm_swing_context()))
     try:
         yield
     finally:

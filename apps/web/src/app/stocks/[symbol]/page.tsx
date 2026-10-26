@@ -13,12 +13,13 @@ import {
   STOCK_EMPTY_SYMBOL_TEXT,
   STOCK_NOT_FOUND_HINT,
   STOCK_POSITION_LINES_NOTE,
+  STOCK_MARKET_DATA_LOADING_TEXT,
   stockLoadingText,
   stockNotFoundText,
 } from '@/lib/copy';
 import { ApiError } from '@/lib/api';
 import { sessionDate } from '@/lib/format';
-import { isUnreachable, swingApi } from '@/lib/swing-api';
+import { LOADING_RETRY_MS, isLoadingMarketData, isUnreachable, swingApi } from '@/lib/swing-api';
 import type { StockOut } from '@/lib/swing-types';
 
 const REFRESH_MS = 5 * 60_000; // the scan data changes once a night; no live stream here
@@ -104,16 +105,20 @@ export default function StockPage() {
   // An address with no ticker in it (/stocks/%20): there is nothing to ask the API for.
   const noSymbol = symbol === '';
 
-  const { data, error, isPending, isFetching, refetch } = useQuery<StockOut>({
+  const { data, error, failureReason, isPending, isFetching, refetch } = useQuery<StockOut>({
     queryKey: ['stock', symbol],
     queryFn: () => swingApi.stock(symbol),
     enabled: !noSymbol,
     refetchInterval: REFRESH_MS,
     refetchOnWindowFocus: true,
-    // Only a request that never reached the API is worth one more try; a 404 or a 503 is the
-    // server's answer, and the Retry button asks again.
-    retry: (failures, err) => failures < 1 && isUnreachable(err),
+    // The API still loading its market data after a start (a 503 that says so) is asked again
+    // every 10 seconds until it answers; a request that never reached the API is worth one more
+    // try. Any other 404 or 503 is the server's answer, and the Retry button asks again.
+    retry: (failures, err) => isLoadingMarketData(err) || (failures < 1 && isUnreachable(err)),
+    retryDelay: (failures, err) =>
+      isLoadingMarketData(err) ? LOADING_RETRY_MS : Math.min(1000 * 2 ** failures, 30_000),
   });
+  const loadingMarketData = isFetching && isLoadingMarketData(failureReason);
 
   const notFound = error instanceof ApiError && error.status === 404;
 
@@ -144,10 +149,16 @@ export default function StockPage() {
           {error !== null && (
             <LoadFailure error={error} retrying={isFetching} onRetry={() => void refetch()} />
           )}
+          {loadingMarketData && (
+            <p role="status" className="text-sm text-ink-muted">
+              {STOCK_MARKET_DATA_LOADING_TEXT}
+            </p>
+          )}
           {data !== undefined ? (
             <StockView stock={data} />
           ) : (
-            isPending && <p className="text-sm text-ink-muted">{stockLoadingText(symbol)}</p>
+            isPending &&
+            !loadingMarketData && <p className="text-sm text-ink-muted">{stockLoadingText(symbol)}</p>
           )}
         </>
       )}

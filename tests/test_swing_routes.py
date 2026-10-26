@@ -32,6 +32,7 @@ import dataclasses
 import json
 import shutil
 import threading
+import time
 import uuid
 from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
@@ -62,6 +63,7 @@ from swing_engine.validation.protocol import protocol_block
 
 REPO = Path(__file__).resolve().parents[1]
 WEB = {"X-ATLAS-Client": "web"}  # what the dashboard sends with every write
+BUILDS = "/v1/stocks/S05"  # a request that waits for the context (GET /v1/positions never does)
 FAKE_TOKEN = "1234567890:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"  # shaped like a real bot token
 
 PANEL = synthetic_universe_panel(seed=5)
@@ -316,6 +318,7 @@ class Api:
         self.panel = PANEL
         monkeypatch.setattr(swing_context, "_CACHE", swing_context._Cache())
         monkeypatch.setattr(swing_context, "_CACHE_LOCK", asyncio.Lock())
+        monkeypatch.setattr(swing_context, "_BUILD", swing_context._Build())
         monkeypatch.setattr(swing_routes, "_CREATE_LOCK", asyncio.Lock())
         monkeypatch.setattr(swing_routes, "_ASSETS", swing_routes._AssetNames())
         monkeypatch.setattr(swing_routes, "store", _Forward(self, "store"))
@@ -400,6 +403,39 @@ def test_today_first_run_has_empty_reason_and_backfill_progress(api):
         "failed_step": None,
         "failed_reason": None,
     }
+
+
+def test_today_tells_a_first_scan_that_is_running_from_one_that_is_downloading(api):
+    """D1, the controller's live run: Today said "downloading 10 years of daily data (0%)"
+    while the first job was still refreshing the asset list, and kept the download line up
+    while the scan ran. ``backfill`` is now only the bars step's progress while it runs, and
+    ``running_step`` says which step the run is in."""
+    assets = _job("running", {"assets": {"status": "running"}})
+    api.store = FakeStore(jobs=[assets])
+    j = _today(api)
+    assert (j["running_step"], j["backfill"], j["empty_reason"]) == ("assets", None, "first_run")
+
+    scanning = _job("running", {"bars": {"status": "ok", "mode": "backfill", "done": 9,
+                                         "total": 9}, "scan": {"status": "running"}})  # fmt: skip
+    api.store = FakeStore(jobs=[scanning])
+    assert (_today(api)["running_step"], _today(api)["backfill"]) == ("scan", None)
+
+    downloading = _job("running", {"bars": {"status": "running", "done": 3, "total": 9}})
+    api.store = FakeStore(jobs=[downloading])
+    assert (_today(api)["running_step"], _today(api)["backfill"]) == ("bars", {"done": 3,
+                                                                               "total": 9})  # fmt: skip
+
+    api.store = FakeStore(jobs=[_job("ok", {})])
+    assert _today(api)["running_step"] is None
+
+
+def test_today_says_why_automatic_scans_are_off(api):
+    api.store = FakeStore()
+    j = _today(api)
+    assert j["freshness"]["last_scan_status"] == "never"
+    assert j["disabled_reason"] == "Automatic scans are off: the API is running under pytest."
+    api.state = {"running": True, "next_scan_at": None, "disabled_reason": None}
+    assert _today(api)["disabled_reason"] is None
 
 
 def test_today_splits_live_and_unproven(api):
@@ -704,8 +740,8 @@ def test_today_never_needs_a_context(api, monkeypatch):
     async def must_not_build(*args: Any, **kwargs: Any) -> None:
         raise AssertionError("Today read the context")
 
-    monkeypatch.setattr(swing_routes, "get_context", must_not_build)
-    monkeypatch.setattr(swing_routes, "cached_context", must_not_build)
+    monkeypatch.setattr(swing_routes, "context_within", must_not_build)
+    monkeypatch.setattr(swing_context, "cached_context", must_not_build)
     api.store = FakeStore(scan=_scan_row())
     assert _today(api)["unproven"]
 
@@ -801,8 +837,15 @@ def test_the_context_is_built_once_lazily_off_the_loop_with_the_users_universe(a
 
     monkeypatch.setattr(swing_context, "build_context", watched)
 
-    for _ in range(3):
-        assert api.get("/v1/positions").status_code == 200
+    with TestClient(api.app, headers=WEB) as client:  # one event loop, as the real API has
+        first = client.get("/v1/positions").json()
+        assert first[0]["last_close"] is None  # a cold cache: no wait, the build starts behind it
+        for _ in range(500):
+            if swing_context._CACHE.ctx is not None:
+                break
+            threading.Event().wait(0.01)
+        for _ in range(2):
+            assert client.get("/v1/positions").json()[0]["last_close"] is not None
 
     assert api.loads == [(SESSION, settings.universe(), ["S05"])]  # once, at the latest scan
     assert on_loop == [False]  # built in a worker thread, never on the event loop
@@ -1850,15 +1893,17 @@ def test_a_universe_change_during_a_job_never_leaves_an_older_session_cached(api
     monkeypatch.setattr(swing_routes.job, "is_running", lambda: True)
     api.store = FakeStore(scan={**_scan_row(), "session": PREV})
     body = {**SwingSettings().model_dump(), "min_price": 15.0}
-    assert api.client.put("/v1/settings", json=body).status_code == 200
-    assert api.get("/v1/positions").status_code == 200  # a lazy build, from the S-1 scan
-    assert swing_context._CACHE.ctx is not None and swing_context._CACHE.ctx.session.date() == PREV
+    with TestClient(api.app, headers=WEB) as client:  # one event loop, as the real API has
+        assert client.put("/v1/settings", json=body).status_code == 200  # starts the rebuild
+        assert client.get(BUILDS).status_code == 200  # waits for it: from the S-1 scan
+        cached = swing_context._CACHE.ctx
+        assert cached is not None and cached.session.date() == PREV
 
-    swing_context.set_context(CTX)  # the job's S context, built with the old filters: dropped
+        swing_context.set_context(CTX)  # the job's S context, built with the old filters: dropped
 
-    assert swing_context._CACHE.ctx is None  # S-1 cleared too
-    api.store.scan = _scan_row()  # the job saved S before it handed its context over
-    assert api.get("/v1/positions").status_code == 200
+        assert swing_context._CACHE.ctx is None  # S-1 cleared too
+        api.store.scan = _scan_row()  # the job saved S before it handed its context over
+        assert client.get(BUILDS).status_code == 200
     assert swing_context._CACHE.ctx.session.date() == SESSION
     assert [load[0] for load in api.loads] == [PREV, SESSION]
 
@@ -1881,7 +1926,12 @@ async def test_a_build_older_than_a_dropped_job_context_is_not_cached(api, monke
     swing_context.set_context(CTX)  # dropped: built with the old filters
     release.set()
 
-    assert await build is None and swing_context._CACHE.ctx is None  # S-1 refused
+    got = await build
+    cached = swing_context._CACHE.ctx
+    # S-1 is refused. The rebuild Settings started (invalidate_context) held the lock first and
+    # was the one refused; this read then builds the newest session offered (S), or finds none.
+    assert got is None or got.session.date() == SESSION
+    assert cached is None or cached.session.date() == SESSION
 
 
 def test_a_stale_cached_context_never_overwrites_newer_advice(api):
@@ -2036,7 +2086,7 @@ def test_the_cache_follows_a_newer_stored_scan_without_a_handover(api):
     swing_context.set_context(CTX_PREV, UniverseFilter())
     api.store = FakeStore(scan=_scan_row())
 
-    assert api.get("/v1/positions").status_code == 200
+    assert api.get(BUILDS).status_code == 200
 
     assert [load[0] for load in api.loads] == [SESSION]
     assert swing_context._CACHE.ctx is not None
@@ -2071,7 +2121,7 @@ def test_a_build_that_would_lose_to_a_newer_session_is_not_retried_on_every_requ
     swing_context.set_context(CTX)  # dropped, but S is the newest session now
 
     for _ in range(3):
-        assert api.get("/v1/positions").status_code == 200
+        assert api.get(BUILDS).status_code == 200
 
     assert [load[0] for load in api.loads] == [SESSION]
     assert swing_context._CACHE.ctx.session.date() == SESSION
@@ -2109,3 +2159,123 @@ def test_run_scan_now_answers_starting_when_the_job_is_slow_to_record_its_run(ap
 
 def test_run_scan_now_waits_at_most_20_seconds():
     assert swing_routes.JOB_ID_WAIT_S <= 20.0
+
+
+# ---------------------------------------------------------------------------- bounded context waits
+#
+# D3, the controller's live run: on a cold start the context build reads a year and a half of
+# bars for the whole universe (about a minute), and every positions request waited for it, so the
+# Positions page and "I bought this" hung. Each request now has its own bound and the build runs
+# in the background. The loader below takes 3 seconds; every bound here is far shorter.
+
+SLOW_S = 3.0
+
+
+def _slow(api: Api, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def slow_loader(as_of, universe, extra_symbols=()):
+        api.loads.append((as_of, universe, list(extra_symbols)))
+        await asyncio.sleep(SLOW_S)
+        return PANEL, KINDS, as_of or SESSION
+
+    monkeypatch.setattr(swing_context, "loader", slow_loader)
+    monkeypatch.setattr(swing_context, "WRITE_WAIT_S", 0.2)
+    monkeypatch.setattr(swing_context, "STOCK_WAIT_S", 0.3)
+
+
+def _timed(call: Any) -> tuple[Any, float]:
+    start = time.monotonic()
+    response = call()
+    return response, time.monotonic() - start
+
+
+def test_listing_positions_never_waits_for_a_cold_build(api, monkeypatch):
+    _slow(api, monkeypatch)
+    api.store = FakeStore(scan=_scan_row())
+    _add_position(api, entry=100.0, stop=95.0, opened=SESSION)
+
+    response, took = _timed(lambda: api.get("/v1/positions"))
+
+    assert response.status_code == 200 and took < 1.0
+    (row,) = response.json()
+    assert row["last_close"] is None and row["r_now"] is None
+    assert api.loads, "the miss started a background build"
+
+
+def test_a_position_write_waits_at_most_its_bound_then_saves_without_advice(api, monkeypatch):
+    _slow(api, monkeypatch)
+    api.store = FakeStore(scan=_scan_row())
+
+    created, took = _timed(lambda: api.client.post("/v1/positions", json=_position_body()))
+
+    assert created.status_code == 201, created.text
+    assert took < swing_context.WRITE_WAIT_S + 1.0 < SLOW_S
+    out = created.json()
+    assert out["last_action"] is None and out["current_stop"] == 95.0  # the nightly advises it
+
+    patched, took = _timed(
+        lambda: api.client.patch(f"/v1/positions/{out['id']}", json={"current_stop": 96.0})
+    )
+    assert patched.status_code == 200 and took < swing_context.WRITE_WAIT_S + 1.0
+    assert patched.json()["current_stop"] == 96.0 and patched.json()["last_action"] is None
+
+    body = {"closed_on": NEXT.isoformat(), "exit_price": 110.0}
+    closed, took = _timed(
+        lambda: api.client.post(f"/v1/positions/{out['id']}/close", json=body)
+    )
+    assert closed.status_code == 200 and took < swing_context.WRITE_WAIT_S + 1.0
+    assert closed.json()["exit_price"] == 110.0  # as given: no split check without a context
+    assert closed.json()["r_multiple"] == pytest.approx((110.0 - 100.0) / 5.0)
+
+
+def test_a_stock_page_waits_at_most_its_bound_then_says_it_is_loading(api, monkeypatch):
+    _slow(api, monkeypatch)
+    api.store = FakeStore(scan=_scan_row())
+
+    response, took = _timed(lambda: api.get("/v1/stocks/S05"))
+
+    assert response.status_code == 503 and took < swing_context.STOCK_WAIT_S + 1.0 < SLOW_S
+    assert response.json() == {
+        "detail": "Loading market data; this takes about a minute after ATLAS starts."
+    }
+
+
+def test_a_stock_page_gets_the_context_when_it_is_ready_within_its_bound(api):
+    api.store = FakeStore(scan=_scan_row())  # the default loader is quick
+    response, took = _timed(lambda: api.get("/v1/stocks/S05"))
+    assert response.status_code == 200 and took < swing_context.STOCK_WAIT_S
+
+
+def test_a_universe_change_starts_the_rebuild_without_waiting_for_a_request(api):
+    api.store = FakeStore(scan=_scan_row())
+    swing_context.set_context(CTX, UniverseFilter())
+    body = {**SwingSettings().model_dump(), "min_price": 15.0}
+
+    with TestClient(api.app, headers=WEB) as client:
+        assert client.put("/v1/settings", json=body).status_code == 200
+        for _ in range(500):
+            if swing_context._CACHE.ctx is not None:
+                break
+            threading.Event().wait(0.01)
+
+    assert [load[1].min_price for load in api.loads] == [15.0]
+    assert swing_context._CACHE.universe == api.store.settings.universe()
+
+
+def test_the_lifespan_warms_the_cache_even_with_the_scheduler_off(monkeypatch):
+    warmed: list[bool] = []
+
+    async def warm() -> None:
+        warmed.append(True)
+
+    monkeypatch.setattr(scheduler, "_STATE", scheduler._State())
+    monkeypatch.setattr(service, "load_env", lambda: None)
+    monkeypatch.setattr(service, "warm_swing_context", warm)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("ATLAS_DISABLE_SCHEDULER", "1")
+    with TestClient(service.app) as client:
+        assert client.get("/healthz").status_code == 200
+        for _ in range(100):
+            if warmed:
+                break
+            threading.Event().wait(0.01)
+    assert warmed == [True]

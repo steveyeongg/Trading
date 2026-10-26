@@ -36,6 +36,16 @@ export const UNREACHABLE = 'unreachable';
 // What the Next dev proxy answers (a plain-text body) when the API behind it is down.
 const PROXY_FAILURES = new Set([500, 502, 504]);
 
+/** The 503 detail of a stock page asked for while the API is still loading its market data. */
+export const LOADING_MARKET_DATA = 'Loading market data; this takes about a minute after ATLAS starts.';
+/** How often a page asks again while the market data is loading. */
+export const LOADING_RETRY_MS = 10_000;
+
+/** True when `err` is the API's "still loading the market data" 503 (worth asking again). */
+export function isLoadingMarketData(err: unknown): boolean {
+  return err instanceof ApiError && err.status === 503 && err.code === LOADING_MARKET_DATA;
+}
+
 /** True when `err` is the "can't reach the API" error (render `ApiDown` for it). */
 export function isUnreachable(err: unknown): boolean {
   return err instanceof ApiError && err.code === UNREACHABLE && err.status === 0;

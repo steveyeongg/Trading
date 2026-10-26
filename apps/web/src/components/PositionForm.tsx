@@ -27,7 +27,7 @@ import { errorText } from '@/lib/error-text';
 import { money, pct, price, todayET } from '@/lib/format';
 import { INPUT_CLASS, PRIMARY_BUTTON_CLASS, SECONDARY_BUTTON_CLASS } from '@/lib/form-styles';
 import { parseAmount, plainNumber } from '@/lib/position-utils';
-import { swingApi } from '@/lib/swing-api';
+import { LOADING_RETRY_MS, isLoadingMarketData, swingApi } from '@/lib/swing-api';
 import type { IdeaOut, PositionIn, PositionOut } from '@/lib/swing-types';
 
 // The server's own pattern for a symbol (`swing_routes._SYMBOL`).
@@ -136,7 +136,9 @@ export function PositionForm({
     queryKey: ['stock', clean(initialSymbol)],
     queryFn: () => swingApi.stock(clean(initialSymbol)),
     enabled: wantIdea,
-    retry: false,
+    // Only while the API is still loading its market data after a start (see the stock page).
+    retry: (_failures, err) => isLoadingMarketData(err),
+    retryDelay: LOADING_RETRY_MS,
     staleTime: 60_000,
     refetchInterval: false,
     refetchOnWindowFocus: false,
@@ -152,7 +154,8 @@ export function PositionForm({
     prefilled.current = true;
     setValues((v) => ({
       ...v,
-      stop: v.stop === '' && matched.stop !== null ? plainNumber(matched.stop) : v.stop,
+      // To the cent (52.69, not 52.6935): what the user sees is what is submitted.
+      stop: v.stop === '' && matched.stop !== null ? matched.stop.toFixed(2) : v.stop,
       shares: v.shares === '' && matched.shares > 0 ? plainNumber(matched.shares) : v.shares,
     }));
   }, [matched]);

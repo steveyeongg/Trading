@@ -1,4 +1,5 @@
 import type { ReactNode } from 'react';
+import { schedulerOffText } from '@/lib/copy';
 import { sessionDate } from '@/lib/format';
 import type { FreshnessOut, ProgressOut, TodayOut } from '@/lib/swing-types';
 
@@ -8,6 +9,23 @@ export const DOWNTREND_TEXT =
 export const NO_SETUP_PASSED_TEXT = 'No setup has passed testing yet';
 export const NO_VALIDATED_IDEAS_TEXT = 'No validated-setup ideas tonight.';
 export const WAITING_FOR_FIRST_SCAN_TEXT = 'Waiting for the first scan to start.';
+
+/** The step names a run records, in words (an unknown one is shown as recorded). */
+const STEP_WORDS: Record<string, string> = {
+  assets: 'refreshing the stock list',
+  bars: 'downloading daily bars',
+  scan: 'scanning for ideas',
+  tracking: 'updating tracked ideas',
+  positions: 'checking your positions',
+  digest: 'sending the Telegram digest',
+};
+
+/** "First scan running: refreshing the stock list…" (`starting` before the first step). */
+export function firstScanRunningText(step: string | null): string {
+  const words =
+    step === null ? 'starting' : Object.prototype.hasOwnProperty.call(STEP_WORDS, step) ? STEP_WORDS[step] : step;
+  return `First scan running: ${words}…`;
+}
 
 export const firstRunText = (percent: number) =>
   `First-time setup: downloading 10 years of daily data (${percent}%)`;
@@ -106,24 +124,38 @@ function FirstRun({ today }: { today: TodayOut }) {
       </Notice>
     );
   }
+  // Downloading: only while the bars step of the first run reports its backfill progress.
+  if (backfill === null) {
+    if (freshness.last_scan_status === 'running') {
+      return (
+        <Notice tone="plain">
+          <p className="text-ink">{firstScanRunningText(today.running_step)}</p>
+        </Notice>
+      );
+    }
+    return (
+      <Notice tone="plain">
+        <p className="text-ink">{WAITING_FOR_FIRST_SCAN_TEXT}</p>
+        {today.disabled_reason !== null && (
+          <p className="mt-1">{schedulerOffText(today.disabled_reason)}</p>
+        )}
+      </Notice>
+    );
+  }
   const percent = backfillPercent(backfill);
   return (
     <Notice tone="plain">
       <p className="text-ink">{firstRunText(percent)}</p>
-      {backfill === null ? (
-        <p className="mt-1">{WAITING_FOR_FIRST_SCAN_TEXT}</p>
-      ) : (
-        <div
-          role="progressbar"
-          aria-label="First-time download progress"
-          aria-valuemin={0}
-          aria-valuemax={100}
-          aria-valuenow={percent}
-          className="mt-2 h-1.5 w-full overflow-hidden rounded bg-bg-subtle"
-        >
-          <div className="h-full bg-accent" style={{ width: `${percent}%` }} />
-        </div>
-      )}
+      <div
+        role="progressbar"
+        aria-label="First-time download progress"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={percent}
+        className="mt-2 h-1.5 w-full overflow-hidden rounded bg-bg-subtle"
+      >
+        <div className="h-full bg-accent" style={{ width: `${percent}%` }} />
+      </div>
     </Notice>
   );
 }

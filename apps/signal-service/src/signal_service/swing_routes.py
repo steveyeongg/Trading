@@ -7,10 +7,14 @@ a backtest inside a request:
 * ``GET /v1/today`` reads the latest stored scan (its ideas carry their narration, PR13), the
   latest job run, the settings and the open positions. It needs no ``ScanContext``.
 * ``GET /v1/stocks/{symbol}`` and the positions routes read the **context cache**
-  (:mod:`signal_service.swing_context`): the job's target session's context, or one built
-  lazily, once, off the event loop, from the stored bars of the latest scanned session. It is
-  rebuilt only when the universe filters in Settings change, never goes back to an earlier
-  session, and a request never builds a context itself.
+  (:mod:`signal_service.swing_context`): the job's target session's context, or one built in
+  the background, once, off the event loop, from the stored bars of the latest scanned session.
+  It is rebuilt only when the universe filters in Settings change and never goes back to an
+  earlier session. No request waits for a cold build beyond a short bound: ``GET /v1/positions``
+  not at all (no last close or R until it is ready), a position write
+  :data:`~signal_service.swing_context.WRITE_WAIT_S` (then it saves without advice and closes
+  without the split check, and the nightly job advises it), a stock page
+  :data:`~signal_service.swing_context.STOCK_WAIT_S` (then 503 "Loading market data...").
 * ``GET /v1/track-record`` reads ``ml/validation`` as Phase 1 writes it, plus the stored ideas'
   forward tracking for the live record (:mod:`signal_service.swing_track_record`).
 * An idea is Live only when its scan said so **and** its family's verdict is Live now.
@@ -87,11 +91,12 @@ from swing_engine.scheduler import scheduler_state
 from swing_engine.settings import SwingSettings
 from swing_engine.validation.protocol import FAMILIES
 
-from signal_service import swing_deps
+from signal_service import swing_context, swing_deps
 from signal_service.swing_context import (
-    cached_context,
-    get_context,
+    LOADING_DETAIL,
+    context_within,
     invalidate_context,
+    is_building,
     last_failure,
 )
 from signal_service.swing_track_record import (
@@ -319,6 +324,11 @@ class TodayOut(_Out):
     capacity: CapacityOut
     empty_reason: Literal["first_run", "downtrend", "no_candidates", "last_scan_failed"] | None
     backfill: ProgressOut | None
+    # The step the latest run is in while it runs (``assets``, ``bars``, ...; null between steps,
+    # while it reads the calendar, and when no run is running).
+    running_step: str | None
+    # Why automatic scans are off (no Alpaca keys, ATLAS_DISABLE_SCHEDULER=1, ...), or null.
+    disabled_reason: str | None
     # The latest scan was saved from incomplete bars: how many of the stocks that traded the
     # session before had no bar on its session (null when the scan had them all).
     partial_data: PartialDataOut | None
@@ -677,11 +687,12 @@ def _failure(run: Mapping[str, Any] | None) -> tuple[str | None, str | None]:
 
 
 def _backfill(run: Mapping[str, Any] | None) -> dict[str, int] | None:
-    """The bars step's ``{done, total}`` while that run is running; otherwise None."""
+    """The backfill's ``{done, total}`` while that run's bars step is downloading; otherwise None
+    (an incremental update reports no progress, and a finished bars step is no download)."""
     if run is None or run.get("status") != "running":
         return None
     bars = (run.get("steps") or {}).get("bars")
-    if not isinstance(bars, Mapping):
+    if not isinstance(bars, Mapping) or bars.get("status") != "running":
         return None
     done, total = as_int(bars.get("done")), as_int(bars.get("total"))
     return None if done is None or total is None else {"done": done, "total": total}
@@ -704,6 +715,16 @@ def _partial(
 AFTER_SCAN_STEPS = frozenset({"tracking", "positions", "digest"})
 """Steps that run after tonight's scan is saved: a failure in one of them still shows tonight's
 scan (Today says which step failed), unlike a failure before it (``last_scan_failed``)."""
+
+
+def _running_step(run: Mapping[str, Any] | None) -> str | None:
+    """The step a running run is in (the first one recorded as running), else None."""
+    if run is None or run.get("status") != "running":
+        return None
+    for name, info in (run.get("steps") or {}).items():
+        if isinstance(info, Mapping) and info.get("status") == "running":
+            return str(name)
+    return None
 
 
 # --- routes: Today ----------------------------------------------------------------------------
@@ -745,6 +766,7 @@ async def today() -> dict[str, Any]:
 
     status = _job_status(run)
     step, reason = _failure(run)
+    sched = scheduler_state()
     if scan is None:
         empty: str | None = "first_run"
     elif status == "failed" and step not in AFTER_SCAN_STEPS:
@@ -777,7 +799,7 @@ async def today() -> dict[str, Any]:
             "freshness": {
                 "data_as_of": None if scan is None else scan["session"],
                 "ideas_for": None if scan is None else scan.get("target_session"),
-                "next_scan_at": scheduler_state()["next_scan_at"],
+                "next_scan_at": sched["next_scan_at"],
                 "last_scan_status": status,
                 "failed_step": step,
                 "failed_reason": reason,
@@ -795,6 +817,8 @@ async def today() -> dict[str, Any]:
             },
             "empty_reason": empty,
             "backfill": _backfill(run),
+            "running_step": _running_step(run),
+            "disabled_reason": None if sched["running"] else sched["disabled_reason"],
             "partial_data": _partial(run, scan),
             "any_live_setup": any(f.verdict == "live" for f in families.values()),
         }
@@ -885,10 +909,12 @@ async def stock(symbol: str) -> dict[str, Any]:
     names = await _asset_names(sym)
     if sym not in names:
         raise HTTPException(404, f"unknown symbol {sym}: it is not in the asset list")
-    cached = await cached_context()
+    cached = await context_within(swing_context.STOCK_WAIT_S)
     scan = await store.latest_scan()
     if cached is None:
         failure = last_failure()
+        if is_building():
+            raise HTTPException(503, LOADING_DETAIL)
         if scan is None or failure is None:
             raise HTTPException(
                 503,
@@ -992,20 +1018,28 @@ def _position_out(
     }
 
 
-async def _position_response(pos: Mapping[str, Any]) -> dict[str, Any]:
+async def _write_context() -> ScanContext | None:
+    """The context for a position write, waiting at most ``WRITE_WAIT_S`` for a cold build."""
+    cached = await context_within(swing_context.WRITE_WAIT_S)
+    return None if cached is None else cached[0]
+
+
+async def _position_response(pos: Mapping[str, Any], ctx: ScanContext | None) -> dict[str, Any]:
     names = await _asset_names()
-    return _json(_position_out(pos, await get_context(), names))
+    return _json(_position_out(pos, ctx, names))
 
 
-async def _advise(pos: dict[str, Any], *, check_stop: bool = True) -> dict[str, Any]:
-    """Tonight's advice for ``pos`` on the cached context, saved, as the nightly job saves it.
+async def _advise(
+    pos: dict[str, Any], ctx: ScanContext | None, *, check_stop: bool = True
+) -> dict[str, Any]:
+    """Tonight's advice for ``pos`` on the context ``ctx``, saved, as the nightly job saves it.
 
     The position is judged on the context's session alone (as one never advised). Without a
-    context, or for a symbol the cached panel lacks (the nightly job loads it), it is returned
-    unadvised: advice from no bars would read as "no price data". It is also left as it is when
-    it was advised for a later session than the context's.
+    context (none yet, or not within the write's wait), or for a symbol the cached panel lacks
+    (the nightly job loads it), it is returned unadvised: advice from no bars would read as "no
+    price data". It is also left as it is when it was advised for a later session than the
+    context's.
     """
-    ctx = await get_context()
     if ctx is None or str(pos["symbol"]) not in ctx.panel.close.columns:
         return pos
     last = pos.get("last_action_on")
@@ -1043,7 +1077,8 @@ async def positions(
     """The user's positions, newest first (only ``open`` or ``closed`` ones when asked)."""
     rows = await store.list_positions(status)
     names = await _asset_names()
-    ctx = await get_context()
+    cached = await context_within(0)  # never waits: a cold cache starts its build and shows none
+    ctx = None if cached is None else cached[0]
     return [_json(_position_out(p, ctx, names)) for p in rows]
 
 
@@ -1095,7 +1130,8 @@ async def create_position(body: PositionIn) -> dict[str, Any]:
                 "notes": body.notes,
             }
         )
-    return await _position_response(await _advise(created))
+    ctx = await _write_context()
+    return await _position_response(await _advise(created, ctx), ctx)
 
 
 @router.patch("/positions/{position_id}", response_model=PositionOut)
@@ -1105,10 +1141,11 @@ async def update_position(position_id: uuid.UUID, body: PositionPatch) -> dict[s
     fields = body.model_dump(exclude_unset=True)
     updated = await store.update_position(position_id, fields) if fields else pos
     stop_changed = "current_stop" in fields and fields["current_stop"] != pos.get("current_stop")
+    ctx = await _write_context()
     if stop_changed and updated.get("status") == "open":
         # The new stop was set after the close: tonight's low says nothing about it.
-        updated = await _advise(updated, check_stop=False)
-    return await _position_response(updated)
+        updated = await _advise(updated, ctx, check_stop=False)
+    return await _position_response(updated, ctx)
 
 
 @router.post(
@@ -1123,7 +1160,8 @@ async def close_position(position_id: uuid.UUID, body: CloseIn) -> dict[str, Any
         raise HTTPException(409, f"position {position_id} is already closed")
     if body.closed_on < pos["opened_on"]:
         raise _invalid("closed_on", "a position can't close before it opened", str(body.closed_on))
-    fields, exit_price = await _on_todays_scale(pos, body.closed_on, body.exit_price)
+    ctx = await _write_context()
+    fields, exit_price = _on_todays_scale(pos, ctx, body.closed_on, body.exit_price)
     pos = {**pos, **fields}
     entry, stop = float(pos["entry_price"]), float(pos["initial_stop"])
     r_multiple = (exit_price - entry) / (entry - stop) if entry > stop else None
@@ -1138,22 +1176,21 @@ async def close_position(position_id: uuid.UUID, body: CloseIn) -> dict[str, Any
             "r_multiple": r_multiple,
         },
     )
-    return await _position_response(closed)
+    return await _position_response(closed, ctx)
 
 
-async def _on_todays_scale(
-    pos: Mapping[str, Any], closed_on: date, exit_price: float
+def _on_todays_scale(
+    pos: Mapping[str, Any], ctx: ScanContext | None, closed_on: date, exit_price: float
 ) -> tuple[dict[str, float], float]:
     """The position's rescaled prices (empty when no split) and the exit price, both on the
     cached panel's adjusted scale, so the R of a trade across a split is on one scale.
 
     The same split check the nightly job applies (:func:`~swing_engine.positions.split_ratio`):
     the entry against the adjusted close on ``opened_on`` and the exit against the one on
-    ``closed_on``. Without a context, for a symbol the cached panel lacks, or when the position
-    was advised for a later session than the context's (the same guard as :func:`_advise`), both
-    stay as given.
+    ``closed_on``. Without a context (none yet, or not within the write's wait), for a symbol
+    the cached panel lacks, or when the position was advised for a later session than the
+    context's (the same guard as :func:`_advise`), both stay as given.
     """
-    ctx = await get_context()
     if ctx is None or str(pos["symbol"]) not in ctx.panel.close.columns:
         return {}, exit_price
     last = pos.get("last_action_on")

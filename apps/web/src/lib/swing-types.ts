@@ -174,6 +174,11 @@ export interface TodayOut {
   empty_reason: EmptyReason | null;
   /** The first-time download's progress, only while that job is running. */
   backfill: ProgressOut | null;
+  /** The step the latest run is in while it runs ("assets", "bars", "scan", ...); null between
+   * steps, while it reads the calendar, and when no run is running. */
+  running_step: string | null;
+  /** Why automatic scans are off (no Alpaca keys, ATLAS_DISABLE_SCHEDULER=1, ...), or null. */
+  disabled_reason: string | null;
   /** Set when the latest scan had prices for under 95% of the stocks; null when complete. */
   partial_data: PartialDataOut | null;
   /** Some setup family's verdict is Live now. False is exactly when "no setup has passed testing"

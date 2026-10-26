@@ -8,6 +8,9 @@ export const DISCLAIMER_TEXT = 'Informational only, not financial advice. You pl
 
 // The stock page's words for a stock it cannot show.
 export const stockLoadingText = (symbol: string) => `Loading ${symbol}…`;
+/** While the API is still loading its market data after a start (it answers 503 meanwhile). */
+export const STOCK_MARKET_DATA_LOADING_TEXT =
+  'ATLAS is still loading market data after starting (about a minute). Trying again every 10 seconds…';
 export const stockNotFoundText = (symbol: string) =>
   `No stock called ${symbol} in the US-listed universe.`;
 export const STOCK_NOT_FOUND_HINT =

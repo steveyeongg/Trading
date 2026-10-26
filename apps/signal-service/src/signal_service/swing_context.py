@@ -7,7 +7,16 @@ and under a lock, from the stored bars of the latest scanned session and the ope
 symbols. It is rebuilt when the universe filters in Settings change and when the store has a
 scan of a later session than the cached context (a job that ran outside this process, the CLI or
 ``ATLAS_DISABLE_SCHEDULER=1``), except while a job runs here, which hands its own over. It never
-goes back to an earlier session (see :class:`_Cache`). A request never builds a context itself.
+goes back to an earlier session (see :class:`_Cache`).
+
+**No request waits long for a build.** A build reads a year and a half of bars for the whole
+universe, about a minute on a cold start, so it runs as one shared background task
+(:func:`start_build`): started at API start-up (:func:`warm_context`), after
+:func:`invalidate_context` and on any cache miss. A request asks :func:`context_within` for the
+context with its own bound: none for ``GET /v1/positions`` (it shows the positions without their
+latest close meanwhile), :data:`WRITE_WAIT_S` for a position write (which then saves without
+advice), :data:`STOCK_WAIT_S` for a stock page (which then answers 503
+:data:`LOADING_DETAIL`). A request whose wait runs out leaves the build going.
 """
 
 from __future__ import annotations
@@ -35,6 +44,15 @@ loader = load_scan_inputs
 BUILD_RETRY_S = 60.0
 """After a failed context build, how long requests go without one before the next try."""
 
+WRITE_WAIT_S = 5.0
+"""The longest a position create, edit or close waits for the context."""
+
+STOCK_WAIT_S = 20.0
+"""The longest a stock page waits for the context before answering 503 :data:`LOADING_DETAIL`."""
+
+LOADING_DETAIL = "Loading market data; this takes about a minute after ATLAS starts."
+"""The 503 detail of a stock page asked for while the context is still being built."""
+
 
 @dataclass
 class _Cache:
@@ -60,6 +78,16 @@ class _Cache:
 
 _CACHE = _Cache()
 _CACHE_LOCK = asyncio.Lock()
+
+
+@dataclass
+class _Build:
+    """The background build requests share (see the module docstring)."""
+
+    task: asyncio.Task[tuple[ScanContext, UniverseFilter] | None] | None = None
+
+
+_BUILD = _Build()
 
 
 def set_context(ctx: ScanContext, universe: UniverseFilter | None = None) -> None:
@@ -100,9 +128,61 @@ def last_failure() -> str | None:
 
 
 def invalidate_context(*, during_job: bool = False) -> None:
-    """Forget the cached context (the universe filters changed); the next read rebuilds it."""
+    """Forget the cached context (the universe filters changed) and start rebuilding it in the
+    background when called from the event loop (a route)."""
     _CACHE.ctx, _CACHE.universe, _CACHE.failed = None, None, None
     _CACHE.drop_job_context = during_job
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    start_build()
+
+
+def _settle(task: asyncio.Task[Any]) -> None:
+    """Read a finished build's exception, so an unawaited failure is not reported as lost."""
+    if not task.cancelled():
+        task.exception()
+
+
+def start_build() -> asyncio.Task[tuple[ScanContext, UniverseFilter] | None]:
+    """The running background build, or a new one (:func:`cached_context` as a task)."""
+    loop = asyncio.get_running_loop()
+    task = _BUILD.task
+    if task is None or task.done() or task.get_loop() is not loop:
+        task = loop.create_task(cached_context())
+        task.add_done_callback(_settle)
+        _BUILD.task = task
+    return task
+
+
+def is_building() -> bool:
+    """Whether a background build is under way in this event loop."""
+    task = _BUILD.task
+    if task is None or task.done():
+        return False
+    try:
+        return task.get_loop() is asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+
+
+async def context_within(timeout: float) -> tuple[ScanContext, UniverseFilter] | None:
+    """The context and its filter when it is cached, or once the background build ends within
+    ``timeout`` seconds; otherwise None, with the build left running (it is started on a miss).
+
+    ``timeout`` 0 never waits: a miss just starts the build. A database error reading the
+    settings or the latest scan raises, as :func:`cached_context` does.
+    """
+    wanted = (await store.get_settings()).universe()
+    hit = _hit(wanted, await store.latest_scan_session())
+    if hit is not None:
+        return hit
+    task = start_build()
+    if timeout <= 0:
+        return None
+    done, _ = await asyncio.wait({task}, timeout=timeout)
+    return task.result() if task in done else None
 
 
 def _hit(wanted: UniverseFilter, latest: date | None) -> tuple[ScanContext, UniverseFilter] | None:
@@ -180,10 +260,10 @@ async def _build_context(universe: UniverseFilter, as_of: date | None) -> ScanCo
 
 
 async def warm_context() -> None:
-    """Fill the cache in the background at startup (when the scheduler is on). Never raises."""
+    """Fill the cache in the background at start-up (never under pytest). Never raises."""
     if job.is_running():
         return  # the running job hands its context over when it is done
     try:
-        await get_context()
+        await start_build()
     except Exception as exc:
         log.warning("swing.api.warm_up_failed", error=safe_reason(exc))
