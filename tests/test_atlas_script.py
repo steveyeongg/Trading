@@ -318,6 +318,21 @@ def test_the_preview_config_binds_the_dashboard_to_localhost_too() -> None:
     assert configs["atlas-web"]["runtimeArgs"] == ["dev", "-H", "127.0.0.1", "-p", "3000"]
 
 
+def test_postgres_redis_and_the_dashboard_listen_on_this_mac_only() -> None:
+    """The incident: Docker published Postgres (dev password in the compose file) and Redis (no
+    password) on every interface, and ``pnpm dev`` without ``-H`` served the dashboard to the
+    whole network. Both now bind 127.0.0.1. The data stays in bind-mounted folders, so
+    ``docker compose up -d`` recreating the containers with the new ports keeps it."""
+    compose = (ROOT / "infra" / "docker" / "docker-compose.yml").read_text()
+    ports = [line.split("- ", 1)[1].split("#")[0].strip().strip('"')
+             for line in compose.splitlines() if line.strip().startswith('- "') and ":" in line
+             and line.strip()[3].isdigit()]  # fmt: skip
+    assert ports == ["127.0.0.1:5432:5432", "127.0.0.1:6379:6379"]
+    assert "./data/postgres:/var/lib/postgresql/data" in compose and "./data/redis:/data" in compose
+    package = json.loads((ROOT / "apps" / "web" / "package.json").read_text())
+    assert package["scripts"]["dev"] == "next dev -H 127.0.0.1"
+
+
 # --- usage ---------------------------------------------------------------------------------
 
 

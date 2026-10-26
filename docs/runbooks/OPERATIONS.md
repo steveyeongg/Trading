@@ -38,8 +38,28 @@ a pid reused after a reboot is never mistaken for ATLAS's.
 `pnpm dev` alone would listen on every network interface (Next's default is
 `0.0.0.0`), so both servers are bound to `127.0.0.1` and the dashboard's port is
 pinned to 3000 (otherwise Next would move to 3001 when 3000 is taken, and the
-script would wait on the wrong port). Another device on your network cannot open
-them. Don't change that without putting a login in front first.
+script would wait on the wrong port). `pnpm dev` itself is `next dev -H 127.0.0.1`
+too, so a dashboard started by hand stays local (the script's own `-H 127.0.0.1`
+repeats the same value, which is harmless). Postgres and Redis are published on
+`127.0.0.1:5432` and `127.0.0.1:6379` only. Another device on your network cannot
+open any of them. Don't change that without putting a login in front first.
+
+If your containers were created before this binding (they published `5432` and
+`6379` on every interface), run `scripts/atlas.sh up` (or
+`docker compose -f infra/docker/docker-compose.yml up -d`) once: Compose sees the
+changed ports and recreates both containers. Your data is kept: it lives in the
+bind-mounted folders `infra/docker/data/postgres` and `infra/docker/data/redis`,
+not in the containers.
+
+**Two more guards on the API.** It answers only requests whose `Host` is
+`localhost` or `127.0.0.1` (`ATLAS_ALLOWED_HOSTS`, below; anything else gets
+400, which stops a DNS-rebinding page from reading it through a name it
+controls). And every write to the swing routes (`POST`/`PUT`/`PATCH` under
+`/v1/positions`, `/v1/settings` and `/v1/scan/run`) needs the header
+`X-ATLAS-Client: web`, which the dashboard sends and a cross-site form cannot;
+without it the API answers 403 *"missing X-ATLAS-Client header"*. To call a
+write route with curl, add `-H 'X-ATLAS-Client: web'`. `scripts/atlas.sh status`
+only reads.
 
 | Flag | Effect |
 |---|---|
@@ -271,6 +291,7 @@ have spent one and failed (see the README's "Where the setups stand").
 | Env | Default | Effect |
 |---|---|---|
 | `ATLAS_DISABLE_SCHEDULER=1` | scheduler **on** | The API starts without the after-close scheduler and its start-up catch-up. **Run scan now** and `python -m swing_engine job` still work, and Settings says *"Automatic scans are off: ATLAS_DISABLE_SCHEDULER=1 is set."* Evaluated when the API starts, after `.env` is loaded, so it may live in `.env` or in front of `scripts/atlas.sh up`. The scheduler never starts under pytest. |
+| `ATLAS_ALLOWED_HOSTS` | `localhost,127.0.0.1,testserver` | Comma-separated `Host` names the API answers; any other gets 400. Read from the shell environment when the app is built (at import, before `.env` is loaded), so set it in front of `scripts/atlas.sh up` if you need another name. |
 | `ATLAS_ENABLE_AUTO_EXECUTION=1` | **off** | The legacy position monitor (see the row above). A BLUEPRINT §22 non-negotiable: leave it off. The swing engine never places or changes an order whatever this is set to. |
 | `ATLAS_ENABLE_LEGACY_SIGNAL_STREAM=1` | **off** | See below. |
 | `ATLAS_ALLOW_LEGACY_MODEL=1` | **off** | See below. |

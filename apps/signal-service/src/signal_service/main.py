@@ -23,6 +23,7 @@ from atlas_shared import get_logger, get_settings, load_env, setup_logging
 from atlas_shared import metrics as mx
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from swing_engine import product_store
 from swing_engine.job import safe_reason
 from swing_engine.scheduler import (
@@ -156,6 +157,21 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+DEFAULT_ALLOWED_HOSTS = "localhost,127.0.0.1,testserver"
+"""The ``Host`` names the API answers by default (``testserver`` is the test client's)."""
+
+
+def allowed_hosts() -> list[str]:
+    """``ATLAS_ALLOWED_HOSTS`` (comma-separated), or :data:`DEFAULT_ALLOWED_HOSTS`. A request
+    whose ``Host`` is not one of them gets 400, which stops a DNS-rebinding page from reading
+    the API through a name it controls. Read when the app is built, from the shell environment."""
+    raw = os.environ.get("ATLAS_ALLOWED_HOSTS") or DEFAULT_ALLOWED_HOSTS
+    hosts = [h.strip() for h in raw.split(",") if h.strip()]
+    return hosts or DEFAULT_ALLOWED_HOSTS.split(",")
+
+
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts())
 
 # Dev CORS: Next.js dashboard at :3000 hits this API at :8000. Production
 # would lock origins down via env config.

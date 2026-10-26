@@ -61,6 +61,7 @@ from swing_engine.validation.prereg import Prereg, write_draft
 from swing_engine.validation.protocol import protocol_block
 
 REPO = Path(__file__).resolve().parents[1]
+WEB = {"X-ATLAS-Client": "web"}  # what the dashboard sends with every write
 FAKE_TOKEN = "1234567890:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"  # shaped like a real bot token
 
 PANEL = synthetic_universe_panel(seed=5)
@@ -325,7 +326,7 @@ class Api:
         monkeypatch.setattr(swing_context, "loader", self.loader)
         self.app = FastAPI()
         self.app.include_router(swing_routes.router)
-        self.client = TestClient(self.app)
+        self.client = TestClient(self.app, headers=WEB)
 
     async def loader(
         self, as_of: date | None, universe: UniverseFilter, extra_symbols: Sequence[str] = ()
@@ -1233,6 +1234,56 @@ def test_the_trail_told_stored_and_tracked_for_one_idea_is_the_same(api, monkeyp
     assert stored["trail_atr"] == trails[0] == 3.5
 
 
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [
+        pytest.param("post", "/v1/positions", None, id="create-position"),
+        pytest.param("patch", f"/v1/positions/{uuid.UUID(int=1)}", {"notes": "x"}, id="patch"),
+        pytest.param("post", f"/v1/positions/{uuid.UUID(int=1)}/close", None, id="close"),
+        pytest.param("put", "/v1/settings", {"equity": 1.0}, id="settings"),
+        pytest.param("post", "/v1/settings/telegram-test", None, id="telegram-test"),
+        pytest.param("post", "/v1/scan/run", None, id="scan-run"),
+    ],
+)
+def test_a_write_without_the_dashboard_header_is_refused(api, monkeypatch, method, path, body):
+    """The incident: the API answered any local page, so a site open in the browser could post
+    a cross-site form to localhost and record a position, change the settings or start a scan.
+    Writes now need ``X-ATLAS-Client: web``, which a cross-site form cannot set; nothing runs
+    without it, not even the body's validation."""
+    ran: list[str] = []
+    monkeypatch.setattr(swing_routes, "make_swing_deps", lambda: ran.append("deps"))
+    monkeypatch.setattr(swing_routes, "send_digest", lambda text: ran.append(text))
+    bare = TestClient(api.app)  # no X-ATLAS-Client header
+
+    response = getattr(bare, method)(path, json=body or _position_body())
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "missing X-ATLAS-Client header"}
+    assert ran == [] and api.store.positions == {} and api.store.settings == SwingSettings()
+    wrong = getattr(bare, method)(path, json=body or _position_body(),
+                                  headers={"X-ATLAS-Client": "curl"})  # fmt: skip
+    assert wrong.status_code == 403
+
+
+def test_reads_need_no_header(api):
+    bare = TestClient(api.app)
+    assert bare.get("/v1/positions").status_code == 200
+    assert bare.get("/v1/settings").status_code == 200
+
+
+def test_the_api_answers_only_the_allowed_host_names(monkeypatch):
+    """DNS rebinding: a page on evil.example resolving to 127.0.0.1 reaches the API with that
+    Host. Only ``ATLAS_ALLOWED_HOSTS`` (default localhost, 127.0.0.1, testserver) get through."""
+    client = TestClient(service.app)
+    assert client.get("/healthz").status_code == 200  # testserver
+    assert client.get("/healthz", headers={"host": "localhost:8000"}).status_code == 200
+    assert client.get("/healthz", headers={"host": "127.0.0.1:8000"}).status_code == 200
+    assert client.get("/healthz", headers={"host": "evil.example"}).status_code == 400
+    assert service.allowed_hosts() == ["localhost", "127.0.0.1", "testserver"]
+    monkeypatch.setenv("ATLAS_ALLOWED_HOSTS", " atlas.local , localhost ")
+    assert service.allowed_hosts() == ["atlas.local", "localhost"]
+
+
 def test_one_open_position_per_symbol(api):
     _add_position(api, entry=100.0, stop=95.0, opened=SESSION)
     response = api.client.post("/v1/positions", json=_position_body())
@@ -1592,7 +1643,7 @@ def test_run_scan_now_starts_a_manual_job_and_returns_its_id(api, monkeypatch):
     )  # fmt: skip
     monkeypatch.setattr(swing_routes, "run_job", fake_run)
 
-    with TestClient(api.app) as client:
+    with TestClient(api.app, headers=WEB) as client:
         response = client.post("/v1/scan/run")
         for _ in range(100):
             if log:
@@ -1824,7 +1875,9 @@ async def test_two_concurrent_creates_for_one_symbol_give_one_position(api):
 
     api.store.slow = True
     transport = httpx.ASGITransport(app=api.app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://atlas.test") as client:
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://atlas.test", headers=WEB
+    ) as client:
         first, second = await asyncio.gather(
             client.post("/v1/positions", json=_position_body(opened_on=NEXT.isoformat())),
             client.post("/v1/positions", json=_position_body(opened_on=NEXT.isoformat())),
@@ -1988,7 +2041,7 @@ def test_run_scan_now_answers_starting_when_the_job_is_slow_to_record_its_run(ap
     monkeypatch.setattr(swing_routes, "make_swing_deps", lambda: _fake_deps(log, store))
     monkeypatch.setattr(swing_routes, "run_job", slow_run)
 
-    with TestClient(api.app) as client:
+    with TestClient(api.app, headers=WEB) as client:
         response = client.post("/v1/scan/run")
         release.set()
         for _ in range(200):

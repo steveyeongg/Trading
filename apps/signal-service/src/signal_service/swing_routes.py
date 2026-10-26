@@ -24,6 +24,12 @@ nothing here places an order (``auto_execution`` reports the API's startup flag,
 account. Like the other ``/v1`` data routes in :mod:`signal_service.routes`, these take no auth
 dependency.
 
+**Only the dashboard writes.** Every ``POST``, ``PUT`` or ``PATCH`` under ``/v1/positions``,
+``/v1/settings`` and ``/v1/scan/run`` needs the header ``X-ATLAS-Client: web`` (the dashboard's
+client sends it), and answers 403 without it. A page on another site can make a browser send a
+simple cross-site form post to localhost, but not a custom header, so a drive-by page cannot
+record a position or start a scan. Reads need no header.
+
 **Failures.** A database that cannot be reached answers 503 with a readable reason (every route
 here goes through :class:`_SwingRoute`), and every 422 has FastAPI's validation shape, ``detail``
 a list of ``{loc, msg, type}``. Responses pass through :func:`atlas_shared.to_jsonable`, with NaN
@@ -142,13 +148,36 @@ with contextlib.suppress(ImportError):  # asyncpg raises its own errors before S
     _DB_ERRORS = (*_DB_ERRORS, asyncpg.PostgresError)
 
 
+CLIENT_HEADER = "X-ATLAS-Client"
+"""The header every mutating swing request must carry, with the value :data:`CLIENT_VALUE`."""
+CLIENT_VALUE = "web"
+_MUTATING = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_GUARDED_PATHS = ("/v1/positions", "/v1/settings", "/v1/scan/run")
+
+
+def _needs_client_header(request: Request) -> bool:
+    """A write to the positions, settings or scan routes without ``X-ATLAS-Client: web``."""
+    path = request.url.path
+    guarded = any(path == p or path.startswith(f"{p}/") for p in _GUARDED_PATHS)
+    return (
+        request.method in _MUTATING
+        and guarded
+        and request.headers.get(CLIENT_HEADER) != CLIENT_VALUE
+    )
+
+
 class _SwingRoute(APIRoute):
-    """Answers 503 with a readable reason when the database cannot be reached or read."""
+    """Answers 403 to a write without the dashboard's header (see the module docstring), and 503
+    with a readable reason when the database cannot be reached or read."""
 
     def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
         handler = super().get_route_handler()
 
         async def guarded(request: Request) -> Response:
+            if _needs_client_header(request):
+                return JSONResponse(
+                    status_code=403, content={"detail": f"missing {CLIENT_HEADER} header"}
+                )
             try:
                 return await handler(request)
             except _DB_ERRORS as exc:

@@ -18,6 +18,8 @@ import type {
 
 // Client for the swing engine's routes (apps/signal-service/.../swing_routes.py). Same `/api/v1`
 // base as the legacy client; the swing tables are single-user, so no dev-auth headers are sent.
+// Every write (POST, PUT, PATCH) carries `X-ATLAS-Client: web`: the API refuses a write to the
+// positions, settings and scan routes without it (403), so a page on another site can't post one.
 //
 // Errors are always an `ApiError`:
 // - Network failure: a fetch rejection, or the Next rewrite proxy's own 500/502/504 with a
@@ -92,6 +94,17 @@ function detailMessage(body: unknown): string | null {
   return null;
 }
 
+/** The header (and value) the API requires on every write to the swing routes. */
+export const CLIENT_HEADER = 'X-ATLAS-Client';
+export const CLIENT_VALUE = 'web';
+
+function requestHeaders(method: string, body: unknown): Record<string, string> | undefined {
+  const headers: Record<string, string> = {};
+  if (method !== 'GET') headers[CLIENT_HEADER] = CLIENT_VALUE;
+  if (body !== undefined) headers['content-type'] = 'application/json';
+  return Object.keys(headers).length > 0 ? headers : undefined;
+}
+
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   let response: Response;
   let text: string;
@@ -99,7 +112,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     response = await fetch(`${BASE}${path}`, {
       method,
       cache: 'no-store',
-      headers: body === undefined ? undefined : { 'content-type': 'application/json' },
+      headers: requestHeaders(method, body),
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     text = await response.text();
