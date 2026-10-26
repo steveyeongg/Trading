@@ -165,15 +165,30 @@ previous session, not tonight.
 |---|---|
 | `assets` | Re-fetches Alpaca's active and inactive asset lists when the last refresh is over 7 days old (new listings, delistings). |
 | `bars` | The first run (no SPY bars), a run whose `assets` step just refreshed the list, or a database more than 30 sessions behind: the resumable backfill from 2016-01-01, saving `done/total` about every 5% (that is the progress Today shows). Otherwise the split-aware incremental update. Symbols the provider cannot serve are listed in the step; they are not failures. |
-| `scan` | Every session after the last stored scan, through the target, oldest first. Each session's ideas are stored with a plain-English reason and what cancels them. Scans are upserts: re-running a session keeps the first `published_at`. |
-| `tracking` | Re-simulates every pending or open published idea (watch-only ones too) to the target session with the same fill and exit model as the tests. |
-| `positions` | The nightly action for each open position you recorded: hold, raise the stop, stop hit, time limit, or *no price data for SYMBOL since DATE* (a delisted, halted or mistyped symbol). A session already advised keeps its stored action. |
-| `digest` | One Telegram digest per session, when it is switched on (below). |
+| `scan` | Every session after the last stored scan, through the target, oldest first. Each session's ideas are stored with a plain-English reason and what cancels them. Scans are upserts: re-running a session keeps the first `published_at`. It records the target session's `coverage` (of the active common stocks with a bar the session before, the share that also has one tonight). Under 95% the scan is still saved but flagged `partial`: Today warns *"Prices were missing for N of M stocks on DAY; tonight's ideas may be incomplete."* and the digest waits (below). |
+| `tracking` | Re-simulates every pending or open published idea (watch-only ones too) to the target session with the same fill and exit model as the tests. Every tracked idea's stock is loaded whatever its liquidity; an idea that still cannot be tracked keeps its stored entry and exit (counted as `untracked`). |
+| `positions` | The nightly action for each open position you recorded: hold, raise the stop, stop hit, time limit, or *no price data for SYMBOL since DATE* (a delisted, halted or mistyped symbol). The trailing stop and time limit are the pre-registered ones of the idea the trade came from (both v1 setups: 3.5 ATR, 30 sessions), or the breakout setup's for a trade recorded without an idea. A session already advised keeps its stored action. |
+| `digest` | One Telegram digest per session, when it is switched on (below). Skipped with reason *partial data* for a partial scan, without marking the session sent, so a later complete run (the 15-minute retry or **Run scan now**) still sends it. |
+
+The `bars` step uses the resumable backfill instead of the update on a first
+run, after the weekly asset refresh, when SPY is more than 30 sessions behind,
+and when the previous run failed to download symbols that already have stored
+bars (`transient_failed` in the step; symbols that never had a bar are the
+provider's permanently unservable ones and do not count).
 
 A step that fails records the reason (first line, secrets removed), the steps
-after it do not run, the job is marked failed and the previous scan stays on
-screen: Today then says *"Last scan failed at step X: reason. Showing the
-previous scan."* Re-running is always safe.
+after it do not run and the job is marked failed. When it is `assets`, `bars`,
+`scan` or a pre-step (the calendar, the settings), tonight's scan was not saved
+and the previous one stays on screen: Today says *"Last scan failed at step X:
+reason. Showing the previous scan."* When it is `tracking`, `positions` or
+`digest`, tonight's scan was saved and is shown, with the line *"Tonight's scan
+finished, but the X step failed: reason."* Re-running is always safe.
+
+**A run is never left "running".** If the API is stopped during a run (quit,
+`scripts/atlas.sh down`, the Mac shut down), the job closes its row as failed
+with *"interrupted"* on its way out, and the next API start closes any row still
+marked running as failed (*"interrupted: the API stopped during the run"*), so
+**Run scan now** is never locked out.
 
 **Catch-up.** If the Mac was asleep or off at 16:45 (or the API was down), the
 next API start checks whether the latest scanned session is earlier than the
@@ -406,7 +421,9 @@ conservative; sparse-data deployments may want to relax them.
 | `scripts/atlas.sh up` says *"Docker isn't running"* | Start Docker Desktop, wait for it to say it is running, and run `scripts/atlas.sh up` again. |
 | `scripts/atlas.sh up` says a port is *already in use* | Another program holds port 8000 or 3000 (often an API or `pnpm dev` started by hand). The script never stops a process it did not start: stop that one yourself (`lsof -ti tcp:8000 -sTCP:LISTEN`), then run `up` again. |
 | `scripts/atlas.sh up`: *"The API didn't start; see logs/api.log"* | Read the 20 lines it printed. Common causes: the database is not migrated (`uv run python -m atlas_shared.migrate up`), a bad `.env` value, or a first start that is just slow (run `up` again; it waits for the process it already started). |
-| Today says *"First-time setup: downloading 10 years of daily data (N%)"* for a long time | Expected on the first run: the free Alpaca plan's rate limit sets the pace. If the percentage stops moving, check `logs/api.log` and that the Alpaca keys are in `.env` (`scripts/atlas.sh status` reports them as yes or no). It resumes after a restart. |
+| Today says *"First-time setup: downloading 10 years of daily data (N%)"* for a long time | Expected on the first run: the free Alpaca plan's rate limit sets the pace. If the percentage stops moving, check `logs/api.log` and that the Alpaca keys are in `.env` (`scripts/atlas.sh status` reports them as yes or no, and shows the download as *Downloading prices*). It resumes after a restart. Before the download starts Today says *"First scan running: …"* (the step it is in), and with no run at all *"Waiting for the first scan to start."*, plus why automatic scans are off when they are. |
+| A stock page says *"ATLAS is still loading market data…"* | The API builds its market-data cache in the background after it starts (about a minute on a full universe); the page asks again every 10 seconds. Meanwhile Positions shows your positions without their latest close and R, and a position you record or edit is checked by the next nightly scan. |
+| Today warns *"Prices were missing for N of M stocks …"* | Tonight's bars arrived incomplete (an update stopped half way, or the provider had an outage). The scan was saved but the digest waits. The failed nightly is retried every 15 minutes; or press **Run scan now** once the data is back. |
 | Today says *"Last scan failed at step X: …. Showing the previous scan."* | Settings shows the steps and the reason. Fix the cause (Alpaca keys or rate limit for `assets` / `bars`, the database for the rest), then press **Run scan now**. Re-running is safe. |
 | Settings says automatic scans are off | `ATLAS_DISABLE_SCHEDULER=1` is set (the panel says so), or the Alpaca keys are missing so the scheduler could not start. Fix it and restart the API. |
 | **Run scan now** answers *"a scan is already running"* | A job is in progress (the scheduler or an earlier click). Wait for it; Settings shows its steps. |

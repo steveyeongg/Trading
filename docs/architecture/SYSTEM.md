@@ -104,11 +104,18 @@ inside the one API process and puts it on the dashboard.
    swing_engine.job.run_job       one job at a time per process; every step recorded in swing_job_runs
       assets    weekly asset-list refresh
       bars      first run: resumable backfill (progress done/total); later: split-aware update
+                (backfill again after an asset refresh, a stale SPY, or last run's transient
+                failures)
       scan      every missed session in order (loader.py -> scan.py); ideas stored with their
-                narration (narrate.py); reconstructed = saved after its session opened
+                narration (narrate.py); reconstructed = saved after its session opened;
+                coverage < 95% of tonight's bars = saved, flagged partial
       tracking  tracking.py: re-simulate pending/open ideas with execution.simulate_trade
-      positions positions.py: nightly action for each recorded position
-      digest    digest.py: one Telegram message per session, validated ideas only
+                (an idea it cannot track keeps its stored state)
+      positions positions.py: nightly action for each recorded position, with the
+                pre-registered trail and time limit of the idea it came from
+      digest    digest.py: one Telegram message per session, validated ideas only; never
+                from a partial scan
+      a cancelled run closes its row as failed; API start-up fails any row left running
           │
           ▼
    Postgres (migration 0010)  swing_settings · swing_scans · swing_ideas · swing_positions ·
@@ -118,7 +125,10 @@ inside the one API process and puts it on the dashboard.
    signal_service.swing_routes (/v1/today, /v1/stocks, /v1/positions, /v1/track-record,
       /v1/settings, /v1/scan/run, /v1/system/status)
       reads the stored scan and job rows, the committed ml/validation reports, and the
-      swing_context cache (the job's target-session ScanContext, for stock and position pages)
+      swing_context cache (the job's target-session ScanContext, for stock and position pages;
+      built in the background, and no request waits on it for long: positions list 0 s,
+      position writes 5 s, a stock page 20 s then 503 "Loading market data...")
+      writes need X-ATLAS-Client: web; the API answers only ATLAS_ALLOWED_HOSTS
           │
           ▼
    apps/web: Today · Positions · Track record · Settings · stock page ("Check a stock")
@@ -309,7 +319,7 @@ hand-mirrored in `apps/web/src/lib/swing-types.ts`, the legacy ones in
 
 | Page | Surface |
 |---|---|
-| `/` Today | Market line (`UPTREND, new trades OK` / `MIXED, half-size trades` / `DOWNTREND, stand aside: no new buy ideas`), ranked validated ideas, the muted `Unproven ideas: these setups have not passed testing` section, watch-only names in a downtrend, nightly actions for open positions, last-scan status and failure copy, first-run download progress, **Run scan now**, disclaimer. |
+| `/` Today | Market line (`UPTREND, new trades OK` / `MIXED, half-size trades` / `DOWNTREND, stand aside: no new buy ideas`), ranked validated ideas, the muted `Unproven ideas: these setups have not passed testing` section, watch-only names in a downtrend, nightly actions for open positions, last-scan status and failure copy (a failure before the scan was saved, or after it), the partial-data warning, the first-run notice by state (running step, download progress, waiting and why scans are off), **Run scan now**, disclaimer. |
 | `/stocks/[symbol]` | Reached from "Check a stock" (the search box on every page) or an idea: daily chart with levels, the eligibility checklist, "I bought this". |
 | `/positions` | Record trades placed with the user's broker, the nightly action, stop edit, close at the user's price, closed trades with R and hold time. |
 | `/track-record` | Per setup: in-sample, out-of-sample (with each failed condition), live record, verdict. |

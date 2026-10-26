@@ -106,6 +106,51 @@ are wall-clock deadlines. `down` stops the process trees and
 `docker compose stop`s (data kept). `status` never fails and summarises the
 nightly scan. Flags: `ATLAS_DISABLE_SCHEDULER=1`, `ATLAS_NO_OPEN=1`.
 
+### Fixes from the final review and the live browser run
+
+- **Trailing-stop parity.** A recorded position now trails with the
+  pre-registered `trail_atr` (and time limit) of the idea it came from, 3.5 ATR
+  for both v1 setups, or the breakout setup's for a trade recorded without an
+  idea. It used the code default of 3.0 while the narration and the tracking
+  said 3.5. A position saved without a trail is resolved the same way, never
+  from the code defaults.
+- **No run stuck at "running".** A run cancelled mid-way (the API stopped)
+  closes its row as failed, and API start-up fails any row still marked running
+  (*"interrupted: the API stopped during the run"*), so Run scan now is never
+  locked out.
+- **Tracking keeps what it stored.** Every tracked idea's stock is loaded
+  whatever its liquidity, and an idea that still cannot be tracked keeps its
+  stored entry and exit instead of being reset to pending.
+- **A failed nightly is retried** every 15 minutes until it works or the next
+  scan is due; one that finds another scan running checks again 15 minutes
+  later.
+- **Partial data.** The scan records tonight's bar coverage. Under 95% it is
+  saved but flagged: Today warns *"Prices were missing for N of M stocks on DAY;
+  tonight's ideas may be incomplete."* and the digest waits for a complete run.
+  Symbols that failed to download last run although they have stored bars now
+  trigger the backfill.
+- **This Mac only.** Postgres and Redis publish on `127.0.0.1`; `pnpm dev` is
+  `next dev -H 127.0.0.1`; the API answers only `ATLAS_ALLOWED_HOSTS` (default
+  `localhost,127.0.0.1,testserver`), and writes to the positions, settings and
+  scan routes need `X-ATLAS-Client: web` (the dashboard sends it; 403 without).
+  Existing containers are recreated with the new ports by the next
+  `docker compose up -d`; the data is in bind mounts and is kept.
+- **Honest notices.** "Showing the previous scan" only when tonight's scan was
+  not saved; a failure in tracking, positions or the digest says *"Tonight's scan
+  finished, but the X step failed: …"* and keeps the downtrend and nothing-found
+  notices. "Live underperforming" only for a Live setup. Track record columns
+  read *Live (forward)* and *Reconstructed (forward)*. `scripts/atlas.sh status`
+  calls a running backfill *Downloading prices* and says why. The job's
+  step-failure log carries no traceback.
+- **First run, by state.** *"First scan running: …"* names the step; the
+  10-year download line shows only while the backfill is downloading;
+  *"Waiting for the first scan to start."* adds why automatic scans are off.
+- **No long waits.** The market-data cache builds in the background (at start,
+  even with the scheduler off, and after a universe change). Positions never
+  waits for it, recording or editing a position waits at most 5 seconds, and a
+  stock page at most 20 seconds before saying it is still loading and retrying
+  every 10 seconds. The position form prefills the stop to the cent.
+
 ### Docs
 
 README (quick start is `scripts/atlas.sh up`; the dashboard, the nightly job
@@ -120,8 +165,9 @@ and `apps/web/README.md`.
 No ESLint setup for `apps/web` (`pnpm lint` is broken at baseline; Phase 2 used
 `pnpm typecheck`, `pnpm build` and a substitute ESLint run), the job lock is
 per process (no Postgres advisory lock), no stop history, no earnings dates, no
-stored `ref_close` per idea (split rescale uses the ATR ratio) and no `avg_hold`
-in the live record.
+stored `ref_close` per idea (split rescale uses the ATR ratio), no `avg_hold`
+in the live record, and the live record pools a family's versions (split it by
+version before a v2).
 
 ### Tests
 

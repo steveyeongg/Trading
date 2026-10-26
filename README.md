@@ -162,14 +162,16 @@ half day that is 13:45 ET). The steps are `assets`, `bars`, `scan`, `tracking`,
 `positions` and `digest`. If the Mac was asleep or off at that time, the next
 start catches up: it scans every missed session in order (their ideas are marked
 reconstructed and never count toward the live record) and sends one digest that
-lists the missed days. **Run scan now** (Today and Settings) starts the same job
+lists the missed days. A nightly that fails is retried every 15 minutes until
+it works or the next scan is due. **Run scan now** (Today and Settings) starts the same job
 by hand, and `python -m swing_engine job` runs it from a terminal. The
 [runbook](docs/runbooks/OPERATIONS.md#the-nightly-job) has the details, the
 Telegram digest rules and the kill switches.
 
 The first run has no bars, so it downloads about ten years of daily prices for
-every US common stock first. Today shows the progress ("First-time setup:
-downloading 10 years of daily data") and the nightly scan follows it. The free
+every US common stock first. Today says which step the first scan is in, shows
+the download's progress ("First-time setup: downloading 10 years of daily data")
+while it runs, and the nightly scan follows it. The free
 Alpaca plan's rate limit sets the pace, so expect a long first run; it resumes
 where it stopped if the API is restarted.
 
@@ -330,6 +332,7 @@ the pipeline. `GET /v1/providers/status` returns the live availability matrix.
 | **Auto-execution** | `ATLAS_ENABLE_AUTO_EXECUTION=1` | Starts the 10s position-monitor loop (auto-closes on stop/target/time). **Off by default — §22 #6 non-negotiable.** | no |
 | **Risk thresholds** | `ATLAS_MIN_COMPOSITE`, `ATLAS_MIN_CONFIDENCE`, `ATLAS_MIN_CONFIRMING_ENGINES`, `ATLAS_MIN_AGREE_THRESHOLD`, `ATLAS_NEWS_VETO_THRESHOLD`, `ATLAS_MAX_BAR_AGE_SWING_H` | Loosen / tighten signal gates without code changes | no (defaults sensible) |
 | **ML registry (legacy composite)** | `ATLAS_TREND_MODEL` | Points the signal service at a trained joblib model. Only models trained with per-symbol labels load; the old `v0` / `v1` files are refused. Unset or refused means `s_quant` is null. Read at import time: export it in the shell that launches `uvicorn`, not in `.env`. | no |
+| **Allowed hosts** | `ATLAS_ALLOWED_HOSTS` | Comma-separated `Host` names the API answers (default `localhost,127.0.0.1,testserver`); any other gets 400. Read from the shell when the API starts, not from `.env`. Writes to the swing routes also need the header `X-ATLAS-Client: web`, which the dashboard sends (403 without it). | no |
 | **Scheduler** | `ATLAS_DISABLE_SCHEDULER=1` | Starts the API without the automatic after-close job (the scheduler and its startup catch-up). **Run scan now** and `python -m swing_engine job` still work. Read when the API starts; it may live in `.env` or be set in front of `scripts/atlas.sh up`. The scheduler never runs under pytest. | no (the scheduler is on by default) |
 | **Legacy switches** | `ATLAS_ALLOW_LEGACY_MODEL=1`, `ATLAS_ENABLE_LEGACY_SIGNAL_STREAM=1` | See [Legacy composite switches](#legacy-composite-switches) | no (both off by default) |
 | **Alerts — webhook** | `ATLAS_WEBHOOK_URL`, `ATLAS_WEBHOOK_SECRET` | HMAC-SHA256 signed POST to your endpoint | no |
