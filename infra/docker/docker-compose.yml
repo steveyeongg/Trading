@@ -9,7 +9,7 @@ services:
       POSTGRES_PASSWORD: atlas_dev
       POSTGRES_DB: atlas
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"  # this Mac only: the dev password is in this file
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
       - ./init/postgres:/docker-entrypoint-initdb.d:ro
@@ -24,7 +24,7 @@ services:
     container_name: atlas-redis
     command: ["redis-server", "--appendonly", "yes"]
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"  # this Mac only: no password
     volumes:
       - ./data/redis:/data
     healthcheck:

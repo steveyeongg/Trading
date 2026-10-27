@@ -104,15 +104,32 @@ def deflated_sharpe(
     n_obs: int,
     skew: float = 0.0,
     kurtosis: float = 3.0,
+    trial_sharpe_std: float | None = None,
 ) -> float:
     """Bailey & López de Prado (2014). Probability that the *true* Sharpe is
     > 0 given multiple-testing over `n_trials`. Returns a probability in [0, 1].
+
+    `observed_sharpe` is per period (not annualised), on the same scale as the
+    `n_obs` returns it came from. The benchmark is the expected maximum Sharpe of
+    N = `n_trials` skill-less trials,
+    ``trial_sharpe_std * ((1 - g) * ppf(1 - 1/N) + g * ppf(1 - 1/(N * e)))`` with
+    g the Euler-Mascheroni constant and ppf the standard normal quantile. It is 0
+    for a single trial. `trial_sharpe_std` is the spread of the trials' Sharpe
+    ratios; by default that of a Sharpe estimate under the null,
+    ``1/sqrt(n_obs - 1)``.
     """
     if n_obs < 10 or n_trials < 1 or not math.isfinite(observed_sharpe):
         return float("nan")
+    if trial_sharpe_std is None:
+        trial_sharpe_std = 1.0 / math.sqrt(n_obs - 1)
     # Expected max Sharpe under H0 (no skill) across n_trials.
     emc = 0.5772156649  # Euler-Mascheroni
-    e_max = (1 - emc) * stats.norm.ppf(1 - 1 / n_trials) + emc * stats.norm.ppf(1 - 1 / (n_trials * math.e))
+    e_max = 0.0
+    if n_trials > 1:
+        e_max = trial_sharpe_std * (
+            (1 - emc) * stats.norm.ppf(1 - 1 / n_trials)
+            + emc * stats.norm.ppf(1 - 1 / (n_trials * math.e))
+        )
     # Variance term — adjusts for non-normal returns.
     excess_kurt = kurtosis - 3.0
     var_term = (1 - skew * observed_sharpe + (excess_kurt / 4) * observed_sharpe**2) / (n_obs - 1)

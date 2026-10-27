@@ -21,7 +21,7 @@ from feature_engine import compute_features, gbm_bars
 
 from quant_engine.data import load_features_for_training
 from quant_engine.labels import binary_up_labels, triple_barrier_labels
-from quant_engine.trend import save, train_trend
+from quant_engine.trend import LABEL_SCHEME_PER_SYMBOL_V2, save, train_trend
 
 setup_logging()
 log = get_logger("quant.train")
@@ -33,6 +33,48 @@ def _synthetic_dataset(n_bars: int, seed: int) -> pd.DataFrame:
     bars = gbm_bars(n=n_bars, seed=seed)
     feats = compute_features(bars)
     return feats
+
+
+def build_training_set(
+    features: pd.DataFrame,
+    horizon: int,
+    pt_mult: float,
+    sl_mult: float,
+) -> tuple[pd.DataFrame, pd.Series, int]:
+    """Label each symbol on its OWN prices, then stack in (ts, symbol) order.
+
+    Triple-barrier labels look `horizon` bars ahead, so they must be computed on one
+    symbol's contiguous series. Labelling the (ts, symbol)-stacked frame makes each
+    row's "next 20 bars" other tickers' prices; the model then learns the price level
+    of each ticker and scores ~0.9 AUC even on pure random walks.
+
+    Returns `(features, labels, label_horizon_rows)`:
+      - `features` is stacked sorted by (ts, symbol) when a `symbol` column exists;
+        a frame without one is a single series and is returned as given.
+      - `labels` is 1.0 / 0.0 (upper barrier hit first / not), aligned to `features`.
+        NaN where the outcome is unknown (ATR warm-up, or the last `horizon` bars of a
+        symbol), so `train_trend` drops those rows rather than teaching them as "down".
+      - `label_horizon_rows = horizon * n_symbols`: in the stacked frame one symbol's
+        `horizon`-bar label window spans that many rows, which is the purge gap the
+        walk-forward CV needs.
+    """
+    if "symbol" not in features.columns:
+        return features, _up_labels(features, horizon, pt_mult, sl_mult), horizon
+
+    stacked = features.sort_values(["ts", "symbol"]).reset_index(drop=True)
+    # Within a symbol the stacked order is chronological, so each group is that symbol's series.
+    per_symbol = [
+        _up_labels(group, horizon, pt_mult, sl_mult) for _, group in stacked.groupby("symbol")
+    ]
+    labels = pd.concat(per_symbol).reindex(stacked.index).rename("label")
+    return stacked, labels, horizon * stacked["symbol"].nunique()
+
+
+def _up_labels(frame: pd.DataFrame, horizon: int, pt_mult: float, sl_mult: float) -> pd.Series:
+    tb = triple_barrier_labels(
+        frame["close"], frame["atr14"], horizon_bars=horizon, pt_mult=pt_mult, sl_mult=sl_mult
+    )
+    return binary_up_labels(tb).astype(float).where(tb.notna())
 
 
 def main() -> None:
@@ -65,16 +107,17 @@ def main() -> None:
         log.info("train.dataset", source="synthetic", n_bars=args.n_bars)
         feats = _synthetic_dataset(args.n_bars, args.seed)
 
-    labels_tb = triple_barrier_labels(
-        feats["close"],
-        feats["atr14"],
-        horizon_bars=args.horizon,
-        pt_mult=args.pt_mult,
-        sl_mult=args.sl_mult,
+    feats, labels, label_horizon = build_training_set(
+        feats, horizon=args.horizon, pt_mult=args.pt_mult, sl_mult=args.sl_mult
     )
-    labels = binary_up_labels(labels_tb)
 
-    artifact = train_trend(feats, labels, version=args.version, label_horizon=args.horizon)
+    artifact = train_trend(
+        feats,
+        labels,
+        version=args.version,
+        label_horizon=label_horizon,
+        label_scheme=LABEL_SCHEME_PER_SYMBOL_V2,
+    )
     log.info("train.metrics", **artifact.metrics)
 
     out_path = Path(args.out) / f"{args.version}.joblib"

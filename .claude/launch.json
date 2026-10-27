@@ -1,0 +1,22 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "atlas-web",
+      "cwd": "apps/web",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["dev", "-H", "127.0.0.1", "-p", "3000"],
+      "port": 3000
+    },
+    {
+      "name": "atlas-api",
+      "runtimeExecutable": "env",
+      "runtimeArgs": [
+        "ATLAS_DISABLE_SCHEDULER=1",
+        "uv", "run", "--package", "signal-service",
+        "uvicorn", "signal_service.main:app", "--host", "127.0.0.1", "--port", "8000"
+      ],
+      "port": 8000
+    }
+  ]
+}

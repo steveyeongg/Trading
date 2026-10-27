@@ -61,10 +61,16 @@ def test_bootstrap_sharpe_ci_brackets_point_estimate() -> None:
     assert lo <= point <= hi
 
 
-def test_deflated_sharpe_below_one_for_overfit() -> None:
-    # 100 trials, modest observed Sharpe → DS probability should be lowish.
-    prob = deflated_sharpe(observed_sharpe=1.0, n_trials=100, n_obs=500)
-    assert 0.0 <= prob <= 1.0
+def test_deflated_sharpe_single_trial_zero_sharpe_is_half() -> None:
+    # One trial has no selection bias (E[max] = 0), so a zero Sharpe sits on the median.
+    assert deflated_sharpe(0.0, 1, 500) == pytest.approx(0.5, abs=1e-6)
+
+
+def test_deflated_sharpe_penalises_more_trials() -> None:
+    # Per-period Sharpe 0.1 over 1000 observations: E[max] under the null is scaled by the
+    # Sharpe estimate's own spread, 1/sqrt(n_obs - 1), so 9 trials only dent it a little.
+    assert 0.9 < deflated_sharpe(0.1, 9, 1000) < 0.99
+    assert deflated_sharpe(0.1, 100, 1000) < deflated_sharpe(0.1, 9, 1000)
 
 
 # --- simulator -------------------------------------------------------------

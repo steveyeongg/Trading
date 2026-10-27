@@ -7,8 +7,9 @@ endpoint and render the **ATLAS — Engine Overview** dashboard.
 
 ```bash
 # 1. Start the API (host, :8000) — exposes /metrics
-ATLAS_TREND_MODEL=ml/registry/trend/v1.joblib \
-  uv run --package signal-service uvicorn signal_service.main:app --reload
+#    (prefix ATLAS_TREND_MODEL=ml/registry/trend/<retrained>.joblib to load a model trained
+#    with per-symbol labels; the old v0/v1 files are refused and `s_quant` stays null)
+uv run --package signal-service uvicorn signal_service.main:app --reload
 
 # 2. Start the observability stack
 docker compose -f infra/observability/docker-compose.yml up -d
@@ -22,6 +23,12 @@ folder — no click-ops. Edits to `grafana/dashboards/atlas.json` reload on
 container restart.
 
 ## What it shows
+
+These panels track the **legacy composite** signal service. The swing engine
+runs as a CLI and exports no metrics yet. The pipeline panels (signal
+outcomes, stage latency) now move only on HTTP signal requests, because the
+WebSocket's background recompute is off unless
+`ATLAS_ENABLE_LEGACY_SIGNAL_STREAM=1` (see the runbook).
 
 | Panel | Metric |
 |---|---|

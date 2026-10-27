@@ -24,7 +24,7 @@ import type {
 
 // All API traffic goes through Next.js rewrites (`/api/*` → backend).
 // That keeps the browser CORS-free in dev and lets us swap origins via env.
-const BASE = '/api/v1';
+export const BASE = '/api/v1';
 
 const TIER_KEY = 'atlas_dev_tier';
 

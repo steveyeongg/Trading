@@ -37,6 +37,8 @@ ml/datasets/processed/
 
 # Local data
 data/
+# ...but not the swing engine's `data` Python package (market-data clients)
+!apps/swing-engine/src/swing_engine/data/
 *.parquet
 *.db
 *.sqlite
@@ -58,6 +60,11 @@ secrets/
 # Logs
 *.log
 logs/
+
+# scripts/atlas.sh state (pid files)
+.atlas/
+
+# Closed punch list, kept local (see CLAUDE.md "Gitignore gotchas")
 GAP_AUDIT.md
 
 # Docker volumes
