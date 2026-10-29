@@ -8,7 +8,7 @@ from typing import Any
 from atlas_shared.db import session_scope
 from sqlalchemy import text
 
-from alert_service.rules import AlertRule
+from alert_service.rules import AlertRule, normalize_rule_symbol
 
 _LIST_RULES = text(
     """
@@ -94,7 +94,7 @@ async def create_rule(rule: dict[str, Any], user_id: str) -> str:
         "metric": rule["metric"],
         "op": rule["op"],
         "threshold": float(rule["threshold"]),
-        "symbol": (rule.get("symbol") or None),
+        "symbol": normalize_rule_symbol(rule.get("symbol")),
         "direction": (rule.get("direction") or None),
         "channels": list(rule.get("channels") or ["log"]),
         "cooldown_s": int(rule.get("cooldown_s", 1800)),

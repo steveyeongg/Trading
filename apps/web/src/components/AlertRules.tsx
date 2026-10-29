@@ -90,9 +90,10 @@ export function AlertRules() {
         <Field label="Symbol">
           <input
             value={draft.symbol ?? ''}
-            onChange={(e) => setDraft({ ...draft, symbol: e.target.value.toUpperCase() })}
-            placeholder="any"
-            className="w-20 rounded border border-line bg-bg-subtle px-2 py-1"
+            onChange={(e) => setDraft({ ...draft, symbol: e.target.value.trim().toUpperCase() })}
+            placeholder="e.g. AAPL"
+            title="Leave blank to watch every stock"
+            className="w-24 rounded border border-line bg-bg-subtle px-2 py-1"
           />
         </Field>
         <Field label="Metric">

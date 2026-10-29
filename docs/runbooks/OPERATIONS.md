@@ -87,7 +87,7 @@ uv sync --dev
 
 # 3. App data plane (Postgres + Redis)
 docker compose -f infra/docker/docker-compose.yml up -d
-uv run python -m atlas_shared.migrate up   # applies migrations 0001–0010
+uv run python -m atlas_shared.migrate up   # applies migrations 0001–0011
 
 # 4. Swing engine (primary path). Needs ALPACA_API_KEY + ALPACA_API_SECRET in .env
 #    (the free plan is enough: SIP daily bars, 15-min delay). The API's scheduler does this

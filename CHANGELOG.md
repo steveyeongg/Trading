@@ -4,6 +4,17 @@ Chronological record of what shipped across the build. Newest first.
 Every entry maps to a turn in the build log; phase numbers reference
 `docs/architecture/BLUEPRINT.md` §18.
 
+## 0.25.1 — Legacy alerts: symbol wildcard fix, token-free redaction tests
+
+- **Alert symbol filter.** Rules saved with the dashboard's old `ANY` default never
+  fired, because the matcher read `ANY` as a ticker. Only an empty symbol or `*` now
+  means any ticker. `ALL` (Allstate) and `ANY` (Sphere 3D) stay real tickers. The API
+  trims and upper-cases the symbol on save, and migration `0011_alert_rule_symbols`
+  turns the old `ANY` rows into NULL (any ticker). A padded symbol such as `" AAPL"`
+  now matches.
+- **Tests.** The Telegram redaction test now sends through `TelegramChannel.send` with
+  a mock transport and checks the returned `detail`. Its fixtures use a made-up token.
+
 ## 0.25.0 — Swing engine Phase 2: nightly job, dashboard, positions, track record, Telegram digest, one-command start
 
 The engine from 0.24.0 becomes a product you can run: it scans by itself after

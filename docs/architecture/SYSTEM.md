@@ -368,7 +368,8 @@ HTTP surface above serves them):**
 `0001_initial` (bars + signals) · `0002_news` · `0003_portfolio` · `0004_journal`
 · `0005_watchlist` · `0006_alerts` · `0007_user_scoping` · `0008_orders`
 · `0009_swing_assets` (the swing engine's `assets` table and a `bars (resolution, ts)` index)
-· `0010_swing_product` (the six swing product tables above).
+· `0010_swing_product` (the six swing product tables above)
+· `0011_alert_rule_symbols` (legacy alert rules: the old `ANY` default becomes NULL, meaning any ticker).
 
 ## §22 non-negotiables status
 

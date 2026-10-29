@@ -59,11 +59,23 @@ def metric_value(signal: dict[str, Any], metric: str) -> float | None:
         return None
 
 
+def normalize_rule_symbol(sym: str | None) -> str | None:
+    """The rule's ticker filter, trimmed and upper-cased; None means any ticker.
+
+    Only None, blank and `"*"` mean "any". `ANY` and `ALL` are real tickers
+    (Sphere 3D, Allstate), so they stay literal filters. The dashboard used to
+    default the field to `"ANY"`; migration 0011 turns those old rows into NULL.
+    """
+    s = (sym or "").strip().upper()
+    return None if s in ("", "*") else s
+
+
 def matches(rule: AlertRule, signal: dict[str, Any]) -> bool:
     """True if the rule fires for this signal (filters + predicate)."""
     if not rule.enabled:
         return False
-    if rule.symbol and signal.get("symbol", "").upper() != rule.symbol.upper():
+    want = normalize_rule_symbol(rule.symbol)
+    if want is not None and (signal.get("symbol") or "").strip().upper() != want:
         return False
     if rule.direction and signal.get("direction") != rule.direction:
         return False

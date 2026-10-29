@@ -51,7 +51,7 @@ You normally don't run these by hand: `scripts/atlas.sh up` starts the API, and
 the API's scheduler runs the nightly job (below). The CLI is for the first load
 without the dashboard, for debugging, and for the validation protocol. Run
 everything from the repo root. You need the schema applied (`atlas.sh up` does
-it, or Manual setup step 5, which covers migrations through `0010_swing_product`)
+it, or Manual setup step 5, which covers migrations through `0011_alert_rule_symbols`)
 and, for the data jobs, `ALPACA_API_KEY` and `ALPACA_API_SECRET` in `.env`.
 
 ```bash
